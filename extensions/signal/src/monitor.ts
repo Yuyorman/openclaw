@@ -602,7 +602,7 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
   const waitForTransportReadyFn = opts.waitForTransportReady ?? waitForTransportReady;
 
   const autoStart = opts.autoStart ?? accountInfo.config.autoStart ?? !accountInfo.config.httpUrl;
-  const configuredApiMode = cfg.channels?.signal?.apiMode ?? "auto";
+  const configuredApiMode = accountInfo.config.apiMode ?? "auto";
   const startupTimeoutMs = Math.min(
     120_000,
     Math.max(1_000, opts.startupTimeoutMs ?? accountInfo.config.startupTimeoutMs ?? 30_000),
@@ -613,9 +613,7 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
   let daemonHandle: SignalDaemonHandle | null = null;
 
   if (autoStart && configuredApiMode === "container") {
-    throw new Error(
-      "channels.signal.autoStart=true is incompatible with channels.signal.apiMode=container",
-    );
+    throw new Error("Signal autoStart=true is incompatible with apiMode=container");
   }
 
   if (autoStart) {

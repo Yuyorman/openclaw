@@ -19,6 +19,8 @@ import {
 } from "openclaw/plugin-sdk/provider-http";
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
 import { readRegularFile } from "openclaw/plugin-sdk/security-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeE164 } from "openclaw/plugin-sdk/text-utility-runtime";
 import WebSocket from "ws";
 
 type ContainerRpcOptions = {
@@ -55,6 +57,9 @@ type ContainerWebSocketMessage = {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_ATTACHMENT_RESPONSE_MAX_BYTES = 1_048_576;
+const MIN_E164_DIGITS = 5;
+const MAX_E164_DIGITS = 15;
+const DIGITS_ONLY = /^\d+$/;
 // Receive envelopes contain JSON metadata; attachment bytes are fetched separately.
 // Keep the ws pre-buffer limit narrow so a container cannot force 100 MiB frames.
 const SIGNAL_CONTAINER_WS_MAX_PAYLOAD_BYTES = 1024 * 1024;
@@ -100,6 +105,22 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   } finally {
     clearTimeout(timer);
   }
+}
+
+function normalizeContainerAccountInput(value: string | null | undefined): string | null {
+  const trimmed = normalizeOptionalString(value);
+  if (!trimmed) {
+    return null;
+  }
+  const normalized = normalizeE164(trimmed);
+  const digits = normalized.slice(1);
+  if (!DIGITS_ONLY.test(digits)) {
+    return null;
+  }
+  if (digits.length < MIN_E164_DIGITS || digits.length > MAX_E164_DIGITS) {
+    return null;
+  }
+  return `+${digits}`;
 }
 
 function normalizeMaxResponseBytes(value: number | undefined): number {
@@ -158,6 +179,61 @@ export async function containerCheck(
   } finally {
     await releaseUnreadResponseBody(res);
   }
+}
+
+async function readContainerAccounts(
+  baseUrl: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<{ ok: true; accounts: string[] } | { ok: false; error: string }> {
+  const normalized = normalizeBaseUrl(baseUrl);
+  let res: Response | undefined;
+  try {
+    res = await fetchWithTimeout(`${normalized}/v1/accounts`, { method: "GET" }, timeoutMs);
+    if (!res.ok) {
+      return { ok: false, error: `HTTP ${res.status}` };
+    }
+    const text = await readProviderTextResponse(res, "Signal accounts");
+    const parsed = JSON.parse(text) as unknown;
+    if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "string")) {
+      return { ok: false, error: "Signal accounts response was not a string array" };
+    }
+    return {
+      ok: true,
+      accounts: parsed.map((entry) => normalizeContainerAccountInput(entry) ?? entry),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    await releaseUnreadResponseBody(res);
+  }
+}
+
+export async function validateSignalContainerLinkedAccount(params: {
+  httpUrl: string;
+  account: string;
+  timeoutMs?: number;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const account = normalizeContainerAccountInput(params.account);
+  if (!account) {
+    return { ok: false, error: "Signal account is not a valid phone number" };
+  }
+  const accounts = await readContainerAccounts(params.httpUrl, params.timeoutMs);
+  if (!accounts.ok) {
+    return { ok: false, error: `Signal accounts check failed: ${accounts.error}` };
+  }
+  if (accounts.accounts.includes(account)) {
+    return { ok: true };
+  }
+  if (accounts.accounts.length === 0) {
+    return { ok: false, error: `Signal container has no linked accounts; expected ${account}.` };
+  }
+  return {
+    ok: false,
+    error: `Signal container does not list ${account}; linked accounts: ${accounts.accounts.join(", ")}.`,
+  };
 }
 
 function containerReceiveCheck(

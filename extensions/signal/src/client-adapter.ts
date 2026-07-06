@@ -19,6 +19,7 @@ import {
 import type { SignalRpcOptions } from "./client.js";
 import {
   signalCheck as nativeCheck,
+  signalReceiveCheck as nativeReceiveCheck,
   signalRpcRequest as nativeRpcRequest,
   streamSignalEvents as nativeStreamEvents,
 } from "./client.js";
@@ -73,20 +74,77 @@ function waitForNativePreferenceGrace(
   });
 }
 
+type SignalCheckResult = { ok: boolean; status?: number | null; error?: string | null };
+type SignalApiDetection = { mode: "native" | "container"; check: SignalCheckResult };
+type SignalApiDetectionOptions = {
+  account?: string;
+  requireReceive?: boolean;
+  checkNativeReceive?: boolean;
+};
+
+function resolveReceiveAccountCacheValue(params: {
+  mode: "native" | "container";
+  receiveAccount?: string;
+  options: SignalApiDetectionOptions;
+}): string | undefined {
+  if (!params.options.requireReceive || !params.receiveAccount) {
+    return undefined;
+  }
+  if (params.mode === "native" && params.options.checkNativeReceive === false) {
+    return undefined;
+  }
+  return params.receiveAccount;
+}
+
+function createSignalApiNotReachableError(
+  baseUrl: string,
+  nativeResult: SignalCheckResult,
+  containerResult: SignalCheckResult,
+  options: { requireReceive?: boolean },
+): Error {
+  if (options.requireReceive && containerResult.error?.includes("receive")) {
+    const error = new Error(containerResult.error);
+    Object.assign(error, {
+      signalCheckResult: containerResult,
+    });
+    return error;
+  }
+  if (options.requireReceive && nativeResult.error?.includes("receive")) {
+    const error = new Error(nativeResult.error);
+    Object.assign(error, {
+      signalCheckResult: nativeResult,
+    });
+    return error;
+  }
+  return new Error(`Signal API not reachable at ${baseUrl}`);
+}
+
+async function checkNativeApi(
+  baseUrl: string,
+  timeoutMs: number,
+  options: SignalApiDetectionOptions,
+): Promise<SignalCheckResult> {
+  const check = await nativeCheck(baseUrl, timeoutMs);
+  if (!check.ok || !options.requireReceive || options.checkNativeReceive === false) {
+    return check;
+  }
+  return nativeReceiveCheck(baseUrl, timeoutMs, options.account?.trim());
+}
+
 async function resolveAutoApiMode(
   baseUrl: string,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  options: { account?: string; requireContainerReceive?: boolean } = {},
+  options: SignalApiDetectionOptions = {},
 ): Promise<"native" | "container"> {
+  const receiveAccount = options.account?.trim();
   const rawNow = Date.now();
   const now = asDateTimestampMs(rawNow);
   const cached = detectedModeCache.get(baseUrl);
   if (cached) {
     if (now !== undefined && cached.expiresAt > now) {
       if (
-        cached.mode !== "container" ||
-        !options.requireContainerReceive ||
-        (Boolean(options.account?.trim()) && cached.receiveAccount === options.account?.trim())
+        !options.requireReceive ||
+        (Boolean(receiveAccount) && cached.receiveAccount === receiveAccount)
       ) {
         return cached.mode;
       }
@@ -97,12 +155,70 @@ async function resolveAutoApiMode(
   const detected = await detectSignalApiMode(baseUrl, timeoutMs, options);
   const expiresAt = resolveExpiresAtMsFromDurationMs(MODE_CACHE_TTL_MS, { nowMs: rawNow });
   if (expiresAt !== undefined) {
+    const cachedReceiveAccount = resolveReceiveAccountCacheValue({
+      mode: detected,
+      receiveAccount,
+      options,
+    });
     detectedModeCache.set(baseUrl, {
       mode: detected,
       expiresAt,
-      ...(detected === "container" && options.requireContainerReceive && options.account
-        ? { receiveAccount: options.account }
-        : {}),
+      ...(cachedReceiveAccount ? { receiveAccount: cachedReceiveAccount } : {}),
+    });
+  }
+  return detected;
+}
+
+async function checkDetectedSignalApiMode(
+  baseUrl: string,
+  timeoutMs: number,
+  mode: "native" | "container",
+  options: SignalApiDetectionOptions,
+): Promise<SignalCheckResult> {
+  if (mode === "container") {
+    return options.requireReceive
+      ? containerCheck(baseUrl, timeoutMs, options.account?.trim())
+      : containerCheck(baseUrl, timeoutMs);
+  }
+  return checkNativeApi(baseUrl, timeoutMs, options);
+}
+
+async function resolveAutoApiDetection(
+  baseUrl: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  options: SignalApiDetectionOptions = {},
+): Promise<SignalApiDetection> {
+  const receiveAccount = options.account?.trim();
+  const rawNow = Date.now();
+  const now = asDateTimestampMs(rawNow);
+  const cached = detectedModeCache.get(baseUrl);
+  if (cached) {
+    if (now !== undefined && cached.expiresAt > now) {
+      if (
+        !options.requireReceive ||
+        (Boolean(receiveAccount) && cached.receiveAccount === receiveAccount)
+      ) {
+        return {
+          mode: cached.mode,
+          check: await checkDetectedSignalApiMode(baseUrl, timeoutMs, cached.mode, options),
+        };
+      }
+    } else {
+      detectedModeCache.delete(baseUrl);
+    }
+  }
+  const detected = await detectSignalApiModeWithCheck(baseUrl, timeoutMs, options);
+  const expiresAt = resolveExpiresAtMsFromDurationMs(MODE_CACHE_TTL_MS, { nowMs: rawNow });
+  if (expiresAt !== undefined) {
+    const cachedReceiveAccount = resolveReceiveAccountCacheValue({
+      mode: detected.mode,
+      receiveAccount,
+      options,
+    });
+    detectedModeCache.set(baseUrl, {
+      mode: detected.mode,
+      expiresAt,
+      ...(cachedReceiveAccount ? { receiveAccount: cachedReceiveAccount } : {}),
     });
   }
   return detected;
@@ -112,7 +228,7 @@ async function resolveApiModeForOperation(params: {
   baseUrl: string;
   accountId?: string;
   account?: string;
-  requireContainerReceive?: boolean;
+  requireReceive?: boolean;
   timeoutMs?: number;
   apiMode?: SignalApiMode;
 }): Promise<"native" | "container"> {
@@ -124,7 +240,10 @@ async function resolveApiModeForOperation(params: {
 
   return resolveAutoApiMode(params.baseUrl, params.timeoutMs ?? DEFAULT_TIMEOUT_MS, {
     account: params.account,
-    requireContainerReceive: params.requireContainerReceive,
+    requireReceive: params.requireReceive,
+    // Native streaming owns the long-lived receive path; probing it here can hang
+    // before headers. Container still needs the finite WebSocket readiness check.
+    checkNativeReceive: false,
   });
 }
 
@@ -135,38 +254,55 @@ async function resolveApiModeForOperation(params: {
 export async function detectSignalApiMode(
   baseUrl: string,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  options: { account?: string; requireContainerReceive?: boolean } = {},
+  options: { account?: string; requireReceive?: boolean } = {},
 ): Promise<"native" | "container"> {
-  const containerAccount = options.requireContainerReceive ? options.account?.trim() : undefined;
-  const nativeResultPromise = nativeCheck(baseUrl, timeoutMs).catch(() => ({ ok: false }));
+  return (await detectSignalApiModeWithCheck(baseUrl, timeoutMs, options)).mode;
+}
+
+async function detectSignalApiModeWithCheck(
+  baseUrl: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  options: SignalApiDetectionOptions = {},
+): Promise<SignalApiDetection> {
+  const containerAccount = options.requireReceive ? options.account?.trim() : undefined;
+  const nativeResultPromise = checkNativeApi(baseUrl, timeoutMs, options).catch(() => ({
+    ok: false,
+  }));
   const containerResultPromise = containerAccount
     ? containerCheck(baseUrl, timeoutMs, containerAccount).catch(() => ({ ok: false }))
-    : options.requireContainerReceive
+    : options.requireReceive
       ? Promise.resolve({ ok: false })
       : containerCheck(baseUrl, timeoutMs).catch(() => ({ ok: false }));
 
   const nativeHealthyPromise = nativeResultPromise.then((result) => {
     if (result.ok) {
-      return "native" as const;
+      return { mode: "native" as const, check: result };
     }
     throw new Error("native not ok");
   });
   const containerHealthyPromise = containerResultPromise.then((result) => {
     if (result.ok) {
-      return "container" as const;
+      return { mode: "container" as const, check: result };
     }
     throw new Error("container not ok");
   });
 
   try {
     const firstHealthy = await Promise.any([nativeHealthyPromise, containerHealthyPromise]);
-    if (firstHealthy === "native") {
-      return "native";
+    if (firstHealthy.mode === "native") {
+      return firstHealthy;
     }
     const nativeResult = await waitForNativePreferenceGrace(nativeResultPromise);
-    return nativeResult.ok ? "native" : "container";
+    return nativeResult.ok
+      ? { mode: "native", check: nativeResult }
+      : { mode: "container", check: firstHealthy.check };
   } catch {
-    throw new Error(`Signal API not reachable at ${baseUrl}`);
+    throw createSignalApiNotReachableError(
+      baseUrl,
+      await nativeResultPromise,
+      await containerResultPromise,
+      { requireReceive: options.requireReceive },
+    );
   }
 }
 
@@ -202,9 +338,27 @@ export async function signalRpcRequest<T = unknown>(
 export async function signalCheck(
   baseUrl: string,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  options: { apiMode?: SignalApiMode } = {},
+  options: { apiMode?: SignalApiMode; account?: string; requireReceive?: boolean } = {},
 ): Promise<{ ok: boolean; status?: number | null; error?: string | null }> {
   const configured = resolveConfiguredApiMode(options.apiMode);
+  if (configured === "auto" && options.requireReceive) {
+    return await resolveAutoApiDetection(baseUrl, timeoutMs, {
+      account: options.account,
+      requireReceive: options.requireReceive,
+    })
+      .then((detection) => detection.check)
+      .catch((error: unknown) => {
+        const result =
+          typeof error === "object" && error !== null
+            ? (error as { signalCheckResult?: SignalCheckResult }).signalCheckResult
+            : undefined;
+        return {
+          ok: false,
+          status: result?.status ?? null,
+          error: result?.error ?? formatErrorMessage(error),
+        } as const;
+      });
+  }
   const mode =
     configured === "auto"
       ? await resolveAutoApiMode(baseUrl, timeoutMs).catch((error: unknown) => {
@@ -215,7 +369,17 @@ export async function signalCheck(
     return mode;
   }
   if (mode === "container") {
+    if (options.requireReceive) {
+      return containerCheck(baseUrl, timeoutMs, options.account?.trim());
+    }
     return containerCheck(baseUrl, timeoutMs);
+  }
+  if (options.requireReceive) {
+    const check = await nativeCheck(baseUrl, timeoutMs);
+    if (!check.ok) {
+      return check;
+    }
+    return nativeReceiveCheck(baseUrl, timeoutMs, options.account?.trim());
   }
   return nativeCheck(baseUrl, timeoutMs);
 }
@@ -238,7 +402,7 @@ export async function streamSignalEvents(params: {
     baseUrl: params.baseUrl,
     accountId: params.accountId,
     account: params.account,
-    requireContainerReceive: true,
+    requireReceive: true,
     timeoutMs: resolveAutoProbeTimeoutMs(params.timeoutMs),
     apiMode: params.apiMode,
   });

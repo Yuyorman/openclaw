@@ -13,6 +13,7 @@ import {
   containerSendReaction,
   containerRemoveReaction,
   streamContainerEvents,
+  validateSignalContainerLinkedAccount,
 } from "./client-container.js";
 
 // spyOn approach works with vitest forks pool for cross-directory imports
@@ -231,6 +232,49 @@ describe("containerCheck", () => {
       ok: false,
       status: null,
       error: "Signal container receive WebSocket closed before open (1000: done)",
+    });
+  });
+});
+
+describe("validateSignalContainerLinkedAccount", () => {
+  it("rejects malformed accounts responses using the bounded text reader", async () => {
+    const response = new Response(null, {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    Object.defineProperty(response, "body", {
+      value: bodyStream(JSON.stringify({ accounts: ["+14259798283"] })).body,
+    });
+    const textSpy = vi.spyOn(response, "text").mockRejectedValue(new Error("unbounded text"));
+    mockFetch.mockResolvedValue(response);
+
+    await expect(
+      validateSignalContainerLinkedAccount({
+        httpUrl: "http://localhost:8080",
+        account: "+14259798283",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: "Signal accounts check failed: Signal accounts response was not a string array",
+    });
+    expect(textSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-string account arrays from the container", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      ...bodyStream(JSON.stringify(["+14259798283", 123])),
+    });
+
+    await expect(
+      validateSignalContainerLinkedAccount({
+        httpUrl: "http://localhost:8080",
+        account: "+14259798283",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: "Signal accounts check failed: Signal accounts response was not a string array",
     });
   });
 });

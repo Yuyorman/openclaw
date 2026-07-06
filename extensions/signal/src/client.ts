@@ -252,6 +252,35 @@ export async function signalCheck(
   }
 }
 
+export async function signalReceiveCheck(
+  baseUrl: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  account?: string,
+): Promise<{ ok: boolean; status?: number | null; error?: string | null }> {
+  const url = resolveSignalEndpointUrl(baseUrl, "/api/v1/events");
+  if (account) {
+    url.searchParams.set("account", account);
+  }
+  let stream: Awaited<ReturnType<typeof openSignalEventStream>> | undefined;
+  try {
+    stream = await openSignalEventStream(url, undefined, timeoutMs);
+    return {
+      ok: true,
+      status: stream.response.statusCode ?? null,
+      error: null,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: null,
+      error: `Signal native receive endpoint unavailable: ${formatErrorMessage(err)}`,
+    };
+  } finally {
+    stream?.cleanup();
+    stream?.response.destroy();
+  }
+}
+
 function openSignalEventStream(
   url: URL,
   abortSignal?: AbortSignal,

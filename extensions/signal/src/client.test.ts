@@ -16,6 +16,7 @@ vi.mock("openclaw/plugin-sdk/core", async () => {
 });
 
 let signalCheck: typeof import("./client.js").signalCheck;
+let signalReceiveCheck: typeof import("./client.js").signalReceiveCheck;
 let signalRpcRequest: typeof import("./client.js").signalRpcRequest;
 let streamSignalEvents: typeof import("./client.js").streamSignalEvents;
 
@@ -49,7 +50,8 @@ async function withSignalServer(
 }
 
 beforeAll(async () => {
-  ({ signalCheck, signalRpcRequest, streamSignalEvents } = await import("./client.js"));
+  ({ signalCheck, signalReceiveCheck, signalRpcRequest, streamSignalEvents } =
+    await import("./client.js"));
 });
 
 afterEach(async () => {
@@ -266,6 +268,50 @@ describe("signalCheck", () => {
       ok: false,
       status: 503,
       error: "HTTP 503",
+    });
+  });
+});
+
+describe("signalReceiveCheck", () => {
+  it("opens the native event stream far enough to prove receive readiness", async () => {
+    const baseUrl = await withSignalServer((req, res) => {
+      expect(req.method).toBe("GET");
+      expect(req.url).toBe("/api/v1/events?account=%2B15555550123");
+      expect(req.headers.accept).toBe("text/event-stream");
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(": keepalive\n\n");
+    });
+
+    await expect(signalReceiveCheck(baseUrl, 1000, "+15555550123")).resolves.toEqual({
+      ok: true,
+      status: 200,
+      error: null,
+    });
+  });
+
+  it("reports native event stream failures as receive unavailable", async () => {
+    const baseUrl = await withSignalServer((_req, res) => {
+      res.writeHead(503, "Unavailable");
+      res.end("down");
+    });
+
+    await expect(signalReceiveCheck(baseUrl, 1000, "+15555550123")).resolves.toEqual({
+      ok: false,
+      status: null,
+      error: "Signal native receive endpoint unavailable: Signal SSE failed (503 Unavailable)",
+    });
+  });
+
+  it("reports idle native event streams as receive unavailable", async () => {
+    const baseUrl = await withSignalServer(() => {
+      // Some signal-cli versions keep the event stream open before sending first headers.
+    });
+
+    await expect(signalReceiveCheck(baseUrl, 25, "+15555550123")).resolves.toEqual({
+      ok: false,
+      status: null,
+      error:
+        "Signal native receive endpoint unavailable: Signal SSE connection timed out after 25ms",
     });
   });
 });
