@@ -7,6 +7,7 @@ import {
   listChannelPlugins,
   normalizeChannelId,
 } from "../channels/plugins/index.js";
+import type { ChannelLoginMethod, ChannelLoginMethodKind } from "../channels/plugins/types.js";
 import { resolveInstallableChannelPlugin } from "../commands/channel-setup/channel-plugin-resolution.js";
 import { getRuntimeConfig, readConfigFileSnapshot, type OpenClawConfig } from "../config/config.js";
 import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
@@ -23,6 +24,7 @@ import { formatUnsupportedChannelActionMessage } from "./error-format.js";
 type ChannelAuthOptions = {
   channel?: string;
   account?: string;
+  phoneNumber?: string;
   verbose?: boolean;
 };
 
@@ -31,6 +33,22 @@ type ChannelAuthMode = "login" | "logout";
 
 function supportsChannelAuthMode(plugin: ChannelPlugin, mode: ChannelAuthMode): boolean {
   return mode === "login" ? Boolean(plugin.auth?.login) : Boolean(plugin.gateway?.logoutAccount);
+}
+
+function buildChannelLoginMethod(opts: ChannelAuthOptions): ChannelLoginMethod | undefined {
+  const phoneNumber = normalizeOptionalString(opts.phoneNumber);
+  return phoneNumber ? { kind: "phone-number", phoneNumber } : undefined;
+}
+
+function assertSupportedLoginMethod(plugin: ChannelPlugin, method: ChannelLoginMethod): void {
+  const supported = plugin.auth?.supportedLoginMethodKinds ?? [];
+  if (supported.includes(method.kind)) {
+    return;
+  }
+  const labelByKind = {
+    "phone-number": "--phone-number",
+  } satisfies Record<ChannelLoginMethodKind, string>;
+  throw new Error(`Channel "${plugin.id}" does not support ${labelByKind[method.kind]} login.`);
 }
 
 function isConfiguredAuthPlugin(plugin: ChannelPlugin, cfg: OpenClawConfig): boolean {
@@ -244,6 +262,10 @@ export async function runChannelLogin(
   }
   // Auth-only flow: do not mutate channel config here.
   setVerbose(Boolean(opts.verbose));
+  const loginMethod = buildChannelLoginMethod(opts);
+  if (loginMethod) {
+    assertSupportedLoginMethod(plugin, loginMethod);
+  }
   const { accountId } = resolveAccountContext(plugin, opts, cfg);
   await login({
     cfg,
@@ -251,6 +273,7 @@ export async function runChannelLogin(
     runtime,
     verbose: Boolean(opts.verbose),
     channelInput,
+    ...(loginMethod ? { loginMethod } : {}),
   });
   await reconcileGatewayRuntimeAfterLocalLogin({
     cfg,

@@ -339,6 +339,13 @@ export type ChannelLogoutContext<ResolvedAccount = unknown> = {
   log?: ChannelLogSink;
 };
 
+export type ChannelLoginMethod = {
+  kind: "phone-number";
+  phoneNumber: string;
+};
+
+export type ChannelLoginMethodKind = ChannelLoginMethod["kind"];
+
 export type ChannelGatewayAdapter<ResolvedAccount = unknown> = {
   startAccount?: (ctx: ChannelGatewayContext<ResolvedAccount>) => Promise<unknown>;
   stopAccount?: (ctx: ChannelGatewayContext<ResolvedAccount>) => Promise<void>;
@@ -359,12 +366,14 @@ export type ChannelGatewayAdapter<ResolvedAccount = unknown> = {
 };
 
 export type ChannelAuthAdapter = {
+  supportedLoginMethodKinds?: readonly ChannelLoginMethodKind[];
   login?: (params: {
     cfg: OpenClawConfig;
     accountId?: string | null;
     runtime: RuntimeEnv;
     verbose?: boolean;
     channelInput?: string | null;
+    loginMethod?: ChannelLoginMethod;
   }) => Promise<void>;
 };
 

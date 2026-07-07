@@ -13,6 +13,7 @@ import {
   readWebAuthState,
   readWebSelfId,
   readWebSelfIdentity,
+  clearStalePhoneCodePairingAuthIfNeeded,
   restoreCredsFromBackupIfNeeded,
   webAuthExists,
   WhatsAppAuthUnstableError,
@@ -200,6 +201,37 @@ describe("auth-store", () => {
         jid: "15551234567@s.whatsapp.net",
         lid: null,
       },
+    });
+  });
+
+  it("does not treat partial phone-code pairing creds as linked", async () => {
+    await withOwnedOAuthAuthDir("openclaw-wa-auth-phone-code-partial", async (authDir) => {
+      fsSync.writeFileSync(
+        path.join(authDir, "creds.json"),
+        JSON.stringify({
+          registered: false,
+          pairingCode: "12345678",
+          me: { id: "15551234567@s.whatsapp.net" },
+        }),
+        "utf-8",
+      );
+      const runtime = {
+        log: vi.fn(),
+        error: vi.fn(),
+        exit: vi.fn(),
+      };
+
+      expect(hasWebCredsSync(authDir)).toBe(true);
+      await expect(webAuthExists(authDir)).resolves.toBe(false);
+      await expect(readWebAuthState(authDir)).resolves.toBe("not-linked");
+      await expect(
+        clearStalePhoneCodePairingAuthIfNeeded({
+          authDir,
+          isLegacyAuthDir: false,
+          runtime: runtime as never,
+        }),
+      ).resolves.toBe(true);
+      expect(fsSync.existsSync(authDir)).toBe(false);
     });
   });
 

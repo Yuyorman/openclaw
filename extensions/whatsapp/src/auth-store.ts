@@ -76,6 +76,54 @@ function isValidJson(raw: string): boolean {
   }
 }
 
+type WhatsAppWebCredsPayload = {
+  registered?: unknown;
+  pairingCode?: unknown;
+  me?: {
+    id?: unknown;
+    lid?: unknown;
+  } | null;
+};
+
+function parseWebCredsPayload(raw: string): WhatsAppWebCredsPayload | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as WhatsAppWebCredsPayload) : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasUsableWebIdentity(payload: WhatsAppWebCredsPayload): boolean {
+  const id = payload.me?.id;
+  const lid = payload.me?.lid;
+  return (
+    (typeof id === "string" && id.trim().length > 0) ||
+    (typeof lid === "string" && lid.trim().length > 0)
+  );
+}
+
+function isLinkedWebCredsRaw(raw: string): boolean {
+  const payload = parseWebCredsPayload(raw);
+  return Boolean(
+    payload && hasUsableWebIdentity(payload) && !isPartialPhoneCodePairingCredsPayload(payload),
+  );
+}
+
+function isPartialPhoneCodePairingCredsPayload(payload: WhatsAppWebCredsPayload): boolean {
+  return (
+    payload.registered === false &&
+    typeof payload.pairingCode === "string" &&
+    payload.pairingCode.trim().length > 0 &&
+    hasUsableWebIdentity(payload)
+  );
+}
+
+function isPartialPhoneCodePairingCredsRaw(raw: string): boolean {
+  const payload = parseWebCredsPayload(raw);
+  return Boolean(payload && isPartialPhoneCodePairingCredsPayload(payload));
+}
+
 export async function restoreCredsFromBackupIfNeeded(
   authDir: string,
   options?: { beforeCredentialPersistence?: () => Promise<void> },
@@ -134,12 +182,7 @@ export async function webAuthExists(authDir: string = resolveDefaultWebAuthDir()
   if (!raw) {
     return false;
   }
-  try {
-    JSON.parse(raw);
-    return true;
-  } catch {
-    return false;
-  }
+  return isLinkedWebCredsRaw(raw);
 }
 
 function resolveWebAuthState(params: {
@@ -259,6 +302,23 @@ async function clearBaileysAuthFiles(
       await fs.rm(path.join(authDir, entry.name), { force: true });
     }),
   );
+}
+
+export async function clearStalePhoneCodePairingAuthIfNeeded(params: {
+  authDir: string;
+  isLegacyAuthDir: boolean;
+  runtime?: RuntimeEnv;
+}): Promise<boolean> {
+  const resolvedAuthDir = resolveUserPath(params.authDir);
+  const raw = await readWebCredsJsonRaw(resolveWebCredsPath(resolvedAuthDir));
+  if (!raw || !isPartialPhoneCodePairingCredsRaw(raw)) {
+    return false;
+  }
+  return await logoutWeb({
+    authDir: resolvedAuthDir,
+    isLegacyAuthDir: params.isLegacyAuthDir,
+    runtime: params.runtime,
+  });
 }
 
 async function shouldClearOnLogout(authDir: string, isLegacyAuthDir: boolean): Promise<boolean> {
