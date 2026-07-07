@@ -246,6 +246,41 @@ export const SessionsListParamsSchema = Type.Object(
   { additionalProperties: false },
 );
 
+/** Searches one agent's indexed session transcripts, optionally within selected sessions. */
+export const SessionsSearchParamsSchema = Type.Object(
+  {
+    agentId: Type.Optional(NonEmptyString),
+    sessionKeys: Type.Optional(Type.Array(NonEmptyString, { minItems: 1, maxItems: 200 })),
+    query: Type.String({ minLength: 1, maxLength: 4096 }),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 25 })),
+  },
+  { additionalProperties: false },
+);
+
+/** One full-text session transcript match with follow-up provenance. */
+export const SessionsSearchHitSchema = Type.Object(
+  {
+    sessionKey: NonEmptyString,
+    sessionId: NonEmptyString,
+    messageId: NonEmptyString,
+    role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]),
+    timestamp: Type.Integer({ minimum: 0 }),
+    snippet: Type.String(),
+    score: Type.Number(),
+  },
+  { additionalProperties: false },
+);
+
+/** Full-text search response; indexing marks a still-running first-use reconcile. */
+export const SessionsSearchResultSchema = Type.Object(
+  {
+    results: Type.Array(SessionsSearchHitSchema),
+    indexing: Type.Optional(Type.Boolean()),
+    truncated: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+
 /** Repairs or removes invalid session records from the selected agent scope. */
 export const SessionsCleanupParamsSchema = Type.Object(
   {

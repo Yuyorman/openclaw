@@ -13,6 +13,7 @@ import { redactTranscriptMessage } from "../../agents/transcript-redact.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { redactSecrets } from "../../logging/redact.js";
 import { isTranscriptOnlyOpenClawAssistantMessage } from "../../shared/transcript-only-openclaw-assistant.js";
+import { queueSessionTranscriptIndex } from "./session-transcript-search.js";
 import { createSessionTranscriptHeader } from "./transcript-header.js";
 import {
   appendJsonlEntry,
@@ -406,8 +407,10 @@ export async function withSessionTranscriptAppendQueue<T>(
 export type AppendSessionTranscriptMessageParams<TMessage = unknown> = {
   transcriptPath: string;
   message: TMessage;
+  agentId?: string;
   now?: number;
   sessionId?: string;
+  sessionKey?: string;
   cwd?: string;
   useRawWhenLinear?: boolean;
   /** Opt into transcript idempotency lookup; default append stays O(1) for fresh keyed messages. */
@@ -660,8 +663,10 @@ async function appendSessionTranscriptMessageLocked<TMessage>(
   const allowRawWhenLinear = params.useRawWhenLinear !== false;
   const shouldRawAppend =
     allowRawWhenLinear && hasLinearEntries && (stat?.size ?? 0) > SESSION_MANAGER_APPEND_MAX_BYTES;
+  let rewroteTranscript = false;
   if (hasLinearEntries && !shouldRawAppend) {
     const migrated = await migrateLinearTranscriptToParentLinked(params.transcriptPath);
+    rewroteTranscript = true;
     leafInfo = {
       ...(migrated.leafId ? { leafId: migrated.leafId } : {}),
       appendMode: "active",
@@ -685,6 +690,14 @@ async function appendSessionTranscriptMessageLocked<TMessage>(
       : {}),
   };
   await appendJsonlEntry(params.transcriptPath, entry);
+  queueSessionTranscriptIndex({
+    transcriptPath: params.transcriptPath,
+    ...(params.agentId ? { agentId: params.agentId } : {}),
+    ...(rewroteTranscript ? { forceRebuild: true } : {}),
+    ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+    ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+    ...(params.config ? { config: params.config } : {}),
+  });
   return { messageId, message: finalMessage, appended: true };
 }
 

@@ -53,6 +53,7 @@ import {
 import { CURRENT_SESSION_VERSION } from "../../config/sessions/version.js";
 import type { ImageContent, Message, TextContent } from "../../llm/types.js";
 import { logWarn } from "../../logger.js";
+import { emitInternalSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import {
   type AgentMessage,
@@ -2098,6 +2099,7 @@ export class SessionManager {
     if (rememberedWrite.verifiedWrite && options?.publishSnapshot !== false) {
       publishRememberedSessionFileSnapshot(this.sessionFile, rememberedWrite.snapshot);
     }
+    emitInternalSessionTranscriptUpdate({ sessionFile: this.sessionFile, mutation: "replace" });
   }
 
   isPersisted(): boolean {
@@ -2261,6 +2263,7 @@ export class SessionManager {
       return;
     }
 
+    let mutation: "append" | "replace" = this.flushed ? "append" : "replace";
     if (!this.flushed) {
       const content = this.writeFullFile();
       this.flushed = true;
@@ -2300,6 +2303,7 @@ export class SessionManager {
         canPublishOwnedAppend,
         invalidateSerializedPrefixCache,
       );
+      mutation = rememberedAppend.ownedAppendVerified ? "append" : "replace";
       this.sessionFileSnapshot = rememberedAppend.snapshot;
       if (rememberedAppend.ownedAppendVerified && publishSnapshot) {
         publishRememberedSessionFileSnapshot(this.sessionFile, rememberedAppend.snapshot);
@@ -2313,6 +2317,7 @@ export class SessionManager {
         );
       }
     }
+    emitInternalSessionTranscriptUpdate({ sessionFile: this.sessionFile, mutation });
   }
 
   persist(entry: SessionEntry, options?: AppendPersistenceOptions): void {
