@@ -8,6 +8,7 @@ export function createBaileysSignalRepository(
 }
 
 export {
+  Browsers,
   BufferJSON,
   DisconnectReason,
   fetchLatestBaileysVersion,
