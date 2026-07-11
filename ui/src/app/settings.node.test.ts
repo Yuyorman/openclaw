@@ -384,7 +384,7 @@ describe("loadSettings default gateway URL derivation", () => {
     persisted.navWidth = 220;
     localStorage.setItem(scopedKey, JSON.stringify(persisted));
 
-    expect(loadSettings().sidebarPinnedRoutes).toEqual(["overview"]);
+    expect(loadSettings().sidebarPinnedRoutes).toEqual(["overview", "cron"]);
     expect(loadSettings().sidebarMoreExpanded).toBe(false);
     expect(loadSettings().navWidth).toBe(258);
   });
