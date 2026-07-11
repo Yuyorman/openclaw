@@ -19,6 +19,10 @@ import { clearBootstrapSnapshot } from "../agents/bootstrap-cache.js";
 import { clearAllCliSessions } from "../agents/cli-session.js";
 import { abortEmbeddedAgentRun, waitForEmbeddedAgentRunEnd } from "../agents/embedded-agent.js";
 import { resetRegisteredAgentHarnessSessions } from "../agents/harness/registry.js";
+import {
+  createMainRunRecoveryCancellationSettlementToken,
+  settleMainRunRecoveryCancellation,
+} from "../agents/main-run-recovery-runtime.js";
 import { resolveSessionModelRef } from "../agents/session-model-ref.js";
 import { stopSubagentsForRequester } from "../auto-reply/reply/abort.js";
 import {
@@ -30,6 +34,7 @@ import { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-clea
 import { getRuntimeConfig } from "../config/io.js";
 import {
   resolveSessionWorkStartError,
+  SESSION_LIFECYCLE_CHANGED_ERROR_REASON,
   snapshotSessionOrigin,
   type SessionEntry,
   resetSessionEntryLifecycle,
@@ -65,6 +70,12 @@ import {
 } from "../sessions/session-lifecycle-admission.js";
 import { handleSessionStateSessionReset } from "../sessions/session-state-events.js";
 import {
+  findActiveMainRunRecoveryBySession,
+  requestMainRunRecoveryCancellation,
+  type MainRunRecovery,
+  type MainRunRecoveryCas,
+} from "../state/main-run-recovery-store.js";
+import {
   forgetActiveSessionForShutdown,
   listActiveSessionsForShutdown,
   noteActiveSessionForShutdown,
@@ -83,6 +94,78 @@ import {
 } from "./session-utils.js";
 
 const ACP_RUNTIME_CLEANUP_TIMEOUT_MS = 15_000;
+const DURABLE_SESSION_RETRY_AFTER_MS = 1_000;
+
+function retryableDurableSessionError(message: string) {
+  return errorShape(ErrorCodes.UNAVAILABLE, message, {
+    retryable: true,
+    retryAfterMs: DURABLE_SESSION_RETRY_AFTER_MS,
+  });
+}
+
+function mainRunRecoveryCas(recovery: MainRunRecovery): MainRunRecoveryCas {
+  if (recovery.state === "terminal") {
+    throw new Error(`main-run recovery ${recovery.publicRunId} is already terminal`);
+  }
+  return {
+    publicRunId: recovery.publicRunId,
+    expectedRevision: recovery.revision,
+    expectedState: recovery.state,
+    agentId: recovery.agentId,
+    sessionKey: recovery.sessionKey,
+    sessionKeyAliases: recovery.sessionKeyAliases,
+    sessionId: recovery.sessionId,
+    storePath: recovery.storePath,
+  };
+}
+
+function requestSessionRecoveryCancellation(params: {
+  agentId: string;
+  sessionKey: string;
+  sessionId: string;
+  storePath: string;
+}): MainRunRecovery | undefined {
+  const current = findActiveMainRunRecoveryBySession(params);
+  if (!current) {
+    return current;
+  }
+  if (current.state === "cancelling") {
+    if (current.cancellation?.kind !== "reset") {
+      throw new Error(`main-run recovery ${current.publicRunId} has a foreign cancellation owner`);
+    }
+    return current;
+  }
+  const requestedAtMs = Date.now();
+  const cancellation = requestMainRunRecoveryCancellation({
+    ...mainRunRecoveryCas(current),
+    cancellation: { kind: "reset", epoch: randomUUID(), requestedAtMs },
+    nowMs: requestedAtMs,
+  });
+  if (!cancellation) {
+    throw new Error(`lost cancellation ownership for main-run recovery ${current.publicRunId}`);
+  }
+  return cancellation;
+}
+
+function terminalizeSessionRecoveryCancellation(recovery: MainRunRecovery | undefined): void {
+  if (!recovery) {
+    return;
+  }
+  if (recovery.state !== "cancelling" || recovery.cancellation?.kind !== "reset") {
+    throw new Error(`main-run recovery ${recovery.publicRunId} is not cancelling for reset`);
+  }
+  const nowMs = Date.now();
+  const terminal = settleMainRunRecoveryCancellation(
+    createMainRunRecoveryCancellationSettlementToken(recovery),
+    {
+      endedAtMs: nowMs,
+      nowMs,
+    },
+  );
+  if (!terminal) {
+    throw new Error(`lost terminal ownership for main-run recovery ${recovery.publicRunId}`);
+  }
+}
 
 export function archiveSessionTranscriptsForSessionDetailed(params: {
   sessionId: string | undefined;
@@ -386,8 +469,7 @@ async function ensureSessionRuntimeCleanup(params: {
     await closeTrackedBrowserTabs();
     return undefined;
   }
-  return errorShape(
-    ErrorCodes.UNAVAILABLE,
+  return retryableDurableSessionError(
     `Session ${params.key} is still active; try again in a moment.`,
   );
 }
@@ -463,8 +545,7 @@ async function closeAcpRuntimeForSession(params: {
   }
   params.assertCurrent?.();
   if (cancelOutcome.status === "timeout") {
-    return errorShape(
-      ErrorCodes.UNAVAILABLE,
+    return retryableDurableSessionError(
       `Session ${params.sessionKey} is still active; try again in a moment.`,
     );
   }
@@ -495,8 +576,7 @@ async function closeAcpRuntimeForSession(params: {
   }
   params.assertCurrent?.();
   if (closeOutcome.status === "timeout") {
-    return errorShape(
-      ErrorCodes.UNAVAILABLE,
+    return retryableDurableSessionError(
       `Session ${params.sessionKey} is still active; try again in a moment.`,
     );
   }
@@ -841,6 +921,8 @@ async function readGatewayBeforeResetPluginHookMessages(params: {
 export async function performGatewaySessionReset(params: {
   key: string;
   agentId?: string;
+  /** Exact old session guard for idempotent lifecycle retries. */
+  expectedSessionId?: string;
   spawnedCwd?: string;
   /** Managed worktree adopted by this reset; cleared together with spawnedCwd. */
   worktree?: { id: string; branch: string; repoRoot: string };
@@ -905,11 +987,15 @@ export async function performGatewaySessionReset(params: {
     params.key,
     resetTarget.requestedAgentId ? { agentId: resetTarget.requestedAgentId } : undefined,
   ).entry;
+  const expectedResetSessionId = params.expectedSessionId?.trim();
+  const potentialCommittedResetRetry = Boolean(
+    expectedResetSessionId && initialResetEntry?.sessionId !== expectedResetSessionId,
+  );
   const missingHarnessSessionError = resolveMissingAgentHarnessSessionError(
     resetTarget.target.canonicalKey,
     initialResetEntry,
   );
-  if (missingHarnessSessionError) {
+  if (missingHarnessSessionError && !potentialCommittedResetRetry) {
     return {
       ok: false,
       error: errorShape(ErrorCodes.INVALID_REQUEST, missingHarnessSessionError),
@@ -917,7 +1003,7 @@ export async function performGatewaySessionReset(params: {
   }
   // Reject before interrupting admitted work or firing reset hooks. The model lock is
   // session-id scoped, so rotating first would silently detach native harness ownership.
-  if (isModelSelectionLocked(initialResetEntry)) {
+  if (isModelSelectionLocked(initialResetEntry) && !potentialCommittedResetRetry) {
     return {
       ok: false,
       error: errorShape(ErrorCodes.INVALID_REQUEST, MODEL_SELECTION_LOCKED_RESET_MESSAGE),
@@ -927,6 +1013,7 @@ export async function performGatewaySessionReset(params: {
     resetTarget.target.canonicalKey,
     params.key,
     initialResetEntry?.sessionId,
+    expectedResetSessionId,
   ];
   const activeLifecycleMutation = isSessionLifecycleMutationActive(
     resetTarget.storePath,
@@ -947,13 +1034,59 @@ export async function performGatewaySessionReset(params: {
     };
   }
   let admittedWorkReleased = true;
+  let preparedResetSessionId: string | undefined;
+  let expectedResetStillCurrent = true;
+  let recoveryCancellation: MainRunRecovery | undefined;
+  let recoveryCancellationError: unknown;
+  let committedResetRetry = false;
   return await runExclusiveSessionLifecycleMutation({
     scope: resetTarget.storePath,
     identities: resetLifecycleIdentities,
+    bypassDurableBarrier: true,
     // Mark the mutation first, then interrupt outside the identity lock. This
     // lets aborted runs finish admission cleanup without deadlocking reset.
     prepare: async () => {
       params.assertCurrent?.();
+      // Preflight can wait behind another reset. Capture and cancel the exact
+      // successor visible after this mutation activates, not the stale preflight id.
+      const preparedEntry = loadSessionEntry(
+        params.key,
+        resetTarget.requestedAgentId ? { agentId: resetTarget.requestedAgentId } : undefined,
+      ).entry;
+      preparedResetSessionId = preparedEntry?.sessionId;
+      if (expectedResetSessionId && preparedResetSessionId !== expectedResetSessionId) {
+        try {
+          recoveryCancellation = requestSessionRecoveryCancellation({
+            agentId: normalizeAgentId(
+              resetTarget.target.agentId ?? resolveDefaultAgentId(resetTarget.cfg),
+            ),
+            sessionKey: resetTarget.target.canonicalKey,
+            sessionId: expectedResetSessionId,
+            storePath: resetTarget.storePath,
+          });
+        } catch (error) {
+          recoveryCancellationError = error;
+          return;
+        }
+        committedResetRetry = recoveryCancellation?.state === "cancelling";
+        expectedResetStillCurrent = committedResetRetry;
+        return;
+      }
+      if (preparedResetSessionId) {
+        try {
+          recoveryCancellation = requestSessionRecoveryCancellation({
+            agentId: normalizeAgentId(
+              resetTarget.target.agentId ?? resolveDefaultAgentId(resetTarget.cfg),
+            ),
+            sessionKey: resetTarget.target.canonicalKey,
+            storePath: resetTarget.storePath,
+            sessionId: preparedResetSessionId,
+          });
+        } catch (error) {
+          recoveryCancellationError = error;
+          return;
+        }
+      }
       admittedWorkReleased = await interruptSessionWorkAdmissions({
         scope: resetTarget.storePath,
         identities: resetLifecycleIdentities,
@@ -962,11 +1095,78 @@ export async function performGatewaySessionReset(params: {
     },
     run: async () => {
       const { cfg, target, storePath, requestedAgentId } = resetTarget;
+      if (recoveryCancellationError) {
+        logVerbose(
+          `sessions.session-reset: failed to request recovery cancellation: ${String(recoveryCancellationError)}`,
+        );
+        return {
+          ok: false as const,
+          error: retryableDurableSessionError(
+            `Session ${params.key} recovery cancellation could not be committed; try again.`,
+          ),
+        };
+      }
+      if (!expectedResetStillCurrent) {
+        return {
+          ok: false as const,
+          error: errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `Session ${params.key} changed before reset. Retry.`,
+          ),
+        };
+      }
+      if (committedResetRetry) {
+        // The cancelling row belongs to a reset that already installed this
+        // successor. Settle it without rotating the successor again.
+        const currentEntry = loadSessionEntry(
+          params.key,
+          requestedAgentId ? { agentId: requestedAgentId } : undefined,
+        ).entry;
+        if (!currentEntry || currentEntry.sessionId !== preparedResetSessionId) {
+          return {
+            ok: false as const,
+            error: errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `Session ${params.key} changed while reset was starting; refresh session state before retrying.`,
+              { details: { reason: SESSION_LIFECYCLE_CHANGED_ERROR_REASON } },
+            ),
+          };
+        }
+        try {
+          terminalizeSessionRecoveryCancellation(recoveryCancellation);
+        } catch (error) {
+          logVerbose(
+            `sessions.session-reset: failed to settle committed recovery cancellation: ${String(error)}`,
+          );
+          return {
+            ok: false as const,
+            error: retryableDurableSessionError(
+              `Session ${params.key} recovery cancellation is still settling; try again.`,
+            ),
+          };
+        }
+        const selectedModel = resolveSessionModelRef(cfg, currentEntry, target.agentId);
+        const resolved = {
+          modelProvider: selectedModel.provider,
+          model: selectedModel.model,
+        };
+        return {
+          ok: true as const,
+          key: target.canonicalKey,
+          entry: {
+            ...currentEntry,
+            modelProvider: resolved.modelProvider,
+            model: resolved.model,
+          },
+          resolved,
+          agentId: target.agentId,
+          storePath,
+        };
+      }
       if (!admittedWorkReleased) {
         return {
-          ok: false,
-          error: errorShape(
-            ErrorCodes.UNAVAILABLE,
+          ok: false as const,
+          error: retryableDurableSessionError(
             `Session ${params.key} is still active; try again in a moment.`,
           ),
         };
@@ -975,16 +1175,26 @@ export async function performGatewaySessionReset(params: {
         params.key,
         requestedAgentId ? { agentId: requestedAgentId } : undefined,
       );
+      if (entry?.sessionId !== preparedResetSessionId) {
+        return {
+          ok: false as const,
+          error: errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `Session ${params.key} changed while reset was starting; refresh session state before retrying.`,
+            { details: { reason: SESSION_LIFECYCLE_CHANGED_ERROR_REASON } },
+          ),
+        };
+      }
       const archivedSessionError = resolveSessionWorkStartError(canonicalKey, entry);
       if (archivedSessionError) {
         return {
-          ok: false,
+          ok: false as const,
           error: errorShape(ErrorCodes.INVALID_REQUEST, archivedSessionError),
         };
       }
       if (isModelSelectionLocked(entry)) {
         return {
-          ok: false,
+          ok: false as const,
           error: errorShape(ErrorCodes.INVALID_REQUEST, MODEL_SELECTION_LOCKED_RESET_MESSAGE),
         };
       }
@@ -1026,7 +1236,7 @@ export async function performGatewaySessionReset(params: {
         sessionId: entry?.sessionId,
       });
       if (runtimeCleanupError) {
-        return { ok: false, error: runtimeCleanupError };
+        return { ok: false as const, error: runtimeCleanupError };
       }
       const parentSessionKey = target.canonicalKey ?? canonicalKey ?? params.key;
       const parentAcpError = await closeAcpRuntimeForSession({
@@ -1040,7 +1250,7 @@ export async function performGatewaySessionReset(params: {
         },
       });
       if (parentAcpError) {
-        return { ok: false, error: parentAcpError };
+        return { ok: false as const, error: parentAcpError };
       }
       const pluginCleanup = await runPluginHostCleanup({
         cfg,
@@ -1287,8 +1497,22 @@ export async function performGatewaySessionReset(params: {
           reason: "session-reset",
         });
       }
+      // The old generation is gone. Only now make its durable cancellation terminal.
+      try {
+        terminalizeSessionRecoveryCancellation(recoveryCancellation);
+      } catch (error) {
+        logVerbose(
+          `sessions.session-reset: failed to settle committed recovery cancellation: ${String(error)}`,
+        );
+        return {
+          ok: false as const,
+          error: retryableDurableSessionError(
+            `Session ${params.key} recovery cancellation is still settling; try again.`,
+          ),
+        };
+      }
       return {
-        ok: true,
+        ok: true as const,
         key: target.canonicalKey,
         entry: responseEntry,
         resolved,

@@ -12,6 +12,7 @@ import {
   listAgentRunsForSession,
   onAgentAuditEvent,
   onAgentEvent,
+  projectAgentEventForPublicBoundary,
   registerAgentRunContext,
   releaseAgentRunContext,
   resetAgentEventsForTest,
@@ -39,6 +40,36 @@ describe("agent-events sequencing", () => {
     expect(getAgentRunContext("run-1")?.sessionKey).toBe("main");
     clearAgentRunContext("run-1");
     expect(getAgentRunContext("run-1")).toBeUndefined();
+  });
+
+  test("projects private execution events to one stable public identity", () => {
+    const privateRunId = "private-recovery-attempt";
+    const publicRunId = "public-recovery-turn";
+    claimAgentRunContext(privateRunId, {
+      lifecycleGeneration: getAgentEventLifecycleGeneration(),
+      publicRunId,
+      sessionKey: "agent:main:main",
+    });
+    let internalEvent: AgentEventPayload | undefined;
+    const stop = onAgentEvent((event) => {
+      internalEvent = event;
+    });
+
+    emitAgentEvent({
+      runId: privateRunId,
+      stream: "assistant",
+      data: { text: "done" },
+    });
+    stop();
+
+    expect(internalEvent?.runId).toBe(privateRunId);
+    expect(internalEvent?.publicRunId).toBe(publicRunId);
+    expect(Object.keys(internalEvent ?? {})).not.toContain("publicRunId");
+    const projected = projectAgentEventForPublicBoundary(internalEvent!);
+    expect(projected.runId).toBe(publicRunId);
+    expect(JSON.stringify(projected)).not.toContain(privateRunId);
+    expect(projected.lifecycleGeneration).toBeUndefined();
+    expect(projected.publicRunId).toBeUndefined();
   });
 
   test("does not let an old execution clear a newer same-id context", () => {

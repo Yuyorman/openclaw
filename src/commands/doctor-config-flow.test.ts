@@ -15,6 +15,8 @@ const terminalNoteMock = vi.hoisted(() => vi.fn<TerminalNote>());
 const callGatewayMock = vi.hoisted(() => vi.fn());
 const runDoctorRepairSequenceMock = vi.hoisted(() => vi.fn());
 const runDoctorConfigPreflightOptionsMock = vi.hoisted(() => vi.fn());
+const inspectDoctorMainRunRecoveryMock = vi.hoisted(() => vi.fn());
+const migrateDoctorMainRunRecoveryMock = vi.hoisted(() => vi.fn());
 const collectDoctorPreviewNotesParamsMock = vi.hoisted(() => vi.fn());
 const collectImplicitFallbackClobberWarningsMock = vi.hoisted(() =>
   vi.fn<(cfg: unknown) => string[]>(() => []),
@@ -226,6 +228,11 @@ const legacyConfigMigrationForTest = vi.hoisted(() => {
     },
   };
 });
+
+vi.mock("./doctor-main-run-recovery.js", () => ({
+  inspectDoctorMainRunRecovery: inspectDoctorMainRunRecoveryMock,
+  migrateDoctorMainRunRecovery: migrateDoctorMainRunRecoveryMock,
+}));
 
 vi.mock("../../packages/terminal-core/src/note.js", () => ({
   note: terminalNoteMock,
@@ -1533,6 +1540,26 @@ describe("doctor config flow", () => {
     collectImplicitFallbackClobberWarningsMock.mockReturnValue([]);
     noteImplicitFallbackClobberWarningsMock.mockClear();
     runDoctorConfigPreflightOptionsMock.mockClear();
+    inspectDoctorMainRunRecoveryMock.mockReset();
+    inspectDoctorMainRunRecoveryMock.mockResolvedValue({ changes: [], warnings: [] });
+    migrateDoctorMainRunRecoveryMock.mockReset();
+    migrateDoctorMainRunRecoveryMock.mockResolvedValue({ changes: [], warnings: [] });
+  });
+
+  it("applies main-run recovery migration only in repair mode", async () => {
+    await runDoctorConfigWithInput({
+      config: {},
+      run: loadAndMaybeMigrateDoctorConfig,
+    });
+    expect(inspectDoctorMainRunRecoveryMock).toHaveBeenCalledOnce();
+    expect(migrateDoctorMainRunRecoveryMock).not.toHaveBeenCalled();
+
+    await runDoctorConfigWithInput({
+      config: {},
+      repair: true,
+      run: loadAndMaybeMigrateDoctorConfig,
+    });
+    expect(migrateDoctorMainRunRecoveryMock).toHaveBeenCalledOnce();
   });
 
   it("grants config preflight cross-state imports only with repair and direct capability", async () => {

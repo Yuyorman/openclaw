@@ -43,6 +43,10 @@ import {
   waitForEmbeddedAgentRunEnd,
 } from "../../agents/embedded-agent-runner/runs.js";
 import { compactEmbeddedAgentSession } from "../../agents/embedded-agent.js";
+import {
+  createMainRunRecoveryCancellationSettlementToken,
+  settleMainRunRecoveryCancellation,
+} from "../../agents/main-run-recovery-runtime.js";
 import { resolvePersistedSessionRuntimeId } from "../../agents/session-runtime-compat.js";
 import { resolveIngressWorkspaceOverrideForSessionRun } from "../../agents/spawned-context.js";
 import { insideGitCheckout } from "../../agents/worktrees/git.js";
@@ -92,6 +96,13 @@ import {
   recordSessionCompacted,
 } from "../../sessions/session-state-events.js";
 import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
+import {
+  findActiveMainRunRecoveryBySession,
+  getMainRunRecovery,
+  requestMainRunRecoveryCancellation,
+  type MainRunRecovery,
+  type MainRunRecoveryCas,
+} from "../../state/main-run-recovery-store.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
 import { resolveSessionKeyForRun } from "../server-session-key.js";
 import {
@@ -164,8 +175,89 @@ import { assertValidParams } from "./validation.js";
 const log = createSubsystemLogger("gateway/sessions");
 
 const compactionCheckpointStore = createFileBackedCompactionCheckpointStore();
+const DURABLE_SESSION_RETRY_AFTER_MS = 1_000;
 const MODEL_SELECTION_LOCKED_CHECKPOINT_MESSAGE =
   "Checkpoint branch and restore are unavailable while model selection is locked.";
+
+function retryableDurableSessionError(message: string) {
+  return errorShape(ErrorCodes.UNAVAILABLE, message, {
+    retryable: true,
+    retryAfterMs: DURABLE_SESSION_RETRY_AFTER_MS,
+  });
+}
+
+function mainRunRecoveryCas(recovery: MainRunRecovery): MainRunRecoveryCas {
+  if (recovery.state === "terminal") {
+    throw new Error(`main-run recovery ${recovery.publicRunId} is already terminal`);
+  }
+  return {
+    publicRunId: recovery.publicRunId,
+    expectedRevision: recovery.revision,
+    expectedState: recovery.state,
+    agentId: recovery.agentId,
+    sessionKey: recovery.sessionKey,
+    sessionKeyAliases: recovery.sessionKeyAliases,
+    sessionId: recovery.sessionId,
+    storePath: recovery.storePath,
+  };
+}
+
+function requestRecoveryCancellation(
+  recovery: MainRunRecovery | undefined,
+  kind: "abort" | "delete",
+) {
+  if (!recovery || recovery.state === "terminal") {
+    return recovery;
+  }
+  if (recovery.state === "cancelling") {
+    if (recovery.cancellation?.kind !== kind) {
+      throw new Error(`main-run recovery ${recovery.publicRunId} has a foreign cancellation owner`);
+    }
+    return recovery;
+  }
+  const requestedAtMs = Date.now();
+  const cancellation = requestMainRunRecoveryCancellation({
+    ...mainRunRecoveryCas(recovery),
+    cancellation: { kind, epoch: randomUUID(), requestedAtMs },
+    nowMs: requestedAtMs,
+  });
+  if (!cancellation) {
+    throw new Error(`lost cancellation ownership for main-run recovery ${recovery.publicRunId}`);
+  }
+  return cancellation;
+}
+
+function findAndRequestSessionRecoveryCancellation(params: {
+  agentId: string;
+  sessionKey: string;
+  sessionId: string;
+  storePath: string;
+}) {
+  return requestRecoveryCancellation(findActiveMainRunRecoveryBySession(params), "delete");
+}
+
+function terminalizeRecoveryCancellation(
+  recovery: MainRunRecovery | undefined,
+  kind: "abort" | "delete",
+): void {
+  if (!recovery) {
+    return;
+  }
+  if (recovery.state !== "cancelling" || recovery.cancellation?.kind !== kind) {
+    throw new Error(`main-run recovery ${recovery.publicRunId} is not cancelling for ${kind}`);
+  }
+  const nowMs = Date.now();
+  const terminal = settleMainRunRecoveryCancellation(
+    createMainRunRecoveryCancellationSettlementToken(recovery),
+    {
+      endedAtMs: nowMs,
+      nowMs,
+    },
+  );
+  if (!terminal) {
+    throw new Error(`lost terminal ownership for main-run recovery ${recovery.publicRunId}`);
+  }
+}
 
 function filterSessionStoreToConfiguredAgents(
   cfg: OpenClawConfig,
@@ -628,8 +720,7 @@ async function interruptSessionRunIfActive(params: {
     if (!ended) {
       return {
         interrupted: true,
-        error: errorShape(
-          ErrorCodes.UNAVAILABLE,
+        error: retryableDurableSessionError(
           `Session ${params.requestedKey} is still active; try again in a moment.`,
         ),
       };
@@ -1986,6 +2077,20 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     const p = params;
     const cfg = context.getRuntimeConfig();
     const requestedRunId = readStringValue(p.runId);
+    let requestedRecovery: MainRunRecovery | undefined;
+    if (requestedRunId) {
+      try {
+        requestedRecovery = getMainRunRecovery(requestedRunId);
+      } catch (error) {
+        log.warn(`failed to read main-run recovery ${requestedRunId}: ${String(error)}`);
+        respond(
+          false,
+          undefined,
+          retryableDurableSessionError("Recovery state is unavailable; try again."),
+        );
+        return;
+      }
+    }
     const requestedKey = normalizeOptionalString(p.key);
     const requestedParamAgentId = normalizeOptionalString(p.agentId);
     const scopedRequestedKey = resolveScopedAbortKey({
@@ -2009,6 +2114,9 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     const activeRunAgentId = normalizeOptionalString(activeRun?.agentId);
     const inferredRunAgentId =
       requestedParamAgentId ??
+      (requestedRecovery
+        ? resolveSessionKeyAgentId(requestedRecovery.sessionKey, cfg)
+        : undefined) ??
       (requestedRunId && scopedRequestedKey?.toLowerCase() === "global"
         ? activeRunAgentId
         : undefined) ??
@@ -2029,6 +2137,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     const keyCandidate =
       scopedRequestedKey ??
       scopedActiveRunSessionKey ??
+      requestedRecovery?.sessionKey ??
       (requestedRunId
         ? resolveSessionKeyForRun(requestedRunId, {
             agentId: requestedRunAgentId ?? resolveDefaultAgentId(cfg),
@@ -2052,7 +2161,45 @@ export const sessionsHandlers: GatewayRequestHandlers = {
       return;
     }
     const requestedGlobalAgentId = requestedGlobalAgent.agentId;
-    const { canonicalKey } = loadSessionEntry(key, { agentId: requestedGlobalAgentId });
+    const loadedSession = loadSessionEntry(key, { agentId: requestedGlobalAgentId });
+    const { canonicalKey } = loadedSession;
+    if (
+      requestedRecovery &&
+      requestedKey &&
+      (loadedSession.storePath !== requestedRecovery.storePath ||
+        loadedSession.entry?.sessionId !== requestedRecovery.sessionId)
+    ) {
+      respond(true, { ok: true, abortedRunId: null, status: "no-active-run" });
+      return;
+    }
+    let recoveryCancellation: MainRunRecovery | undefined;
+    try {
+      const recovery =
+        requestedRunId !== undefined
+          ? requestedRecovery?.state !== "terminal"
+            ? requestedRecovery
+            : undefined
+          : loadedSession.entry?.sessionId
+            ? findActiveMainRunRecoveryBySession({
+                agentId:
+                  requestedGlobalAgentId ??
+                  resolveSessionKeyAgentId(canonicalKey, cfg) ??
+                  resolveDefaultAgentId(cfg),
+                sessionKey: canonicalKey,
+                sessionId: loadedSession.entry.sessionId,
+                storePath: loadedSession.storePath,
+              })
+            : undefined;
+      recoveryCancellation = requestRecoveryCancellation(recovery, "abort");
+    } catch (error) {
+      log.warn(`failed to cancel main-run recovery for ${canonicalKey}: ${String(error)}`);
+      respond(
+        false,
+        undefined,
+        retryableDurableSessionError("Recovery cancellation could not be committed; try again."),
+      );
+      return;
+    }
     const requestedKeyAliases =
       requestedKey &&
       requestedKey !== key &&
@@ -2096,6 +2243,19 @@ export const sessionsHandlers: GatewayRequestHandlers = {
           respond(ok, payload, error, meta);
           return;
         }
+        try {
+          terminalizeRecoveryCancellation(recoveryCancellation, "abort");
+        } catch (settlementError) {
+          log.warn(
+            `failed to settle main-run recovery cancellation for ${canonicalKey}: ${String(settlementError)}`,
+          );
+          respond(
+            false,
+            undefined,
+            retryableDurableSessionError("Recovery cancellation is still settling; try again."),
+          );
+          return;
+        }
         const runIds =
           payload &&
           typeof payload === "object" &&
@@ -2104,7 +2264,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
                 Boolean(normalizeOptionalString(value)),
               )
             : [];
-        const firstAbortedRunId = runIds[0] ?? null;
+        const firstAbortedRunId = runIds[0] ?? recoveryCancellation?.publicRunId ?? null;
         abortedRunId = firstAbortedRunId;
         if (firstAbortedRunId) {
           const endedAt = Date.now();
@@ -2442,6 +2602,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     const result = await performGatewaySessionReset({
       key,
       ...(p.agentId ? { agentId: p.agentId } : {}),
+      ...(p.expectedSessionId ? { expectedSessionId: p.expectedSessionId } : {}),
       reason,
       commandSource: "gateway:sessions.reset",
     });
@@ -2507,6 +2668,20 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     const initialDeleteEntry = loadSessionEntry(key, {
       agentId: requestedAgentId,
     }).entry;
+    const expectedSessionId = p.expectedSessionId?.trim();
+    const expectedLifecycleRevision = p.expectedLifecycleRevision?.trim();
+    const expectedSessionUpdatedAt = p.expectedSessionUpdatedAt;
+    const expectedLifecycleRevisionMatches = (entry: SessionEntry | undefined): boolean =>
+      !expectedLifecycleRevision || entry?.lifecycleRevision === expectedLifecycleRevision;
+    const expectedSessionIdMatches = (entry: SessionEntry | undefined): boolean => {
+      if (!expectedSessionId || entry?.sessionId === expectedSessionId) {
+        return true;
+      }
+      return false;
+    };
+    const potentialCommittedRetry = Boolean(
+      expectedSessionId && !expectedSessionIdMatches(initialDeleteEntry),
+    );
     const rejectModelSelectionLockedDelete = (entry: SessionEntry | undefined): boolean => {
       if (!isModelSelectionLocked(entry)) {
         return false;
@@ -2521,12 +2696,17 @@ export const sessionsHandlers: GatewayRequestHandlers = {
       );
       return true;
     };
-    if (rejectModelSelectionLockedDelete(initialDeleteEntry)) {
+    if (!potentialCommittedRetry && rejectModelSelectionLockedDelete(initialDeleteEntry)) {
       return;
     }
     // archivedOnly is the archive-then-delete contract: the dispatcher grants
     // it to write-scope operators, so the target must actually be archived.
-    if (p.archivedOnly === true && initialDeleteEntry?.archivedAt === undefined) {
+    if (
+      p.archivedOnly === true &&
+      initialDeleteEntry &&
+      initialDeleteEntry.archivedAt === undefined &&
+      !potentialCommittedRetry
+    ) {
       respond(
         false,
         undefined,
@@ -2537,17 +2717,6 @@ export const sessionsHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const expectedSessionId = p.expectedSessionId?.trim();
-    const expectedLifecycleRevision = p.expectedLifecycleRevision?.trim();
-    const expectedSessionUpdatedAt = p.expectedSessionUpdatedAt;
-    const expectedLifecycleRevisionMatches = (entry: SessionEntry | undefined): boolean =>
-      !expectedLifecycleRevision || entry?.lifecycleRevision === expectedLifecycleRevision;
-    const expectedSessionIdMatches = (entry: SessionEntry | undefined): boolean => {
-      if (!expectedSessionId || entry?.sessionId === expectedSessionId) {
-        return true;
-      }
-      return false;
-    };
     const respondSessionChanged = () => {
       respond(
         false,
@@ -2570,10 +2739,17 @@ export const sessionsHandlers: GatewayRequestHandlers = {
       respondSessionChanged();
       return true;
     };
-    if (rejectExpectedSessionMismatch(initialDeleteEntry)) {
+    // Missing or replaced rows need the lifecycle-locked SQLite check below: a
+    // previous attempt may have committed deletion before cancellation settlement.
+    if (
+      initialDeleteEntry &&
+      !potentialCommittedRetry &&
+      rejectExpectedSessionMismatch(initialDeleteEntry)
+    ) {
       return;
     }
     if (
+      !potentialCommittedRetry &&
       rejectPluginRuntimeDeleteMismatch({
         client,
         key: target.canonicalKey ?? key,
@@ -2616,18 +2792,61 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     let admittedWorkReleased = true;
     let expectedSessionStillCurrent = true;
     let deleteBlockedByModelLock = false;
+    let preparedDeleteSessionId: string | undefined;
+    let recoveryCancellation: MainRunRecovery | undefined;
+    let recoveryCancellationError: unknown;
+    let committedDeleteRetry = false;
+    let deletionAbsenceCommitted = false;
+    let postCommitDeleteFailed = false;
+    let postCommitDeleteError: unknown;
     const deletion = await runExclusiveSessionLifecycleMutation({
       scope: storePath,
       identities: deleteLifecycleIdentities,
+      bypassDurableBarrier: true,
       prepare: async () => {
         const preparedEntry = loadSessionEntry(key, { agentId: requestedAgentId }).entry;
+        preparedDeleteSessionId = preparedEntry?.sessionId;
+        if (expectedSessionId && !expectedSessionIdMatches(preparedEntry)) {
+          try {
+            recoveryCancellation = findAndRequestSessionRecoveryCancellation({
+              agentId: target.agentId,
+              sessionKey: target.canonicalKey,
+              sessionId: expectedSessionId,
+              storePath,
+            });
+          } catch (error) {
+            recoveryCancellationError = error;
+            return;
+          }
+          committedDeleteRetry = recoveryCancellation?.state === "cancelling";
+          expectedSessionStillCurrent = committedDeleteRetry;
+          return;
+        }
         deleteBlockedByModelLock = rejectModelSelectionLockedDelete(preparedEntry);
         if (deleteBlockedByModelLock) {
           return;
         }
-        expectedSessionStillCurrent = !rejectExpectedSessionMismatch(preparedEntry);
-        if (!expectedSessionStillCurrent) {
-          return;
+        if (preparedEntry?.sessionId) {
+          expectedSessionStillCurrent = !rejectExpectedSessionMismatch(preparedEntry);
+          if (!expectedSessionStillCurrent) {
+            return;
+          }
+          try {
+            recoveryCancellation = findAndRequestSessionRecoveryCancellation({
+              agentId: target.agentId,
+              sessionKey: target.canonicalKey,
+              sessionId: preparedEntry.sessionId,
+              storePath,
+            });
+          } catch (error) {
+            recoveryCancellationError = error;
+            return;
+          }
+        } else {
+          expectedSessionStillCurrent = !rejectExpectedSessionMismatch(preparedEntry);
+          if (!expectedSessionStillCurrent) {
+            return;
+          }
         }
         admittedWorkReleased = await interruptSessionWorkAdmissions({
           scope: storePath,
@@ -2636,24 +2855,63 @@ export const sessionsHandlers: GatewayRequestHandlers = {
         });
       },
       run: async () => {
-        if (deleteBlockedByModelLock || !expectedSessionStillCurrent) {
+        if (recoveryCancellationError) {
+          log.warn(
+            `failed to request main-run recovery cancellation for ${key}: ${String(recoveryCancellationError)}`,
+          );
+          respond(
+            false,
+            undefined,
+            retryableDurableSessionError(
+              `Session ${key} recovery cancellation could not be committed; try again.`,
+            ),
+          );
+          return undefined;
+        }
+        if (committedDeleteRetry) {
+          // The expected session ID names the retired row. A retry may settle
+          // its barrier, but must never delete the replacement visible now.
+          const currentEntry = loadSessionEntry(key, { agentId: requestedAgentId }).entry;
+          if (currentEntry?.sessionId !== preparedDeleteSessionId) {
+            respondSessionChanged();
+            return undefined;
+          }
+          try {
+            terminalizeRecoveryCancellation(recoveryCancellation, "delete");
+          } catch (error) {
+            log.warn(
+              `failed to settle main-run recovery for deleted session ${key}: ${String(error)}`,
+            );
+            respond(
+              false,
+              undefined,
+              retryableDurableSessionError(
+                `Session ${key} recovery cancellation is still settling; try again.`,
+              ),
+            );
+            return undefined;
+          }
+          return { archivedTranscripts: [], deleted: false };
+        }
+        if (!expectedSessionStillCurrent) {
+          respondSessionChanged();
+          return undefined;
+        }
+        if (deleteBlockedByModelLock) {
           return undefined;
         }
         if (!admittedWorkReleased) {
           respond(
             false,
             undefined,
-            errorShape(ErrorCodes.UNAVAILABLE, `Session ${key} is still active; try again.`),
+            retryableDurableSessionError(`Session ${key} is still active; try again.`),
           );
           return undefined;
         }
         const { entry, legacyKey, canonicalKey } = loadSessionEntry(key, {
           agentId: requestedAgentId,
         });
-        if (rejectModelSelectionLockedDelete(entry)) {
-          return undefined;
-        }
-        if (rejectExpectedSessionMismatch(entry)) {
+        if (rejectModelSelectionLockedDelete(entry) || rejectExpectedSessionMismatch(entry)) {
           return undefined;
         }
         // Recheck under the lifecycle lock: an unarchive racing the pre-lock
@@ -2702,23 +2960,50 @@ export const sessionsHandlers: GatewayRequestHandlers = {
           respondSessionChanged();
           return undefined;
         }
-        const result = await deleteSessionEntryLifecycle({
-          agentId: target.agentId,
-          archiveTranscript: deleteTranscript,
-          expectedEntry: postCleanupEntry,
-          expectedLifecycleRevision,
-          expectedSessionId,
-          expectedUpdatedAt: postCleanupEntry?.updatedAt,
-          storePath,
-          target: {
-            canonicalKey: target.canonicalKey,
-            storeKeys: target.storeKeys,
-          },
-        });
+        let result: Awaited<ReturnType<typeof deleteSessionEntryLifecycle>>;
+        try {
+          result = await deleteSessionEntryLifecycle({
+            agentId: target.agentId,
+            archiveTranscript: deleteTranscript,
+            expectedEntry: postCleanupEntry,
+            expectedLifecycleRevision,
+            expectedSessionId,
+            expectedUpdatedAt: postCleanupEntry?.updatedAt,
+            storePath,
+            target: {
+              canonicalKey: target.canonicalKey,
+              storeKeys: target.storeKeys,
+            },
+          });
+        } catch (error) {
+          // Transcript archival follows the session-store write. If that
+          // post-commit step fails, the missing exact row still owns the
+          // cancellation outcome; never restore a recoverable ghost turn.
+          const currentEntry = loadSessionEntry(key, { agentId: requestedAgentId }).entry;
+          if (postCleanupEntry && currentEntry?.sessionId !== postCleanupEntry.sessionId) {
+            deletionAbsenceCommitted = true;
+            postCommitDeleteFailed = true;
+            postCommitDeleteError = error;
+            result = {
+              archivedTranscripts: [],
+              deleted: true,
+              deletedEntry: postCleanupEntry,
+              ...(postCleanupEntry.sessionId
+                ? { deletedSessionId: postCleanupEntry.sessionId }
+                : {}),
+              ...(postCleanupEntry.sessionFile
+                ? { deletedSessionFile: postCleanupEntry.sessionFile }
+                : {}),
+            };
+          } else {
+            throw error;
+          }
+        }
         if (result.expectedEntryMismatch) {
           respondSessionChanged();
           return undefined;
         }
+        deletionAbsenceCommitted = result.deleted || !postCleanupEntry;
         if (result.deleted) {
           emitGatewaySessionEndPluginHook({
             cfg,
@@ -2768,6 +3053,41 @@ export const sessionsHandlers: GatewayRequestHandlers = {
       }
     }
 
+    const emitDeletedSessionChanged = () => {
+      if (!deleted) {
+        return;
+      }
+      emitSessionsChanged(context, {
+        sessionKey: target.canonicalKey,
+        ...(target.canonicalKey === "global" && requestedAgentId
+          ? { agentId: requestedAgentId }
+          : {}),
+        reason: "delete",
+      });
+    };
+    if (postCommitDeleteFailed) {
+      // Keep the durable cancellation pending: the exact retry must be able to
+      // reconcile the committed delete after this post-store failure.
+      emitDeletedSessionChanged();
+      throw postCommitDeleteError;
+    }
+    if (deletionAbsenceCommitted) {
+      try {
+        terminalizeRecoveryCancellation(recoveryCancellation, "delete");
+      } catch (error) {
+        log.warn(`failed to settle main-run recovery for deleted session ${key}: ${String(error)}`);
+        emitDeletedSessionChanged();
+        respond(
+          false,
+          undefined,
+          retryableDurableSessionError(
+            `Session ${key} recovery cancellation is still settling; try again.`,
+          ),
+        );
+        return;
+      }
+    }
+
     respond(
       true,
       {
@@ -2779,15 +3099,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
       },
       undefined,
     );
-    if (deleted) {
-      emitSessionsChanged(context, {
-        sessionKey: target.canonicalKey,
-        ...(target.canonicalKey === "global" && requestedAgentId
-          ? { agentId: requestedAgentId }
-          : {}),
-        reason: "delete",
-      });
-    }
+    emitDeletedSessionChanged();
   },
   "sessions.groups.list": async ({ params, respond }) => {
     if (

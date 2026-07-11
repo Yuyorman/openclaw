@@ -120,6 +120,11 @@ openclaw gateway restart --wait 30s
 
 `--force` skips the active-work drain and restarts immediately. Plain `restart` (no flags) keeps the existing service-manager restart behavior.
 
+Before one-way teardown, the running Gateway makes interrupted main-session
+recovery durable. If that preflight fails, the restart is cancelled and the
+current Gateway stays online. See [Restart recovery](/gateway/restart-recovery)
+for the Control UI admission and resume contract.
+
 <Warning>
 Inline `--password` can be exposed in local process listings. Prefer `--password-file`, env, or a SecretRef-backed `gateway.auth.password`.
 </Warning>

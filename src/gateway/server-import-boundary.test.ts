@@ -81,10 +81,11 @@ describe("gateway startup import boundaries", () => {
     expect(serverImpl.match(/await loadWorkerEnvironmentRuntimeModule\(\)/gu)).toHaveLength(3);
   });
 
-  it("marks gateway close before awaiting gateway_stop hooks", () => {
+  it("prepares restart before marking gateway close and awaiting gateway_stop hooks", () => {
     const serverImpl = readSource("src/gateway/server.impl.ts");
     const closeStart = /close:\s*async\s*\([^)]*\)\s*=>/u.exec(serverImpl)?.index ?? -1;
     const hookStart = serverImpl.indexOf("runGlobalGatewayStopSafely", closeStart);
+    const prepareStart = serverImpl.indexOf("prepareRestartClose(optsLocal)", closeStart);
     const markStart = serverImpl.indexOf("markClosePreludeStarted();", closeStart);
     const markHelperStart = serverImpl.indexOf("const markClosePreludeStarted = () => {");
     const markHelperEnd = serverImpl.indexOf("};", markHelperStart);
@@ -93,6 +94,8 @@ describe("gateway startup import boundaries", () => {
     const postReadyBlock = serverImpl.slice(postReadyStart, postReadyEnd);
 
     expect(closeStart).toBeGreaterThan(-1);
+    expect(prepareStart).toBeGreaterThan(closeStart);
+    expect(prepareStart).toBeLessThan(markStart);
     expect(markStart).toBeGreaterThan(closeStart);
     expect(markStart).toBeLessThan(hookStart);
     expect(markHelperStart).toBeGreaterThan(-1);

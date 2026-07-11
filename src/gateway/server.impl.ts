@@ -60,7 +60,11 @@ import {
 } from "../plugins/runtime.js";
 import { resolveWorkerProvider } from "../plugins/worker-provider-registry.js";
 import { getTotalQueueSize, isGatewayDraining } from "../process/command-queue.js";
-import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
+import {
+  beginGatewayRestartSignalAdmission,
+  getActiveGatewayRootWorkCount,
+  markGatewayRestartDraining,
+} from "../process/gateway-work-admission.js";
 import type { RuntimeEnv } from "../runtime.js";
 import {
   clearSecretsRuntimeSnapshot,
@@ -70,9 +74,14 @@ import {
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { createLazyPromise } from "../shared/lazy-runtime.js";
 import { recordRemoteNodeInfo, removeRemoteNodeInfo } from "../skills/runtime/remote.js";
+import { resolveActiveRunByIdentity } from "./active-run-registry.js";
 import { createAuthRateLimiter, type AuthRateLimiter } from "./auth-rate-limit.js";
 import { resolveGatewayAuth } from "./auth.js";
-import type { RestartRecoveryCandidate } from "./chat-abort.js";
+import {
+  abortTrackedChatRunById,
+  isChatAbortControllerEntryAbortable,
+  type RestartRecoveryCandidate,
+} from "./chat-abort.js";
 import { ADMIN_SCOPE } from "./method-scopes.js";
 import {
   STARTUP_UNAVAILABLE_GATEWAY_METHODS,
@@ -102,7 +111,6 @@ import {
   resumeGatewayRestartTraceFromHandoff,
 } from "./restart-trace.js";
 import { resolveGatewayPluginConfig } from "./runtime-plugin-config.js";
-import type { ChannelAutostartSuppression } from "./server-channels.js";
 import { resolveGatewayControlUiRootState } from "./server-control-ui-root.js";
 import { createLazyGatewayCronState } from "./server-cron-lazy.js";
 import { createGatewayCronReconciliation } from "./server-cron-reconciled.js";
@@ -111,7 +119,10 @@ import { createGatewayServerLiveState, type GatewayServerLiveState } from "./ser
 import { GATEWAY_EVENTS } from "./server-methods-list.js";
 import { clearNodeWakeState } from "./server-methods/nodes-wake-state.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./server-methods/types.js";
-import { setFallbackGatewayContextResolver } from "./server-plugins.js";
+import {
+  dispatchGatewayMethodInProcessRaw,
+  setFallbackGatewayContextResolver,
+} from "./server-plugins.js";
 import type { GatewayPluginReloadResult } from "./server-reload-handlers.js";
 import { createGatewayRuntimeState } from "./server-runtime-state.js";
 import {
@@ -120,6 +131,7 @@ import {
   type SharedGatewaySessionGenerationState,
 } from "./server-shared-auth-generation.js";
 import type { GatewaySidecarStartupMode } from "./server-sidecar-startup-mode.js";
+import type { GatewayStartupWorkSuppression } from "./server-startup-work-suppression.js";
 import { createWizardSessionTracker } from "./server-wizard-sessions.js";
 import { createGatewayEventLoopHealthMonitor } from "./server/event-loop-health.js";
 import {
@@ -523,7 +535,7 @@ export type GatewayServerOptions = {
     prompter: import("../wizard/prompts.js").WizardPrompter,
   ) => Promise<void>;
   sidecarStartup?: GatewaySidecarStartupMode;
-  channelAutostartSuppression?: ChannelAutostartSuppression;
+  startupWorkSuppression?: GatewayStartupWorkSuppression;
   /**
    * Optional startup timestamp used for concise readiness logging.
    */
@@ -965,7 +977,7 @@ export async function startGatewayServer(
     startupTrace,
     deferStartupAccountStartsUntil: startupAccountStartsReady,
   });
-  channelManager.setAutostartSuppression(opts.channelAutostartSuppression ?? null);
+  channelManager.setAutostartSuppression(opts.startupWorkSuppression ?? null);
   const sidecarStartup = opts.sidecarStartup ?? "start";
   const isGatewayStartupPending = () => !startupSidecarsReady && sidecarStartup === "start";
   const getReadiness = createReadinessChecker({
@@ -1062,6 +1074,105 @@ export async function startGatewayServer(
     nodePluginToolsEnabled: cfgAtStart.gateway?.nodes?.pluginTools?.enabled !== false,
     nodeSkillsEnabled: cfgAtStart.gateway?.nodes?.skills?.enabled !== false,
   });
+  const projectedMainRunRecoveryTerminals = new Set<string>();
+  const notifyMainRunRecoveryTerminal = (
+    notification: import("../agents/main-run-recovery-worker.js").MainRunRecoveryTerminalNotification,
+  ) => {
+    if (projectedMainRunRecoveryTerminals.has(notification.publicRunId)) {
+      return;
+    }
+    // Recovery terminalization is already durable. Project only the public id
+    // so a retired execution alias cannot keep a Control UI spinner alive.
+    projectedMainRunRecoveryTerminals.add(notification.publicRunId);
+    const runId = notification.publicRunId;
+    const seq = (agentRunSeq.get(runId) ?? 0) + 1;
+    const phase = notification.status === "done" ? "end" : "error";
+    const agentPayload = {
+      runId,
+      seq,
+      stream: "lifecycle",
+      ts: notification.endedAtMs,
+      sessionKey: notification.sessionKey,
+      agentId: notification.agentId,
+      data: {
+        phase,
+        status: notification.status,
+        ...(notification.message ? { error: notification.message } : {}),
+      },
+    };
+    const chatPayload = {
+      runId,
+      sessionKey: notification.sessionKey,
+      agentId: notification.agentId,
+      state:
+        notification.status === "done"
+          ? ("final" as const)
+          : notification.status === "cancelled"
+            ? ("aborted" as const)
+            : ("error" as const),
+      ...(notification.message ? { errorMessage: notification.message } : {}),
+    };
+    agentRunSeq.set(runId, seq);
+    chatRunState.clearRun(runId);
+    removeChatRun(runId, runId, notification.sessionKey);
+    broadcast("agent", agentPayload);
+    broadcast("chat", chatPayload);
+    nodeSendToSession(notification.sessionKey, "agent", agentPayload);
+    nodeSendToSession(notification.sessionKey, "chat", chatPayload);
+  };
+  const abortMainRunRecoveryExecution: import("../agents/main-run-recovery-worker.js").MainRunRecoveryExecutionAbort =
+    (execution) => {
+      const resolved = resolveActiveRunByIdentity(chatAbortControllers, execution.runId);
+      if (!resolved || resolved.identity.executionRunId !== execution.runId) {
+        return resolved ? "unknown" : "inactive";
+      }
+      const { entry } = resolved;
+      const owner = entry.mainRunRecoveryExecution;
+      if (
+        !owner ||
+        owner.execution.runId !== execution.runId ||
+        owner.execution.lifecycleGeneration !== execution.lifecycleGeneration ||
+        owner.execution.epoch !== execution.epoch ||
+        entry.lifecycleGeneration !== execution.lifecycleGeneration
+      ) {
+        return "unknown";
+      }
+      if (entry.controller.signal.aborted) {
+        return "aborted";
+      }
+      if (!isChatAbortControllerEntryAbortable(entry)) {
+        return "inactive";
+      }
+      const result = abortTrackedChatRunById(
+        {
+          chatAbortControllers,
+          chatRunBuffers,
+          chatRunState,
+          removeChatRun,
+          agentRunSeq,
+          broadcast,
+          nodeSendToSession,
+        },
+        {
+          runId: execution.runId,
+          sessionKey: entry.sessionKey,
+          stopReason: "main-run recovery cancellation",
+        },
+      );
+      return result.aborted ? "aborted" : "unknown";
+    };
+  const callMainRunRecoveryAgent = async (params: Record<string, unknown>) => {
+    const response = await dispatchGatewayMethodInProcessRaw("agent", params, {
+      forceSyntheticClient: true,
+      timeoutMs: 10_000,
+    });
+    if (!response.ok) {
+      throw new Error(response.error?.message ?? "main-run recovery agent dispatch failed");
+    }
+    return response.payload && typeof response.payload === "object"
+      ? (response.payload as { status?: string })
+      : {};
+  };
   const { createWatchNodeHttpRuntime } = await import("./watch-node-http.js");
   const watchNodeHttpRuntime = createWatchNodeHttpRuntime({
     nodeRegistry,
@@ -1217,7 +1328,24 @@ export async function startGatewayServer(
       await gatewayLifetimeSidecar.stop();
     }
   };
-  const createCloseHandler = () => async (optsValue?: GatewayCloseOptions) => {
+  const markMainSessionsAbortedForRestart: import("./server-close.js").MarkMainSessionsAbortedForRestart =
+    async ({ sessionKeys, sessionIds, activeRuns, reason, isActiveRun }) => {
+      if (sessionKeys.size === 0 && sessionIds.size === 0) {
+        return;
+      }
+      const { reserveRestartAbortedMainSessions } =
+        await import("../agents/main-session-restart-reservation.js");
+      await reserveRestartAbortedMainSessions({
+        cfg: getRuntimeConfig(),
+        sessionKeys,
+        sessionIds,
+        activeRuns,
+        isActiveRun,
+        reason,
+      });
+    };
+  type PreparedGatewayCloseOptions = GatewayCloseOptions & { restartPrepared?: boolean };
+  const createCloseHandler = () => async (optsValue?: PreparedGatewayCloseOptions) => {
     const channelIds = listLoadedChannelPlugins().map((plugin) => plugin.id as ChannelId);
     const { createGatewayCloseHandler, drainActiveSessionsForShutdown } =
       await loadGatewayCloseModule();
@@ -1254,27 +1382,7 @@ export async function startGatewayServer(
       agentRunSeq,
       nodeSendToSession,
       resolveActiveSessionIdForKey: resolveActiveEmbeddedRunSessionId,
-      markMainSessionsAbortedForRestart: async ({
-        sessionKeys,
-        sessionIds,
-        activeRuns,
-        reason,
-        isActiveRun,
-      }) => {
-        if (sessionKeys.size === 0 && sessionIds.size === 0) {
-          return;
-        }
-        const { markRestartAbortedMainSessions } =
-          await import("../agents/main-session-restart-recovery.js");
-        await markRestartAbortedMainSessions({
-          cfg: getRuntimeConfig(),
-          sessionKeys,
-          sessionIds,
-          activeRuns,
-          isActiveRun,
-          reason,
-        });
-      },
+      markMainSessionsAbortedForRestart,
       getPendingReplyCount: getTotalPendingReplies,
       clients,
       configReloader: runtimeState.configReloader,
@@ -1629,6 +1737,20 @@ export async function startGatewayServer(
     const unavailableGatewayMethods = new Set<string>(
       minimalTestGateway ? [] : STARTUP_UNAVAILABLE_GATEWAY_METHODS,
     );
+    if (!minimalTestGateway) {
+      await startupTrace.measure("main-run-recovery.barriers", async () => {
+        const { hydrateMainRunRecoveryBarriers } =
+          await import("../agents/main-run-recovery-worker.js");
+        hydrateMainRunRecoveryBarriers();
+      });
+    }
+    const legacyMainRunRecoveryAdmissionGate = minimalTestGateway
+      ? undefined
+      : await startupTrace.measure("main-run-recovery.legacy-gate", async () => {
+          const { collectLegacyMainRunRecoveryAdmissionGate } =
+            await import("../infra/main-run-recovery-admission-gate.js");
+          return collectLegacyMainRunRecoveryAdmissionGate({ cfg: cfgAtStart });
+        });
     const gatewayRequestContext = await startupTrace.measure(
       "gateway.request-context",
       async () => {
@@ -1637,6 +1759,7 @@ export async function startGatewayServer(
           deps,
           runtimeState,
           getRuntimeConfig,
+          legacyMainRunRecoveryAdmissionGate,
           resolveTerminalLaunchPolicy: terminalLaunchPolicy.resolve,
           isTerminalEnabled: terminalLaunchPolicy.isEnabled,
           execApprovalManager,
@@ -1930,6 +2053,10 @@ export async function startGatewayServer(
             isClosing: () => closePreludeStarted,
             startupTrace,
             sidecarStartup,
+            startupWorkSuppression: opts.startupWorkSuppression,
+            notifyMainRunRecoveryTerminal,
+            abortMainRunRecoveryExecution,
+            callMainRunRecoveryAgent,
             providerAuthPrewarm: {
               getConfig: getRuntimeConfig,
             },
@@ -2060,9 +2187,47 @@ export async function startGatewayServer(
   }
 
   const close = createCloseHandler();
+  const prepareRestartClose = async (closeOpts?: GatewayCloseOptions): Promise<boolean> => {
+    if (
+      typeof closeOpts?.restartExpectedMs !== "number" ||
+      !Number.isFinite(closeOpts.restartExpectedMs)
+    ) {
+      return false;
+    }
+    const admission = beginGatewayRestartSignalAdmission();
+    try {
+      const { prepareGatewayRestartClose } = await loadGatewayCloseModule();
+      const drainTimeoutMs =
+        typeof closeOpts.drainTimeoutMs === "number" && Number.isFinite(closeOpts.drainTimeoutMs)
+          ? Math.max(0, Math.floor(closeOpts.drainTimeoutMs))
+          : 0;
+      await prepareGatewayRestartClose({
+        getPendingReplyCount: getTotalPendingReplies,
+        chatAbortControllers,
+        chatQueuedTurns,
+        restartRecoveryCandidates,
+        chatRunState,
+        removeChatRun,
+        agentRunSeq,
+        broadcast,
+        nodeSendToSession,
+        markMainSessionsAbortedForRestart,
+        resolveActiveSessionIdForKey: resolveActiveEmbeddedRunSessionId,
+        timeoutMs: drainTimeoutMs,
+      });
+      markGatewayRestartDraining();
+      return true;
+    } catch (error) {
+      admission.rollback();
+      throw error;
+    }
+  };
 
   return {
     close: async (optsLocal) => {
+      // Preparation failure leaves this server live. Do not clear shared
+      // dispatch context until the durable restart gate has committed.
+      const restartPrepared = await prepareRestartClose(optsLocal);
       try {
         markClosePreludeStarted();
         // Kill any live operator shells before the socket layer tears down.
@@ -2077,7 +2242,7 @@ export async function startGatewayServer(
           onError: (err) => log.warn(`gateway_stop hook failed: ${String(err)}`),
         });
         await runClosePrelude();
-        await close(optsLocal);
+        await close(restartPrepared ? { ...optsLocal, restartPrepared: true } : optsLocal);
       } finally {
         clearFallbackGatewayContextForServer();
       }

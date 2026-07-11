@@ -65,6 +65,30 @@ function createEmbeddedRunMockExports() {
   };
 }
 
+async function importAgentCommandMockModule(
+  actualPath: string,
+): Promise<typeof import("../agents/agent-command.js")> {
+  const actual = await vi.importActual<typeof import("../agents/agent-command.js")>(actualPath);
+  return {
+    ...actual,
+    agentCommandFromIngress: (...args: Parameters<typeof actual.agentCommandFromIngress>) =>
+      agentCommand(...args) as ReturnType<typeof actual.agentCommandFromIngress>,
+    agentCommandFromRecoveryIngress: async (
+      ...args: Parameters<typeof actual.agentCommandFromRecoveryIngress>
+    ) => {
+      const [opts, executionOwner, runtime, deps] = args;
+      const lifecycleGeneration = opts.lifecycleGeneration?.trim();
+      if (!lifecycleGeneration) {
+        throw new Error("recovery ingress requires a lifecycle generation");
+      }
+      await executionOwner.start({ lifecycleGeneration });
+      return (await agentCommand(opts, runtime, deps)) as Awaited<
+        ReturnType<typeof actual.agentCommandFromRecoveryIngress>
+      >;
+    },
+  };
+}
+
 async function importEmbeddedRunMockModule<TModule extends object>(
   actualPath: string,
   opts?: { includeActiveCount?: boolean },
@@ -260,6 +284,14 @@ vi.mock("/src/agents/embedded-agent-runner/runs.js", async () => {
   return await importEmbeddedRunMockModule<
     typeof import("../agents/embedded-agent-runner/runs.js")
   >("../agents/embedded-agent-runner/runs.js", { includeActiveCount: true });
+});
+
+vi.mock("../agents/agent-command.js", async () => {
+  return await importAgentCommandMockModule("../agents/agent-command.js");
+});
+
+vi.mock("/src/agents/agent-command.js", async () => {
+  return await importAgentCommandMockModule("../agents/agent-command.js");
 });
 
 vi.mock("../commands/health.js", () => ({

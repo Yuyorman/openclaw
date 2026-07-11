@@ -6,6 +6,8 @@ import path from "node:path";
 import { DELIVERY_NO_REPLY_RUNTIME_CONTRACT } from "openclaw/plugin-sdk/agent-runtime-test-contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { setCliSessionBinding } from "../../agents/cli-session.js";
+import { MainRunRecoveryOwnershipLostError } from "../../agents/main-run-recovery-errors.js";
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import {
@@ -60,6 +62,16 @@ const FOLLOWUP_TEST_QUEUES = new Map<
 >();
 const FOLLOWUP_TEST_SESSION_STORES = new Map<string, Record<string, SessionEntry>>();
 const FOLLOWUP_TEST_SESSION_STORE_PATHS = new Set<string>();
+
+function createExecutionOwner(
+  onStart: (info: { lifecycleGeneration: string }) => Promise<void> | void,
+): MainRunRecoveryExecutionOwner {
+  return {
+    async start(info): Promise<void> {
+      await onStart(info);
+    },
+  } as MainRunRecoveryExecutionOwner;
+}
 
 function debugFollowupTest(message: string): void {
   if (!FOLLOWUP_DEBUG) {
@@ -746,6 +758,175 @@ describe("createFollowupRunner reply-lane admission", () => {
 
     const call = requireLastMockCallArg(runEmbeddedAgentMock, "run embedded agent");
     expect(call.clientCaps).toEqual(["tool-events", "inline-widgets"]);
+  });
+
+  it("scopes queued recovery ownership around the embedded execution", async () => {
+    const storePath = "/tmp/openclaw-followup-execution-ownership.json";
+    const sessionEntry: SessionEntry = { sessionId: "session-execution-ownership", updatedAt: 1 };
+    registerFollowupTestSessionStore(storePath, { main: sessionEntry });
+    const events: string[] = [];
+    const exactOwner = vi.fn();
+    const executionOwner = createExecutionOwner(({ lifecycleGeneration }) => {
+      expect(lifecycleGeneration).toBe("queued-generation");
+      exactOwner();
+      events.push("ownership");
+    });
+    runEmbeddedAgentMock.mockImplementationOnce(
+      async (params: { executionOwner?: MainRunRecoveryExecutionOwner }) => {
+        await params.executionOwner?.start({ lifecycleGeneration: "queued-generation" });
+        events.push("embedded");
+        return { payloads: [], meta: {} };
+      },
+    );
+    const runner = createFollowupRunner({
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      sessionEntry,
+      sessionStore: { main: sessionEntry },
+      sessionKey: "main",
+      storePath,
+      defaultModel: "anthropic/claude",
+    });
+
+    await runner(
+      createQueuedRun({
+        executionOwner,
+        run: {
+          sessionId: "session-execution-ownership",
+          sessionKey: "main",
+          provider: "anthropic",
+          model: "claude",
+        },
+      }),
+    );
+
+    expect(events).toEqual(["ownership", "embedded"]);
+    expect(exactOwner).toHaveBeenCalledOnce();
+  });
+
+  it("keeps queued execution owners isolated across one drain runner", async () => {
+    const storePath = "/tmp/openclaw-followup-execution-owner-isolation.json";
+    const sessionEntry: SessionEntry = { sessionId: "session-owner-isolation", updatedAt: 1 };
+    registerFollowupTestSessionStore(storePath, { main: sessionEntry });
+    const events: string[] = [];
+    const ownerA = vi.fn();
+    const ownerB = vi.fn();
+    const executionOwnerA = createExecutionOwner(({ lifecycleGeneration }) => {
+      expect(lifecycleGeneration).toBe("generation-a");
+      ownerA();
+      events.push("owner-a");
+    });
+    const executionOwnerB = createExecutionOwner(({ lifecycleGeneration }) => {
+      expect(lifecycleGeneration).toBe("generation-b");
+      ownerB();
+      events.push("owner-b");
+    });
+    runEmbeddedAgentMock
+      .mockImplementationOnce(
+        async (params: { executionOwner?: MainRunRecoveryExecutionOwner }) => {
+          await params.executionOwner?.start({ lifecycleGeneration: "generation-a" });
+          events.push("embedded-a");
+          return { payloads: [], meta: {} };
+        },
+      )
+      .mockImplementationOnce(
+        async (params: { executionOwner?: MainRunRecoveryExecutionOwner }) => {
+          await params.executionOwner?.start({ lifecycleGeneration: "generation-b" });
+          events.push("embedded-b");
+          return { payloads: [], meta: {} };
+        },
+      );
+    const runner = createFollowupRunner({
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      sessionEntry,
+      sessionStore: { main: sessionEntry },
+      sessionKey: "main",
+      storePath,
+      defaultModel: "anthropic/claude",
+    });
+    const queuedRun = (executionOwner: MainRunRecoveryExecutionOwner) =>
+      createQueuedRun({
+        executionOwner,
+        run: {
+          sessionId: "session-owner-isolation",
+          sessionKey: "main",
+          provider: "anthropic",
+          model: "claude",
+        },
+      });
+
+    await runner(queuedRun(executionOwnerA));
+    await runner(queuedRun(executionOwnerB));
+
+    expect(events).toEqual(["owner-a", "embedded-a", "owner-b", "embedded-b"]);
+    expect(ownerA).toHaveBeenCalledOnce();
+    expect(ownerB).toHaveBeenCalledOnce();
+  });
+
+  it("fails only the owning queued turn when execution ownership is rejected", async () => {
+    const storePath = "/tmp/openclaw-followup-execution-owner-rejection.json";
+    const sessionEntry: SessionEntry = { sessionId: "session-owner-rejection", updatedAt: 1 };
+    registerFollowupTestSessionStore(storePath, { main: sessionEntry });
+    const events: string[] = [];
+    const ownerA = vi.fn();
+    const ownerB = vi.fn();
+    const executionOwnerA = createExecutionOwner(() => {
+      ownerA();
+      events.push("owner-a");
+      throw new MainRunRecoveryOwnershipLostError("owner A rejected");
+    });
+    const executionOwnerB = createExecutionOwner(() => {
+      ownerB();
+      events.push("owner-b");
+    });
+    let rejectedRunId: string | undefined;
+    runEmbeddedAgentMock
+      .mockImplementationOnce(
+        async (params: { executionOwner?: MainRunRecoveryExecutionOwner; runId: string }) => {
+          rejectedRunId = params.runId;
+          await params.executionOwner?.start({ lifecycleGeneration: "generation-a" });
+          events.push("embedded-a");
+          return { payloads: [], meta: {} };
+        },
+      )
+      .mockImplementationOnce(
+        async (params: { executionOwner?: MainRunRecoveryExecutionOwner }) => {
+          await params.executionOwner?.start({ lifecycleGeneration: "generation-b" });
+          events.push("embedded-b");
+          return { payloads: [], meta: {} };
+        },
+      );
+    const runner = createFollowupRunner({
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      sessionEntry,
+      sessionStore: { main: sessionEntry },
+      sessionKey: "main",
+      storePath,
+      defaultModel: "anthropic/claude",
+    });
+    const queuedRun = (executionOwner: MainRunRecoveryExecutionOwner) =>
+      createQueuedRun({
+        executionOwner,
+        run: {
+          sessionId: "session-owner-rejection",
+          sessionKey: "main",
+          provider: "anthropic",
+          model: "claude",
+        },
+      });
+
+    await expect(runner(queuedRun(executionOwnerA))).rejects.toThrow("owner A rejected");
+    await runner(queuedRun(executionOwnerB));
+
+    expect(events).toEqual(["owner-a", "owner-b", "embedded-b"]);
+    expect(ownerA).toHaveBeenCalledOnce();
+    expect(ownerB).toHaveBeenCalledOnce();
+    const realAgentEvents = await vi.importActual<typeof import("../../infra/agent-events.js")>(
+      "../../infra/agent-events.js",
+    );
+    expect(realAgentEvents.getAgentRunContext(rejectedRunId ?? "")).toBeUndefined();
   });
 
   it("adopts a matching admission-time model lock for queued execution", async () => {
@@ -1517,14 +1698,22 @@ describe("createFollowupRunner runtime config", () => {
       },
     };
     const sessionStore = { main: sessionEntry };
-    runCliAgentMock.mockResolvedValueOnce({
-      payloads: [],
-      meta: {
-        agentMeta: {
-          provider: "claude-cli",
-          model: "claude-opus-4-7",
+    const executionEvents: string[] = [];
+    const executionOwner = createExecutionOwner(({ lifecycleGeneration }) => {
+      expect(lifecycleGeneration).toEqual(expect.any(String));
+      executionEvents.push("owner");
+    });
+    runCliAgentMock.mockImplementationOnce(async () => {
+      executionEvents.push("cli");
+      return {
+        payloads: [],
+        meta: {
+          agentMeta: {
+            provider: "claude-cli",
+            model: "claude-opus-4-7",
+          },
         },
-      },
+      };
     });
 
     const runner = createFollowupRunner({
@@ -1538,6 +1727,7 @@ describe("createFollowupRunner runtime config", () => {
 
     await runner(
       createQueuedRun({
+        executionOwner,
         originatingChannel: "telegram",
         originatingTo: "telegram:-100123:topic:42",
         originatingThreadId: "42",
@@ -1574,6 +1764,7 @@ describe("createFollowupRunner runtime config", () => {
 
     expect(runEmbeddedAgentMock).not.toHaveBeenCalled();
     expect(runCliAgentMock).toHaveBeenCalledTimes(1);
+    expect(executionEvents).toEqual(["owner", "cli"]);
     const call = requireLastMockCallArg(runCliAgentMock, "run cli agent");
     expect(call.provider).toBe("claude-cli");
     expect(call.modelProvider).toBe("anthropic");

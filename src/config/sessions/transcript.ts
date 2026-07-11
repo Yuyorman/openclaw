@@ -464,6 +464,8 @@ export async function appendAssistantMessageToSessionTranscript(params: {
   /** Optional override for store path (mostly for tests). */
   storePath?: string;
   updateMode?: SessionTranscriptUpdateMode;
+  /** False for transcript artifacts that must not count as user-visible session activity. */
+  touchSessionEntry?: boolean;
   config?: OpenClawConfig;
   beforeMessageWrite?: AssistantBeforeMessageWrite;
 }): Promise<SessionTranscriptAppendResult> {
@@ -490,6 +492,7 @@ export async function appendAssistantMessageToSessionTranscript(params: {
     storePath: params.storePath,
     idempotencyKey: params.idempotencyKey,
     updateMode: params.updateMode,
+    touchSessionEntry: params.touchSessionEntry,
     config: params.config,
     ...(params.beforeMessageWrite ? { beforeMessageWrite: params.beforeMessageWrite } : {}),
     message: {
@@ -528,6 +531,8 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
   idempotencyKey?: string;
   storePath?: string;
   updateMode?: SessionTranscriptUpdateMode;
+  /** False for transcript artifacts that must not count as user-visible session activity. */
+  touchSessionEntry?: boolean;
   config?: OpenClawConfig;
   beforeMessageWrite?: AssistantBeforeMessageWrite;
 }): Promise<SessionTranscriptAppendResult> {
@@ -621,7 +626,7 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
           : {}),
         ...(params.config ? { config: params.config } : {}),
         updateMode: params.updateMode ?? "inline",
-        touchSessionEntry: true,
+        touchSessionEntry: params.touchSessionEntry !== false,
         messages: [
           {
             message: preparedUnkeyedMessage,

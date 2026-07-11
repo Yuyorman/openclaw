@@ -179,7 +179,7 @@ function buildToolExecutionStartTraceMeta(params: {
   return {
     event: "embedded_tool_execution_start",
     tags: ["tool_start", "embedded", "trace"],
-    runId: params.ctx.params.runId,
+    runId: params.ctx.params.publicRunId ?? params.ctx.params.runId,
     toolName: params.toolName,
     toolCallId: params.toolCallId,
     argsType,
@@ -948,6 +948,7 @@ export function handleToolExecutionStart(
     const toolCallId = evt.toolCallId;
     const args = evt.args;
     const runId = ctx.params.runId;
+    const publicRunId = ctx.params.publicRunId ?? runId;
     ctx.state.toolExecutionSinceLastBlockReply = true;
     emitExecutionPhaseBestEffort(ctx, {
       phase: "tool_execution_started",
@@ -983,7 +984,7 @@ export function handleToolExecutionStart(
           rawArgsPreview?.slice(0, TOOL_START_WARNING_RAW_PREVIEW_MAX_CHARS),
           TOOL_START_WARNING_PREVIEW_MAX_CHARS,
         );
-        const safeRunId = sanitizeForConsole(runId) ?? "-";
+        const safeRunId = sanitizeForConsole(publicRunId) ?? "-";
         const safeSessionKey = sanitizeForConsole(ctx.params.sessionKey);
         const safeSessionId = sanitizeForConsole(ctx.params.sessionId);
         const safeAgentId = sanitizeForConsole(ctx.params.agentId);
@@ -1012,7 +1013,7 @@ export function handleToolExecutionStart(
         ctx.log.warn(message, {
           event: "embedded_read_tool_start_warning",
           tags: ["tool_start", "read", "embedded", "validation"],
-          runId: ctx.params.runId,
+          runId: publicRunId,
           toolCallId,
           argsType,
           ...(safeSessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
@@ -1040,7 +1041,7 @@ export function handleToolExecutionStart(
       buildToolCallSummary(toolName, args, meta, instanceReplaySafe, false),
     );
     ctx.log.debug(
-      `embedded run tool start: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
+      `embedded run tool start: runId=${publicRunId} tool=${toolName} toolCallId=${toolCallId}`,
     );
 
     const shouldEmitToolEvents = ctx.shouldEmitToolResult();
@@ -1270,6 +1271,7 @@ export async function handleToolExecutionEnd(
   const hideFromChannelProgress = evt.hideFromChannelProgress === true;
   const toolCallId = evt.toolCallId;
   const runId = ctx.params.runId;
+  const publicRunId = ctx.params.publicRunId ?? runId;
   const isError = evt.isError;
   const result = evt.result;
   const toolSendReceiptResult = ctx.consumeToolSendReceipt?.(toolCallId);
@@ -1717,7 +1719,7 @@ export async function handleToolExecutionEnd(
   }
 
   ctx.log.debug(
-    `embedded run tool end: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
+    `embedded run tool end: runId=${publicRunId} tool=${toolName} toolCallId=${toolCallId}`,
   );
 
   await emitToolResultOutput({
@@ -1740,7 +1742,7 @@ export async function handleToolExecutionEnd(
     const hookEvent: PluginHookAfterToolCallEvent = {
       toolName,
       params: startArgs,
-      runId,
+      runId: publicRunId,
       toolCallId,
       result: sanitizedResult,
       error: isToolError ? extractToolErrorMessage(sanitizedResult) : undefined,
@@ -1752,7 +1754,7 @@ export async function handleToolExecutionEnd(
         agentId: ctx.params.agentId,
         sessionKey: ctx.params.sessionKey,
         sessionId: ctx.params.sessionId,
-        runId,
+        runId: publicRunId,
         toolCallId,
       })
       .catch((err: unknown) => {

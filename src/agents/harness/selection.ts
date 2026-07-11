@@ -40,7 +40,7 @@ import {
 } from "./policy.js";
 import { getRegisteredAgentHarness, listRegisteredAgentHarnesses } from "./registry.js";
 import { buildAgentHarnessSupportContext, compareHarnessSupport } from "./support.js";
-import type { AgentHarness, AgentHarnessSupport } from "./types.js";
+import type { AgentHarness, AgentHarnessAttemptParams, AgentHarnessSupport } from "./types.js";
 
 const log = createSubsystemLogger("agents/harness");
 export { resolveAgentHarnessPolicy } from "./policy.js";
@@ -400,25 +400,37 @@ function withoutInternalHarnessAuthority(
   return pluginParams;
 }
 
-function preparePluginHarnessParams(params: EmbeddedRunAttemptParams): EmbeddedRunAttemptParams {
+function preparePluginHarnessParams(params: EmbeddedRunAttemptParams): AgentHarnessAttemptParams {
+  const {
+    executionOwner: _executionOwner,
+    lifecycleGeneration: _lifecycleGeneration,
+    onExecutionStarted: _onExecutionStarted,
+    publicRunId,
+    runId,
+    ...pluginParams
+  } = params;
   const boundary = "plugin harness handoff";
   const resolvedApiKey = params.resolvedApiKey
     ? unwrapSecretSentinelsForProviderEgress(params.resolvedApiKey, boundary)
     : params.resolvedApiKey;
   const model = unwrapModelHeaderSentinelsForProviderEgress(params.model, boundary);
+  const projectedParams: AgentHarnessAttemptParams = {
+    ...pluginParams,
+    runId: publicRunId ?? runId,
+  };
   if (model === params.model && resolvedApiKey === params.resolvedApiKey) {
-    return applyPluginHarnessDenyAllToolPolicy(params);
+    return applyPluginHarnessDenyAllToolPolicy(projectedParams);
   }
   return applyPluginHarnessDenyAllToolPolicy({
-    ...params,
+    ...projectedParams,
     model,
     resolvedApiKey,
   });
 }
 
 function applyPluginHarnessDenyAllToolPolicy(
-  params: EmbeddedRunAttemptParams,
-): EmbeddedRunAttemptParams {
+  params: AgentHarnessAttemptParams,
+): AgentHarnessAttemptParams {
   if (
     isHostScopedAgentToolActive("crestodian") &&
     params.toolsAllow?.length === 1 &&

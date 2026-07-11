@@ -719,6 +719,7 @@ export function handleMessageUpdate(
   ctx: EmbeddedAgentSubscribeContext,
   evt: AgentEvent & { message: AgentMessage; assistantMessageEvent?: unknown },
 ) {
+  const publicRunId = ctx.params.publicRunId ?? ctx.params.runId;
   const msg = evt.message;
   if (msg?.role !== "assistant" || isTranscriptOnlyOpenClawAssistantMessage(msg)) {
     return;
@@ -745,7 +746,7 @@ export function handleMessageUpdate(
       appendRawStream({
         ts: Date.now(),
         event: "assistant_text_stream",
-        runId: ctx.params.runId,
+        runId: publicRunId,
         sessionId: (ctx.params.session as { id?: string }).id,
         evtType: "commentary_update",
         delta: "",
@@ -782,7 +783,7 @@ export function handleMessageUpdate(
     appendRawStream({
       ts: Date.now(),
       event: "assistant_thinking_stream",
-      runId: ctx.params.runId,
+      runId: publicRunId,
       sessionId: (ctx.params.session as { id?: string }).id,
       evtType,
       delta: thinkingDelta,
@@ -818,7 +819,7 @@ export function handleMessageUpdate(
   appendRawStream({
     ts: Date.now(),
     event: "assistant_text_stream",
-    runId: ctx.params.runId,
+    runId: publicRunId,
     sessionId: (ctx.params.session as { id?: string }).id,
     evtType,
     delta,
@@ -1139,6 +1140,7 @@ export function handleMessageEnd(
   ctx: EmbeddedAgentSubscribeContext,
   evt: AgentEvent & { message: AgentMessage },
 ): void | Promise<void> {
+  const publicRunId = ctx.params.publicRunId ?? ctx.params.runId;
   const msg = evt.message;
   if (msg?.role !== "assistant" || isTranscriptOnlyOpenClawAssistantMessage(msg)) {
     return;
@@ -1165,7 +1167,7 @@ export function handleMessageEnd(
     appendRawStream({
       ts: Date.now(),
       event: "assistant_message_end",
-      runId: ctx.params.runId,
+      runId: publicRunId,
       sessionId: (ctx.params.session as { id?: string }).id,
       rawText: coerceChatContentText(extractAssistantText(assistantMessage)),
       rawThinking: extractAssistantThinking(assistantMessage),
@@ -1209,7 +1211,7 @@ export function handleMessageEnd(
   appendRawStream({
     ts: Date.now(),
     event: "assistant_message_end",
-    runId: ctx.params.runId,
+    runId: publicRunId,
     sessionId: (ctx.params.session as { id?: string }).id,
     rawText,
     rawThinking: extractAssistantThinking(assistantMessage),

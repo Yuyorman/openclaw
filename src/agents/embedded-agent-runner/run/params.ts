@@ -33,6 +33,7 @@ import type {
 import type { FastModeAutoProgressState } from "../../fast-mode.js";
 import type { ExpectedAgentHarnessRuntimeArtifact } from "../../harness/runtime-artifact.types.js";
 import type { AgentInternalEvent } from "../../internal-events.js";
+import type { MainRunRecoveryExecutionOwner } from "../../main-run-recovery-execution-owner.js";
 import type { AgentRunSessionTarget } from "../../run-session-target.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import type { SilentReplyPromptMode } from "../../system-prompt.types.js";
@@ -224,9 +225,12 @@ export type RunEmbeddedAgentParams = {
    * default.
    */
   runTimeoutOverrideMs?: number;
+  /** Stable operator identity; differs from runId only for private recovery attempts. */
+  publicRunId?: string;
   runId: string;
   abortSignal?: AbortSignal;
-  onExecutionStarted?: (info?: { lifecycleGeneration?: string }) => void;
+  executionOwner?: MainRunRecoveryExecutionOwner;
+  onExecutionStarted?: (info?: { lifecycleGeneration?: string }) => void | Promise<void>;
   onExecutionPhase?: (info: {
     phase: EmbeddedAgentExecutionPhase;
     provider?: string;

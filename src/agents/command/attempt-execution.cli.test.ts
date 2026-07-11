@@ -261,6 +261,7 @@ describe("CLI attempt execution", () => {
     modelOverride?: string;
     isFallbackRetry?: boolean;
     fallbackRuntimeState?: RunAgentAttemptParams["fallbackRuntimeState"];
+    onExecutionStarted?: RunAgentAttemptParams["onExecutionStarted"];
     userTurnTranscriptRecorder?: RunAgentAttemptParams["userTurnTranscriptRecorder"];
     sessionEntry?: Partial<SessionEntry>;
     configuredAuthProfileId?: string;
@@ -313,6 +314,7 @@ describe("CLI attempt execution", () => {
       sessionStore,
       storePath,
       sessionHasHistory: false,
+      onExecutionStarted: overrides?.onExecutionStarted,
       userTurnTranscriptRecorder: overrides?.userTurnTranscriptRecorder,
     });
 
@@ -360,6 +362,8 @@ describe("CLI attempt execution", () => {
     body: string;
     runId: string;
     cwd?: string;
+    executionOwner?: RunAgentAttemptParams["executionOwner"];
+    onExecutionStarted?: RunAgentAttemptParams["onExecutionStarted"];
   }) {
     await runAgentAttempt({
       providerOverride: "claude-cli",
@@ -390,8 +394,79 @@ describe("CLI attempt execution", () => {
       sessionStore: params.sessionStore,
       storePath,
       sessionHasHistory: false,
+      executionOwner: params.executionOwner,
+      onExecutionStarted: params.onExecutionStarted,
     });
   }
+
+  it("forwards the adopted lifecycle generation at embedded execution start", async () => {
+    const onExecutionStarted = vi.fn(async () => {});
+    runEmbeddedAgentMock.mockReset();
+    runEmbeddedAgentMock.mockImplementationOnce(async (params: unknown) => {
+      const callback = requireRecord(params, "embedded attempt").onExecutionStarted as
+        | ((info: { lifecycleGeneration: string }) => Promise<void>)
+        | undefined;
+      await callback?.({ lifecycleGeneration: "adopted-generation" });
+      return { meta: { durationMs: 1 } } satisfies EmbeddedAgentRunResult;
+    });
+
+    await runOpenClawEmbeddedAttemptForTest({ onExecutionStarted });
+
+    expect(onExecutionStarted).toHaveBeenCalledOnce();
+    expect(onExecutionStarted).toHaveBeenCalledWith({
+      lifecycleGeneration: "adopted-generation",
+    });
+  });
+
+  it("forwards the captured lifecycle generation at CLI execution start", async () => {
+    const onExecutionStarted = vi.fn(async () => {});
+    runCliAgentMock.mockImplementationOnce(async (params: unknown) => {
+      const callback = requireRecord(params, "CLI attempt").onExecutionStarted as
+        | (() => Promise<void>)
+        | undefined;
+      await callback?.();
+      return makeCliResult("done");
+    });
+    const sessionKey = "agent:main:main";
+    const sessionEntry: SessionEntry = { sessionId: "session-cli", updatedAt: 1 };
+
+    await runClaudeCliAttempt({
+      sessionKey,
+      sessionEntry,
+      sessionStore: { [sessionKey]: sessionEntry },
+      body: "hello",
+      runId: "run-cli",
+      onExecutionStarted,
+    });
+
+    expect(onExecutionStarted).toHaveBeenCalledOnce();
+    expect(onExecutionStarted).toHaveBeenCalledWith({ lifecycleGeneration: "test-generation" });
+  });
+
+  it("carries a recovery public run id to CLI transcript boundaries", async () => {
+    runCliAgentMock.mockResolvedValueOnce(makeCliResult("done"));
+    const sessionKey = "agent:main:main";
+    const sessionEntry: SessionEntry = { sessionId: "session-cli", updatedAt: 1 };
+    const executionOwner = {
+      publicRunId: "public-recovery-run",
+      start: vi.fn(async () => {}),
+    } as unknown as NonNullable<RunAgentAttemptParams["executionOwner"]>;
+
+    await runClaudeCliAttempt({
+      sessionKey,
+      sessionEntry,
+      sessionStore: { [sessionKey]: sessionEntry },
+      body: "hello",
+      runId: "private-recovery-execution",
+      executionOwner,
+    });
+
+    expect(firstRunCliAgentArg()).toMatchObject({
+      runId: "private-recovery-execution",
+      publicRunId: "public-recovery-run",
+      executionOwner,
+    });
+  });
 
   async function writeClaudeCliAssistantTranscript(cliSessionId: string) {
     // Claude stores resumable sessions under a workspace-derived project dir,

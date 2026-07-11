@@ -3,6 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { MainRunRecoveryOwnershipLostError } from "../../agents/main-run-recovery-errors.js";
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import {
   loadTranscriptEvents,
   replaceSessionEntry,
@@ -29,6 +31,16 @@ import { resolveFollowupAuthorizationKey } from "./queue/drain.js";
 import { getExistingFollowupQueue } from "./queue/state.js";
 
 installQueueRuntimeErrorSilencer();
+
+function createExecutionOwner(
+  onStart: (info: { lifecycleGeneration: string }) => Promise<void> | void,
+): MainRunRecoveryExecutionOwner {
+  return {
+    async start(info): Promise<void> {
+      await onStart(info);
+    },
+  } as MainRunRecoveryExecutionOwner;
+}
 
 describe("followup queue collect routing", () => {
   it("retries lifecycle admission after a callback rejection", async () => {
@@ -2002,6 +2014,229 @@ describe("followup queue collect routing", () => {
         expect(call.prompt).not.toContain("normal two");
       }
     }
+  });
+
+  it("keeps mixed execution owners separate in collect mode", async () => {
+    const key = `test-collect-execution-owners-${Date.now()}`;
+    const events: string[] = [];
+    const done = createDeferred<void>();
+    const ownerA = vi.fn();
+    const ownerB = vi.fn();
+    const executionOwnerA = createExecutionOwner(({ lifecycleGeneration }) => {
+      expect(lifecycleGeneration).toBe("generation-a");
+      ownerA();
+      events.push("owner-a");
+    });
+    const executionOwnerB = createExecutionOwner(({ lifecycleGeneration }) => {
+      expect(lifecycleGeneration).toBe("generation-b");
+      ownerB();
+      events.push("owner-b");
+    });
+    const runFollowup = async (run: FollowupRun) => {
+      const lifecycleGeneration = run.prompt === "owned a" ? "generation-a" : "generation-b";
+      await run.executionOwner?.start({ lifecycleGeneration });
+      events.push(run.prompt);
+      if (events.length === 4) {
+        done.resolve();
+      }
+    };
+    const settings: QueueSettings = {
+      mode: "collect",
+      debounceMs: 0,
+      cap: 50,
+      dropPolicy: "summarize",
+    };
+    const route = { originatingChannel: "slack" as const, originatingTo: "channel:A" };
+
+    enqueueFollowupRun(
+      key,
+      {
+        ...createRun({ prompt: "owned a", ...route }),
+        executionOwner: executionOwnerA,
+      },
+      settings,
+    );
+    enqueueFollowupRun(
+      key,
+      {
+        ...createRun({ prompt: "owned b", ...route }),
+        executionOwner: executionOwnerB,
+      },
+      settings,
+    );
+
+    scheduleFollowupDrain(key, runFollowup);
+    await done.promise;
+
+    expect(events).toEqual(["owner-a", "owned a", "owner-b", "owned b"]);
+    expect(ownerA).toHaveBeenCalledOnce();
+    expect(ownerB).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an execution owner separate from ordinary collect work", async () => {
+    const key = `test-collect-owned-and-ordinary-${Date.now()}`;
+    const calls: FollowupRun[] = [];
+    const done = createDeferred<void>();
+    const executionOwner = createExecutionOwner(() => {});
+    const runFollowup = async (run: FollowupRun) => {
+      calls.push(run);
+      await run.executionOwner?.start({ lifecycleGeneration: "owned-generation" });
+      if (calls.length === 2) {
+        done.resolve();
+      }
+    };
+    const settings: QueueSettings = {
+      mode: "collect",
+      debounceMs: 0,
+      cap: 50,
+      dropPolicy: "summarize",
+    };
+    const route = { originatingChannel: "slack" as const, originatingTo: "channel:A" };
+
+    enqueueFollowupRun(
+      key,
+      {
+        ...createRun({ prompt: "normal a", ...route }),
+      },
+      settings,
+    );
+    enqueueFollowupRun(
+      key,
+      {
+        ...createRun({ prompt: "owned", ...route }),
+        executionOwner,
+      },
+      settings,
+    );
+    enqueueFollowupRun(
+      key,
+      {
+        ...createRun({ prompt: "normal b", ...route }),
+      },
+      settings,
+    );
+
+    scheduleFollowupDrain(key, runFollowup);
+    await done.promise;
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ prompt: "owned", executionOwner });
+    expect(calls[1]?.executionOwner).toBeUndefined();
+    expect(calls[1]?.prompt).toContain("normal a");
+    expect(calls[1]?.prompt).toContain("normal b");
+    expect(calls[1]?.prompt).not.toContain("owned");
+  });
+
+  it("admits an execution owner despite dedupe and a drop-new cap", () => {
+    const key = `test-owned-followup-overflow-${Date.now()}`;
+    const settings: QueueSettings = {
+      mode: "collect",
+      debounceMs: 10_000,
+      cap: 1,
+      dropPolicy: "new",
+    };
+    const executionOwner = createExecutionOwner(() => {});
+    const shared = {
+      prompt: "same prompt",
+      messageId: "same-message",
+      originatingChannel: "slack" as const,
+      originatingTo: "channel:A",
+    };
+
+    expect(enqueueFollowupRun(key, createRun(shared), settings)).toBe(true);
+    expect(
+      enqueueFollowupRun(key, { ...createRun(shared), executionOwner }, settings, "message-id"),
+    ).toBe(true);
+
+    expect(getExistingFollowupQueue(key)?.items).toHaveLength(2);
+    expect(getExistingFollowupQueue(key)?.items[1]?.executionOwner).toBe(executionOwner);
+    clearFollowupQueue(key);
+  });
+
+  it.each(["old", "summarize"] as const)(
+    "admits and retains an execution owner under %s overflow",
+    (dropPolicy) => {
+      const key = `test-owned-followup-${dropPolicy}-${Date.now()}`;
+      const settings: QueueSettings = {
+        mode: "collect",
+        debounceMs: 10_000,
+        cap: 1,
+        dropPolicy,
+      };
+      const executionOwner = createExecutionOwner(() => {});
+
+      expect(enqueueFollowupRun(key, createRun({ prompt: "replaceable" }), settings)).toBe(true);
+      expect(
+        enqueueFollowupRun(key, { ...createRun({ prompt: "owned" }), executionOwner }, settings),
+      ).toBe(true);
+      expect(enqueueFollowupRun(key, createRun({ prompt: "later" }), settings)).toBe(false);
+
+      expect(getExistingFollowupQueue(key)?.items).toHaveLength(1);
+      expect(getExistingFollowupQueue(key)?.items[0]).toMatchObject({
+        prompt: "owned",
+        executionOwner,
+      });
+      clearFollowupQueue(key);
+    },
+  );
+
+  it("discards a rejected execution owner and continues the collect drain", async () => {
+    const key = `test-collect-rejected-execution-owner-${Date.now()}`;
+    const events: string[] = [];
+    const done = createDeferred<void>();
+    const rejectedComplete = vi.fn();
+    const ownerA = vi.fn();
+    const ownerB = vi.fn();
+    const executionOwnerA = createExecutionOwner(() => {
+      ownerA();
+      events.push("owner-a");
+      throw new MainRunRecoveryOwnershipLostError();
+    });
+    const executionOwnerB = createExecutionOwner(() => {
+      ownerB();
+      events.push("owner-b");
+    });
+    const runFollowup = async (run: FollowupRun) => {
+      await run.executionOwner?.start({
+        lifecycleGeneration: `generation-${run.prompt.at(-1)}`,
+      });
+      events.push(run.prompt);
+      done.resolve();
+    };
+    const settings: QueueSettings = {
+      mode: "collect",
+      debounceMs: 0,
+      cap: 50,
+      dropPolicy: "summarize",
+    };
+    const route = { originatingChannel: "slack" as const, originatingTo: "channel:A" };
+
+    enqueueFollowupRun(
+      key,
+      {
+        ...createRun({ prompt: "owned a", ...route }),
+        executionOwner: executionOwnerA,
+        queuedLifecycle: { onComplete: rejectedComplete },
+      },
+      settings,
+    );
+    enqueueFollowupRun(
+      key,
+      {
+        ...createRun({ prompt: "owned b", ...route }),
+        executionOwner: executionOwnerB,
+      },
+      settings,
+    );
+
+    scheduleFollowupDrain(key, runFollowup);
+    await done.promise;
+    await vi.waitFor(() => expect(getExistingFollowupQueue(key)).toBeUndefined());
+
+    expect(events).toEqual(["owner-a", "owner-b", "owned b"]);
+    expect(ownerA).toHaveBeenCalledOnce();
+    expect(ownerB).toHaveBeenCalledOnce();
+    expect(rejectedComplete).toHaveBeenCalledOnce();
   });
 
   it("can prepend priority followups before already queued items", () => {

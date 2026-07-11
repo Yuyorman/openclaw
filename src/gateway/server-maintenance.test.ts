@@ -4,18 +4,39 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { managedWorktrees } from "../agents/worktrees/service.js";
 import type { HealthSummary } from "../commands/health.js";
 import { CURATOR_INITIAL_DELAY_MS, CURATOR_SWEEP_INTERVAL_MS } from "../skills/workshop/curator.js";
-import type { ChatAbortControllerEntry } from "./chat-abort.js";
+import { createActiveRunIdentity } from "./active-run-registry.js";
+import {
+  bindChatAbortControllerMainRunRecoveryExecution,
+  notifyChatAbortControllerSessionTerminalPersisted,
+  recordChatAbortControllerMainRunRecoveryTerminalEvidence,
+  type ChatAbortControllerEntry,
+} from "./chat-abort.js";
 import { DEDUPE_MAX, DEDUPE_TTL_MS } from "./server-constants.js";
 import { pendingChatSendDedupeKey } from "./server-shared.js";
 import { createGatewayMaintenanceStateForTest } from "./test-helpers.maintenance-state.js";
 
 const cleanOldMediaMock = vi.fn(async () => {});
+const recoveryStoreTestState = vi.hoisted(() => ({
+  get: vi.fn(),
+  record: vi.fn(),
+}));
 
 vi.mock("../media/store.js", async () => {
   const actual = await vi.importActual<typeof import("../media/store.js")>("../media/store.js");
   return {
     ...actual,
     cleanOldMedia: cleanOldMediaMock,
+  };
+});
+
+vi.mock("../state/main-run-recovery-store.js", async () => {
+  const actual = await vi.importActual<typeof import("../state/main-run-recovery-store.js")>(
+    "../state/main-run-recovery-store.js",
+  );
+  return {
+    ...actual,
+    getMainRunRecovery: recoveryStoreTestState.get,
+    recordMainRunRecoveryTerminalEvidenceCas: recoveryStoreTestState.record,
   };
 });
 
@@ -123,6 +144,8 @@ function stopMaintenanceTimers(timers: {
 
 describe("startGatewayMaintenanceTimers", () => {
   afterEach(() => {
+    recoveryStoreTestState.get.mockReset();
+    recoveryStoreTestState.record.mockReset();
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.clearAllMocks();
@@ -321,6 +344,25 @@ describe("startGatewayMaintenanceTimers", () => {
 
     expectStaleRunBuffersPresent(deps, runId);
 
+    stopMaintenanceTimers(timers);
+  });
+
+  it("keeps public-keyed buffers for an active recovered run", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
+    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
+    const deps = createMaintenanceTimerDeps();
+    const executionRunId = "private-recovery-dispatch";
+    const publicRunId = "public-chat-admission";
+    const activeRun = createActiveRun("main", "agent");
+    activeRun.runIdentity = createActiveRunIdentity(executionRunId, publicRunId);
+    deps.chatAbortControllers.set(executionRunId, activeRun);
+    seedStaleRunBuffers(deps, publicRunId);
+
+    const timers = startGatewayMaintenanceTimers(deps);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expectStaleRunBuffersPresent(deps, publicRunId);
     stopMaintenanceTimers(timers);
   });
 
@@ -566,6 +608,90 @@ describe("startGatewayMaintenanceTimers", () => {
       sessionId: "sess-1",
       observedAt: Date.now() - 60_500,
     });
+    stopMaintenanceTimers(timers);
+  });
+
+  it("retries bound recovery evidence after event and persistence writes both fail", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
+    const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
+    const deps = createMaintenanceTimerDeps();
+    const execution = {
+      runId: "private-recovery-maintenance",
+      lifecycleGeneration: "generation-maintenance",
+      epoch: "epoch-maintenance",
+    } as const;
+    const recovery = {
+      agentId: "main",
+      publicRunId: "public-recovery-maintenance",
+      sessionId: "sess-1",
+      sessionKey: "main",
+      sessionKeyAliases: [] as string[],
+      storePath: "/tmp/recovery-maintenance-sessions.json",
+      state: "running" as const,
+      revision: 7,
+      execution,
+    };
+    const settled = vi.fn();
+    const entry = createActiveRun("main");
+    entry.agentId = recovery.agentId;
+    entry.runIdentity = createActiveRunIdentity(execution.runId, recovery.publicRunId);
+    entry.lifecycleGeneration = execution.lifecycleGeneration;
+    entry.expiresAtMs = Date.now() - 1;
+    entry.projectSessionActive = false;
+    entry.projectSessionTerminalPending = true;
+    entry.registrationCleanupRequested = true;
+    entry.onSessionTerminalPersisted = settled;
+    bindChatAbortControllerMainRunRecoveryExecution(entry, {
+      publicRunId: recovery.publicRunId,
+      agentId: recovery.agentId,
+      sessionId: recovery.sessionId,
+      sessionKey: recovery.sessionKey,
+      sessionKeyAliases: recovery.sessionKeyAliases,
+      storePath: recovery.storePath,
+      execution,
+      database: { path: "/tmp/recovery-maintenance.sqlite" },
+    });
+    recoveryStoreTestState.get.mockReturnValue(recovery);
+    let writeAttempts = 0;
+    recoveryStoreTestState.record.mockImplementation(
+      (input: { observedAtMs: number; outcome: { status: string; endedAtMs: number } }) => {
+        writeAttempts += 1;
+        if (writeAttempts <= 2) {
+          throw new Error("transient SQLite write failure");
+        }
+        return {
+          ...recovery,
+          terminalEvidence: {
+            execution,
+            observedAtMs: input.observedAtMs,
+            outcome: input.outcome,
+          },
+        };
+      },
+    );
+    deps.chatAbortControllers.set(execution.runId, entry);
+
+    expect(() =>
+      recordChatAbortControllerMainRunRecoveryTerminalEvidence(entry, {
+        runId: execution.runId,
+        lifecycleGeneration: execution.lifecycleGeneration,
+        outcome: { status: "done", endedAtMs: Date.now() - 10 },
+        observedAtMs: Date.now(),
+      }),
+    ).toThrow("transient SQLite write failure");
+    expect(() => notifyChatAbortControllerSessionTerminalPersisted(entry)).toThrow(
+      "transient SQLite write failure",
+    );
+    expect(deps.chatAbortControllers.has(execution.runId)).toBe(true);
+
+    const timers = startGatewayMaintenanceTimers(deps);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(recoveryStoreTestState.record).toHaveBeenCalledTimes(3);
+    expect(entry.mainRunRecoveryTerminalEvidenceResolved).toBe(true);
+    expect(settled).toHaveBeenCalledOnce();
+    expect(deps.chatAbortControllers.has(execution.runId)).toBe(false);
     stopMaintenanceTimers(timers);
   });
 

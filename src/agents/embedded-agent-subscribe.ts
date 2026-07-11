@@ -162,6 +162,7 @@ function collectPendingMediaFromInternalEvents(
 export type { SubscribeEmbeddedAgentSessionParams } from "./embedded-agent-subscribe.types.js";
 
 export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSessionParams) {
+  const publicRunId = params.publicRunId ?? params.runId;
   const log = resolveEmbeddedAgentSessionLogger(params.messageChannel);
   const reasoningMode = params.reasoningMode ?? "off";
   const canShowReasoning = params.thinkingLevel !== "off";
@@ -1345,7 +1346,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     // Reject pending compaction wait to unblock awaiting code.
     // Don't resolve, as that would incorrectly signal "compaction complete" when it's still in-flight.
     if (state.compactionRetryPromise) {
-      log.debug(`unsubscribe: rejecting compaction wait runId=${params.runId}`);
+      log.debug(`unsubscribe: rejecting compaction wait runId=${publicRunId}`);
       const reject = state.compactionRetryReject;
       state.compactionRetryResolve = undefined;
       state.compactionRetryReject = undefined;
@@ -1358,11 +1359,11 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     // Cancel any in-flight compaction to prevent resource leaks when unsubscribing.
     // Only abort if compaction is actually running to avoid unnecessary work.
     if (params.session.isCompacting) {
-      log.debug(`unsubscribe: aborting in-flight compaction runId=${params.runId}`);
+      log.debug(`unsubscribe: aborting in-flight compaction runId=${publicRunId}`);
       try {
         params.session.abortCompaction();
       } catch (err) {
-        log.warn(`unsubscribe: compaction abort failed runId=${params.runId} err=${String(err)}`);
+        log.warn(`unsubscribe: compaction abort failed runId=${publicRunId} err=${String(err)}`);
       }
     }
     sessionUnsubscribe();

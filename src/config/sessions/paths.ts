@@ -5,6 +5,7 @@ import path from "node:path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { expandHomePrefix, resolveRequiredHomeDir } from "../../infra/home-dir.js";
 import { DEFAULT_AGENT_ID, normalizeAgentId } from "../../routing/session-key.js";
+import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import { resolveStateDir } from "../paths.js";
 import { isCompactionCheckpointTranscriptFileName } from "./artifacts.js";
 
@@ -44,6 +45,17 @@ export type SessionFilePathOptions = {
 
 const MULTI_STORE_PATH_SENTINEL = "(multiple)";
 const SQLITE_TRANSCRIPT_TARGET_PREFIX = "sqlite:";
+const MAX_CANONICAL_STORE_PATHS = 256;
+// Session store targets are process-stable between config reloads. Cache their
+// physical identity at resolution time so request paths never poll the filesystem.
+const canonicalStorePaths = resolveGlobalSingleton(
+  Symbol.for("openclaw.canonicalSessionStorePaths"),
+  () => new Map<string, string>(),
+);
+
+export function clearCanonicalSessionStorePathCache(): void {
+  canonicalStorePaths.clear();
+}
 
 export function resolveSessionFilePathOptions(params: {
   agentId?: string;
@@ -322,6 +334,41 @@ export function resolveSessionFilePath(
     }
   }
   return resolveSessionTranscriptPathInDir(sessionId, sessionsDir);
+}
+
+/** Resolve one store identity through symlinks, including a not-yet-created leaf. */
+export function resolveCanonicalSessionStorePath(storePath: string): string {
+  const resolvedStorePath = path.resolve(storePath);
+  const cached = canonicalStorePaths.get(resolvedStorePath);
+  if (cached) {
+    return cached;
+  }
+  const unresolvedParts: string[] = [];
+  let current = resolvedStorePath;
+  while (true) {
+    try {
+      const canonicalParent = fs.realpathSync.native(current);
+      const canonical = path.normalize(path.join(canonicalParent, ...unresolvedParts.toReversed()));
+      canonicalStorePaths.set(resolvedStorePath, canonical);
+      if (canonicalStorePaths.size > MAX_CANONICAL_STORE_PATHS) {
+        const oldest = canonicalStorePaths.keys().next().value;
+        if (oldest) {
+          canonicalStorePaths.delete(oldest);
+        }
+      }
+      return canonical;
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+        throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        throw error;
+      }
+      unresolvedParts.push(path.basename(current));
+      current = parent;
+    }
+  }
 }
 
 export function resolveStorePath(

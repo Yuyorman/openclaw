@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { clearMainRunRecoveryRuntimeForTest } from "../../agents/main-run-recovery-runtime.js";
 import {
   appendTranscriptMessageSync,
   loadTranscriptEvents,
@@ -230,6 +231,7 @@ async function createMissingEntryFixture(prefix: string) {
 afterEach(async () => {
   vi.restoreAllMocks();
   resetAgentEventsForTest();
+  clearMainRunRecoveryRuntimeForTest();
   closeOpenClawAgentDatabasesForTest();
   closeOpenClawStateDatabaseForTest();
   transcriptFixtures.clear();

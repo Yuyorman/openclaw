@@ -399,7 +399,7 @@ describe("gateway run option collisions", () => {
     return callArg(startGatewayServer, index, 1) as {
       auth?: { mode?: string; token?: string; password?: string };
       bind?: string;
-      channelAutostartSuppression?: { reason?: string };
+      startupWorkSuppression?: { reason?: string };
       startupConfigSnapshotRead?: { snapshot?: Record<string, unknown> };
       startupStartedAt?: number;
     };
@@ -1426,10 +1426,10 @@ describe("gateway run option collisions", () => {
       "gateway.crash_loop_recovered",
     ]);
     expect(writeDiagnosticStabilityBundleForFailureSync).toHaveBeenCalledTimes(1);
-    expect(gatewayStartOptions(0).channelAutostartSuppression).toMatchObject({
+    expect(gatewayStartOptions(0).startupWorkSuppression).toMatchObject({
       reason: "crash-loop-breaker",
     });
-    expect(gatewayStartOptions(1).channelAutostartSuppression).toBeUndefined();
+    expect(gatewayStartOptions(1).startupWorkSuppression).toBeUndefined();
     expect(gatewayLogMessages.some((message) => message.includes("breaker recovered"))).toBe(true);
   });
 

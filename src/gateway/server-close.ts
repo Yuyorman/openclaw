@@ -9,9 +9,11 @@ import { createAgentRunRestartAbortError } from "../agents/run-termination.js";
 import { type ChannelId, listChannelPlugins } from "../channels/plugins/index.js";
 import { createInternalHookEvent, triggerInternalHook } from "../hooks/internal-hooks.js";
 import type { HeartbeatRunner } from "../infra/heartbeat-runner.js";
+import { GatewayRestartPreparationError } from "../infra/restart.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { closePluginStateDatabase } from "../plugin-state/plugin-state-store.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
+import { activeRunIdentityAliases, resolveActiveRunIdentity } from "./active-run-registry.js";
 import {
   abortTrackedChatRunById,
   type ChatAbortControllerEntry,
@@ -190,8 +192,8 @@ type RestartRunAbortParams = {
   restartRecoveryCandidates?: Map<string, RestartRecoveryCandidate>;
   chatRunState: ChatRunState;
   removeChatRun: (
-    sessionId: string,
-    clientRunId: string,
+    executionRunId: string,
+    publicRunId: string,
     sessionKey?: string,
   ) => ChatRunEntry | undefined;
   agentRunSeq: Map<string, number>;
@@ -218,6 +220,19 @@ type RestartRunAbortParams = {
   }) => Promise<void> | void;
   resolveActiveSessionIdForKey?: (sessionKey: string) => string | undefined;
 };
+
+type MainRunRecoveryWorkerQuiescence = {
+  resume: () => boolean | Promise<boolean>;
+};
+
+type QuiesceMainRunRecoveryWorker = () =>
+  | MainRunRecoveryWorkerQuiescence
+  | undefined
+  | Promise<MainRunRecoveryWorkerQuiescence | undefined>;
+
+export type MarkMainSessionsAbortedForRestart = NonNullable<
+  RestartRunAbortParams["markMainSessionsAbortedForRestart"]
+>;
 
 /** Wait for pending replies and active runs to drain before restart shutdown. */
 async function waitForRestartReplyDrain(params: {
@@ -413,7 +428,9 @@ async function markActiveRunsForRestartRecovery(
     }
   } catch (err) {
     shutdownLog.warn(`failed to mark active main session(s) for restart recovery: ${String(err)}`);
-    recordShutdownWarning(params.warnings, "restart-main-session-marker");
+    throw new Error("restart aborted because active main-session recovery was not durable", {
+      cause: err,
+    });
   }
 }
 
@@ -425,15 +442,15 @@ function abortActiveRunsForRestart(params: RestartRunAbortParams): number {
       continue;
     }
     if (entry.projectSessionActive === false) {
+      const identity = resolveActiveRunIdentity(runId, entry);
       entry.abortStopReason = "restart";
       entry.controller.abort(createAgentRunRestartAbortError());
       removeChatAbortControllerEntry(params.chatAbortControllers, runId, entry);
-      params.chatRunState.abortedRuns.set(runId, createChatAbortMarker());
-      params.chatRunState.clearRun(runId);
-      const removed = params.removeChatRun(runId, runId, entry.sessionKey);
-      params.agentRunSeq.delete(runId);
-      if (removed?.clientRunId) {
-        params.agentRunSeq.delete(removed.clientRunId);
+      params.chatRunState.abortedRuns.set(identity.publicRunId, createChatAbortMarker());
+      params.chatRunState.clearRun(identity.publicRunId);
+      params.removeChatRun(identity.executionRunId, identity.publicRunId, entry.sessionKey);
+      for (const aliasRunId of activeRunIdentityAliases(identity)) {
+        params.agentRunSeq.delete(aliasRunId);
       }
       aborted += 1;
       continue;
@@ -473,11 +490,11 @@ async function drainRestartPendingRepliesForShutdown(
     initialCounts.activeRuns <= 0 &&
     initialCounts.queuedTurns <= 0
   ) {
-    abortQueuedTurnsForRestart(params);
     await markActiveRunsForRestartRecovery({
       ...params,
       reason: "gateway restart shutdown",
     });
+    abortQueuedTurnsForRestart(params);
     abortActiveRunsForRestart(params);
     return;
   }
@@ -496,11 +513,11 @@ async function drainRestartPendingRepliesForShutdown(
     timeoutMs,
   });
   if (drainResult.drained) {
-    abortQueuedTurnsForRestart(params);
     await markActiveRunsForRestartRecovery({
       ...params,
       reason: "gateway restart shutdown",
     });
+    abortQueuedTurnsForRestart(params);
     abortActiveRunsForRestart(params);
     shutdownLog.info(`restart reply drain completed after ${drainResult.elapsedMs}ms`);
     return;
@@ -510,6 +527,11 @@ async function drainRestartPendingRepliesForShutdown(
     `restart reply drain timed out after ${drainResult.elapsedMs}ms with ${formatRestartReplyDrainDetails(drainResult.counts)} still active; continuing shutdown`,
   );
   recordShutdownWarning(params.warnings, "restart-reply-drain");
+
+  await markActiveRunsForRestartRecovery({
+    ...params,
+    reason: "gateway restart shutdown",
+  });
 
   const abortedQueuedTurns = abortQueuedTurnsForRestart(params);
   if (abortedQueuedTurns > 0) {
@@ -524,10 +546,6 @@ async function drainRestartPendingRepliesForShutdown(
     return;
   }
 
-  await markActiveRunsForRestartRecovery({
-    ...params,
-    reason: "gateway restart shutdown",
-  });
   const abortedRuns = abortActiveRunsForRestart(params);
   if (abortedRuns <= 0) {
     return;
@@ -543,6 +561,45 @@ async function drainRestartPendingRepliesForShutdown(
   });
   if (postAbortDrain.drained) {
     shutdownLog.info("restart reply drain completed after abort cleanup");
+  }
+}
+
+/** Prove restart recovery ownership before any one-way gateway teardown. */
+export async function prepareGatewayRestartClose(
+  params: {
+    getPendingReplyCount: () => number;
+    timeoutMs: number;
+    warnings?: string[];
+    quiesceMainRunRecoveryWorker?: QuiesceMainRunRecoveryWorker;
+  } & RestartRunAbortParams,
+): Promise<void> {
+  let workerQuiescence: MainRunRecoveryWorkerQuiescence | undefined;
+  try {
+    if (params.quiesceMainRunRecoveryWorker) {
+      workerQuiescence = await params.quiesceMainRunRecoveryWorker();
+    } else {
+      const { quiesceMainRunRecoveryWorker } =
+        await import("../agents/main-run-recovery-worker.js");
+      workerQuiescence = await quiesceMainRunRecoveryWorker();
+    }
+    await drainRestartPendingRepliesForShutdown({
+      ...params,
+      warnings: params.warnings ?? [],
+    });
+  } catch (error) {
+    let cause = error;
+    try {
+      await workerQuiescence?.resume();
+    } catch (resumeError) {
+      cause = new AggregateError(
+        [error, resumeError],
+        "restart preparation failed and recovery worker rollback did not complete",
+      );
+    }
+    throw new GatewayRestartPreparationError(
+      "restart cancelled because active main-session recovery was not durable",
+      { cause },
+    );
   }
 }
 
@@ -682,6 +739,8 @@ export function createGatewayCloseHandler(
     heartbeatRunner: HeartbeatRunner;
     updateCheckStop?: (() => void) | null;
     stopTaskRegistryMaintenance?: (() => Promise<void> | void) | null;
+    stopMainRunRecoveryWorker?: () => Promise<void> | void;
+    quiesceMainRunRecoveryWorker?: QuiesceMainRunRecoveryWorker;
     nodePresenceTimers: Map<string, ReturnType<typeof setInterval>>;
     tickInterval: ReturnType<typeof setInterval>;
     healthInterval: ReturnType<typeof setInterval>;
@@ -713,6 +772,7 @@ export function createGatewayCloseHandler(
     reason?: string;
     restartExpectedMs?: number | null;
     drainTimeoutMs?: number | null;
+    restartPrepared?: boolean;
   }): Promise<ShutdownResult> => {
     const start = Date.now();
     const warnings: string[] = [];
@@ -724,10 +784,62 @@ export function createGatewayCloseHandler(
         : null;
     const measureCloseStep = <T>(name: string, run: () => Promise<T> | T) =>
       measureGatewayRestartTrace(`restart.close.${name}`, run, [["reason", reason]]);
+    let restartWorkerQuiesced = opts?.restartPrepared === true;
     try {
       // Debug-level: the signal handler already announced the stop/restart at
       // info, and the completion line below reports duration and outcome.
       shutdownLog.debug(`shutdown started: ${reason}`);
+
+      if (
+        restartExpectedMs !== null &&
+        params.getPendingReplyCount &&
+        opts?.restartPrepared !== true
+      ) {
+        const drainTimeoutMs =
+          typeof opts?.drainTimeoutMs === "number" && Number.isFinite(opts.drainTimeoutMs)
+            ? Math.max(0, Math.floor(opts.drainTimeoutMs))
+            : 0;
+        // Worker quiescence is reversible until durable ownership is proven.
+        // Failure resumes dispatch before hooks, queues, channels, or sockets move.
+        await measureCloseStep("reply-drain", () =>
+          prepareGatewayRestartClose({
+            getPendingReplyCount: params.getPendingReplyCount!,
+            chatAbortControllers: params.chatAbortControllers,
+            chatQueuedTurns: params.chatQueuedTurns,
+            restartRecoveryCandidates: params.restartRecoveryCandidates,
+            chatRunState: params.chatRunState,
+            removeChatRun: params.removeChatRun,
+            agentRunSeq: params.agentRunSeq,
+            broadcast: params.broadcast,
+            nodeSendToSession: params.nodeSendToSession,
+            markMainSessionsAbortedForRestart: params.markMainSessionsAbortedForRestart,
+            resolveActiveSessionIdForKey: params.resolveActiveSessionIdForKey,
+            quiesceMainRunRecoveryWorker:
+              params.quiesceMainRunRecoveryWorker ??
+              (params.stopMainRunRecoveryWorker
+                ? async () => {
+                    await params.stopMainRunRecoveryWorker?.();
+                    return undefined;
+                  }
+                : undefined),
+            timeoutMs: drainTimeoutMs,
+            warnings,
+          }),
+        );
+        restartWorkerQuiesced = true;
+      }
+
+      if (!restartWorkerQuiesced) {
+        await measureCloseStep("main-run-recovery-worker", async () => {
+          if (params.stopMainRunRecoveryWorker) {
+            await params.stopMainRunRecoveryWorker();
+            return;
+          }
+          const { stopMainRunRecoveryWorker } =
+            await import("../agents/main-run-recovery-worker.js");
+          await stopMainRunRecoveryWorker();
+        });
+      }
 
       await measureCloseStep("gateway-shutdown-hook", () =>
         shutdownStep(
@@ -777,34 +889,6 @@ export function createGatewayCloseHandler(
                 recordShutdownWarning(warnings, "gateway:pre-restart");
               }
             },
-            warnings,
-          ),
-        );
-      }
-      if (restartExpectedMs !== null && params.getPendingReplyCount) {
-        const drainTimeoutMs =
-          typeof opts?.drainTimeoutMs === "number" && Number.isFinite(opts.drainTimeoutMs)
-            ? Math.max(0, Math.floor(opts.drainTimeoutMs))
-            : 0;
-        await measureCloseStep("reply-drain", () =>
-          shutdownStep(
-            "restart-reply-drain",
-            () =>
-              drainRestartPendingRepliesForShutdown({
-                getPendingReplyCount: params.getPendingReplyCount!,
-                chatAbortControllers: params.chatAbortControllers,
-                chatQueuedTurns: params.chatQueuedTurns,
-                restartRecoveryCandidates: params.restartRecoveryCandidates,
-                chatRunState: params.chatRunState,
-                removeChatRun: params.removeChatRun,
-                agentRunSeq: params.agentRunSeq,
-                broadcast: params.broadcast,
-                nodeSendToSession: params.nodeSendToSession,
-                markMainSessionsAbortedForRestart: params.markMainSessionsAbortedForRestart,
-                resolveActiveSessionIdForKey: params.resolveActiveSessionIdForKey,
-                timeoutMs: drainTimeoutMs,
-                warnings,
-              }),
             warnings,
           ),
         );

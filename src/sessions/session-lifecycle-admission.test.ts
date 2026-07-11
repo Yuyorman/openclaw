@@ -1,6 +1,10 @@
 // Tests lifecycle/work admission ordering across canonical keys and backing ids.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { expect, it } from "vitest";
+import { clearCanonicalSessionStorePathCache } from "../config/sessions/paths.js";
 import { runExclusiveSessionStoreWrite } from "../config/sessions/store-writer.js";
 import {
   resetGatewayWorkAdmission,
@@ -9,12 +13,15 @@ import {
 } from "../process/gateway-work-admission.js";
 import {
   beginSessionWorkAdmission,
+  collectActiveSessionWorkAdmissionIdentities,
   getActiveSessionLifecycleMutationCount,
   getActiveSessionWorkAdmissionCount,
   hasOnlySessionLifecycleMutationKindActive,
   interruptSessionWorkAdmissions,
   isSessionWorkAdmissionActive,
+  registerSessionWorkAdmissionBarrier,
   runExclusiveSessionLifecycleMutation,
+  SessionWorkAdmissionBlockedError,
 } from "./session-lifecycle-admission.js";
 
 function createDeferred() {
@@ -172,6 +179,70 @@ it("registers active work before waiting for the store writer barrier", async ()
   }
 });
 
+it("serializes writer revalidation across physical store aliases", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-writer-alias-")));
+  const physical = path.join(root, "physical");
+  const aliasA = path.join(root, "alias-a");
+  const aliasB = path.join(root, "alias-b");
+  fs.mkdirSync(physical);
+  const symlinkType = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(physical, aliasA, symlinkType);
+  fs.symlinkSync(physical, aliasB, symlinkType);
+  fs.writeFileSync(path.join(physical, "sessions.json"), "{}");
+  const storeA = path.join(aliasA, "sessions.json");
+  const storeB = path.join(aliasB, "sessions.json");
+  const writerStarted = createDeferred();
+  const releaseWriter = createDeferred();
+  const initialValidated = createDeferred();
+  const revalidationStarted = createDeferred();
+  const releaseRevalidation = createDeferred();
+  const order: string[] = [];
+  const writer = runExclusiveSessionStoreWrite(storeA, async () => {
+    order.push("writer:start");
+    writerStarted.resolve();
+    await releaseWriter.promise;
+    order.push("writer:end");
+  });
+  await writerStarted.promise;
+
+  const admissionPromise = beginSessionWorkAdmission({
+    scope: storeB,
+    identities: ["session-writer-physical-alias"],
+    assertAllowed: () => {
+      order.push("initial");
+      initialValidated.resolve();
+    },
+    revalidateAllowed: async () => {
+      order.push("revalidate");
+      revalidationStarted.resolve();
+      await releaseRevalidation.promise;
+    },
+  });
+  let admission: Awaited<typeof admissionPromise> | undefined;
+
+  try {
+    await initialValidated.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(order).toEqual(["writer:start", "initial"]);
+
+    releaseWriter.resolve();
+    await writer;
+    await revalidationStarted.promise;
+    releaseRevalidation.resolve();
+    admission = await admissionPromise;
+    expect(order).toEqual(["writer:start", "initial", "writer:end", "revalidate"]);
+  } finally {
+    releaseWriter.resolve();
+    releaseRevalidation.resolve();
+    const [, admissionResult] = await Promise.allSettled([writer, admissionPromise]);
+    const settledAdmission =
+      admissionResult.status === "fulfilled" ? admissionResult.value : undefined;
+    (admission ?? settledAdmission)?.release();
+    clearCanonicalSessionStorePathCache();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it("revalidates inline when admission begins inside the active store writer", async () => {
   const storePath = "store-writer-reentrant-admission";
   const order: string[] = [];
@@ -218,6 +289,573 @@ it("runs one-time admission work only during writer-barrier revalidation", async
   } finally {
     admission.release();
   }
+});
+
+it("reports an admission that passed the writer before its caller registers work", async () => {
+  const scope = "store-concurrent-admission";
+  const sessionId = "session-concurrent-admission";
+  const writerStarted = createDeferred();
+  const releaseWriter = createDeferred();
+  const firstValidated = createDeferred();
+  const allowFirstCaller = createDeferred();
+  const writer = runExclusiveSessionStoreWrite(scope, async () => {
+    writerStarted.resolve();
+    await releaseWriter.promise;
+  });
+  await writerStarted.promise;
+
+  const firstAdmission = beginSessionWorkAdmission({
+    scope,
+    identities: ["agent:main:concurrent-admission", sessionId],
+    assertAllowed: () => {
+      firstValidated.resolve();
+    },
+  });
+  let firstCallerRegisteredWork = false;
+  const firstCaller = firstAdmission.then(async () => {
+    await allowFirstCaller.promise;
+    firstCallerRegisteredWork = true;
+  });
+  await firstValidated.promise;
+
+  let hasConcurrentAdmissions: boolean | undefined;
+  const secondAdmission = beginSessionWorkAdmission({
+    scope,
+    identities: [sessionId],
+    assertAllowed: () => {},
+    revalidateAllowed: (facts) => {
+      hasConcurrentAdmissions = facts.hasConcurrentAdmissions;
+    },
+  });
+  releaseWriter.resolve();
+
+  let first: Awaited<typeof firstAdmission> | undefined;
+  let second: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
+  try {
+    first = await firstAdmission;
+    second = await secondAdmission;
+    expect(hasConcurrentAdmissions).toBe(true);
+    expect(firstCallerRegisteredWork).toBe(false);
+    expect(getActiveSessionWorkAdmissionCount()).toBe(2);
+  } finally {
+    second?.release();
+    first?.release();
+    allowFirstCaller.resolve();
+    await Promise.allSettled([firstCaller, writer, firstAdmission, secondAdmission]);
+  }
+
+  expect(getActiveSessionWorkAdmissionCount()).toBe(0);
+});
+
+it("blocks work that matches any durable session identity", async () => {
+  const barrier = registerSessionWorkAdmissionBarrier({
+    scope: "store-durable-identity",
+    identities: ["agent:main:alias", "session-durable-identity"],
+  });
+
+  try {
+    await expect(
+      beginSessionWorkAdmission({
+        scope: "store-durable-identity",
+        identities: ["agent:main:alias"],
+        assertAllowed: () => {},
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+    await expect(
+      beginSessionWorkAdmission({
+        scope: "store-durable-identity",
+        identities: ["session-durable-identity"],
+        assertAllowed: () => {},
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+  } finally {
+    barrier.release();
+  }
+});
+
+it("shares durable barriers across physical store aliases", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-lifecycle-alias-")));
+  const physical = path.join(root, "physical");
+  const aliasA = path.join(root, "alias-a");
+  const aliasB = path.join(root, "alias-b");
+  fs.mkdirSync(physical);
+  const symlinkType = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(physical, aliasA, symlinkType);
+  fs.symlinkSync(physical, aliasB, symlinkType);
+  const storeA = path.join(aliasA, "sessions.json");
+  const storeB = path.join(aliasB, "sessions.json");
+  fs.writeFileSync(path.join(physical, "sessions.json"), "{}");
+  const identity = "session-durable-physical-identity";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope: storeA, identities: [identity] });
+
+  try {
+    expect(isSessionWorkAdmissionActive(storeB, [identity])).toBe(true);
+    expect(collectActiveSessionWorkAdmissionIdentities(storeB)).toEqual(new Set([identity]));
+    await expect(
+      beginSessionWorkAdmission({
+        scope: storeB,
+        identities: [identity],
+        assertAllowed: () => {},
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+    await expect(
+      runExclusiveSessionLifecycleMutation({
+        scope: storeB,
+        identities: [identity],
+        run: async () => {},
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+  } finally {
+    barrier.release();
+    clearCanonicalSessionStorePathCache();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it("reports durable barriers as active session work identities", () => {
+  const scope = "store-durable-observability";
+  const alias = "agent:main:durable-observability";
+  const sessionId = "session-durable-observability";
+  const barrier = registerSessionWorkAdmissionBarrier({
+    scope,
+    identities: [alias, sessionId],
+  });
+
+  try {
+    expect(isSessionWorkAdmissionActive(scope, [alias])).toBe(true);
+    expect(isSessionWorkAdmissionActive(scope, [sessionId])).toBe(true);
+    expect(collectActiveSessionWorkAdmissionIdentities(scope)).toEqual(new Set([alias, sessionId]));
+  } finally {
+    barrier.release();
+  }
+
+  expect(isSessionWorkAdmissionActive(scope, [alias, sessionId])).toBe(false);
+  expect(collectActiveSessionWorkAdmissionIdentities(scope)).toEqual(new Set());
+});
+
+it("blocks lifecycle mutation before preparation while durable work remains", async () => {
+  const scope = "store-durable-mutation-block";
+  const identity = "session-durable-mutation-block";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+  let prepared = false;
+  let ran = false;
+
+  try {
+    await expect(
+      runExclusiveSessionLifecycleMutation({
+        scope,
+        identities: [identity],
+        prepare: async () => {
+          prepared = true;
+        },
+        run: async () => {
+          ran = true;
+        },
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+    expect(prepared).toBe(false);
+    expect(ran).toBe(false);
+  } finally {
+    barrier.release();
+  }
+});
+
+it("allows an exact cancellation mutation to bypass and release durable work", async () => {
+  const scope = "store-durable-mutation-cancel";
+  const identity = "session-durable-mutation-cancel";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+  const order: string[] = [];
+
+  try {
+    await runExclusiveSessionLifecycleMutation({
+      scope,
+      identities: [identity],
+      bypassDurableBarrier: true,
+      prepare: async () => {
+        order.push("prepare");
+        expect(isSessionWorkAdmissionActive(scope, [identity])).toBe(true);
+        barrier.release();
+      },
+      run: async () => {
+        order.push("run");
+        expect(isSessionWorkAdmissionActive(scope, [identity])).toBe(false);
+      },
+    });
+    expect(order).toEqual(["prepare", "run"]);
+  } finally {
+    barrier.release();
+  }
+});
+
+it("allows unrelated sessions through a durable session barrier", async () => {
+  const barrier = registerSessionWorkAdmissionBarrier({
+    scope: "store-durable-unrelated",
+    identities: ["session-durable-blocked"],
+  });
+
+  try {
+    const admission = await beginSessionWorkAdmission({
+      scope: "store-durable-unrelated",
+      identities: ["session-durable-allowed"],
+      assertAllowed: () => {},
+    });
+    admission.release();
+  } finally {
+    barrier.release();
+  }
+});
+
+it("allows the durable barrier owner to resume matching session work", async () => {
+  const barrier = registerSessionWorkAdmissionBarrier({
+    scope: "store-durable-owner",
+    identities: ["agent:main:owner-alias", "session-durable-owner"],
+  });
+
+  try {
+    const admission = await beginSessionWorkAdmission({
+      scope: "store-durable-owner",
+      identities: ["agent:main:owner-alias", "session-durable-owner"],
+      barrierGrant: barrier.issueGrant({
+        identities: ["agent:main:owner-alias", "session-durable-owner"],
+      }).grant,
+      assertAllowed: () => {},
+    });
+    admission.release();
+  } finally {
+    barrier.release();
+  }
+});
+
+it("consumes a durable barrier grant only once", async () => {
+  const scope = "store-durable-one-shot";
+  const identity = "session-durable-one-shot";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+  const grant = barrier.issueGrant({ identities: [identity] }).grant;
+
+  try {
+    const admission = await beginSessionWorkAdmission({
+      scope,
+      identities: [identity],
+      barrierGrant: grant,
+      assertAllowed: () => {},
+    });
+    admission.release();
+    await expect(
+      beginSessionWorkAdmission({
+        scope,
+        identities: [identity],
+        barrierGrant: grant,
+        assertAllowed: () => {},
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+  } finally {
+    barrier.release();
+  }
+});
+
+it("binds durable barrier grants to their exact scope and identities", async () => {
+  const scope = "store-durable-bound-grant";
+  const identity = "session-durable-bound-grant";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+
+  try {
+    expect(() => barrier.issueGrant({ identities: ["other-session"] })).toThrow(
+      SessionWorkAdmissionBlockedError,
+    );
+    const wrongScopeGrant = barrier.issueGrant({ identities: [identity] }).grant;
+    await expect(
+      beginSessionWorkAdmission({
+        scope: `${scope}-other`,
+        identities: [identity],
+        barrierGrant: wrongScopeGrant,
+        assertAllowed: () => {},
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+  } finally {
+    barrier.release();
+  }
+});
+
+it("inherits the durable barrier owner through nested admission runs", async () => {
+  const scope = "store-durable-owner-inherited";
+  const identity = "session-durable-owner-inherited";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+  const outer = await beginSessionWorkAdmission({
+    scope,
+    identities: [identity],
+    barrierGrant: barrier.issueGrant({ identities: [identity] }).grant,
+    assertAllowed: () => {},
+  });
+
+  try {
+    await outer.run(async () => {
+      const nested = await beginSessionWorkAdmission({
+        scope,
+        identities: [identity],
+        assertAllowed: () => {},
+      });
+      try {
+        await nested.run(async () => {
+          const deepest = await beginSessionWorkAdmission({
+            scope,
+            identities: [identity],
+            assertAllowed: () => {},
+          });
+          deepest.release();
+        });
+      } finally {
+        nested.release();
+      }
+    });
+  } finally {
+    outer.release();
+    barrier.release();
+  }
+});
+
+it("does not promote an inherited owner beyond its parent admission run", async () => {
+  const scope = "store-durable-owner-child-stashed";
+  const identity = "session-durable-owner-child-stashed";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+  const outer = await beginSessionWorkAdmission({
+    scope,
+    identities: [identity],
+    barrierGrant: barrier.issueGrant({ identities: [identity] }).grant,
+    assertAllowed: () => {},
+  });
+  let nested: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
+
+  try {
+    await outer.run(async () => {
+      nested = await beginSessionWorkAdmission({
+        scope,
+        identities: [identity],
+        assertAllowed: () => {},
+      });
+    });
+    if (!nested) {
+      throw new Error("nested admission was not created");
+    }
+    await expect(
+      nested.run(async () => {
+        const deepest = await beginSessionWorkAdmission({
+          scope,
+          identities: [identity],
+          assertAllowed: () => {},
+        });
+        deepest.release();
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+  } finally {
+    nested?.release();
+    outer.release();
+    barrier.release();
+  }
+});
+
+it("uses the explicit nested barrier owner only for that admission run", async () => {
+  const scope = "store-durable-owner-explicit-nested";
+  const outerIdentity = "session-durable-owner-outer";
+  const nestedIdentity = "session-durable-owner-nested";
+  const outerBarrier = registerSessionWorkAdmissionBarrier({
+    scope,
+    identities: [outerIdentity],
+  });
+  const nestedBarrier = registerSessionWorkAdmissionBarrier({
+    scope,
+    identities: [nestedIdentity],
+  });
+  const outer = await beginSessionWorkAdmission({
+    scope,
+    identities: [outerIdentity],
+    barrierGrant: outerBarrier.issueGrant({ identities: [outerIdentity] }).grant,
+    assertAllowed: () => {},
+  });
+
+  try {
+    await outer.run(async () => {
+      await expect(
+        beginSessionWorkAdmission({
+          scope,
+          identities: [nestedIdentity],
+          assertAllowed: () => {},
+        }),
+      ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+
+      const nested = await beginSessionWorkAdmission({
+        scope,
+        identities: [nestedIdentity],
+        barrierGrant: nestedBarrier.issueGrant({ identities: [nestedIdentity] }).grant,
+        assertAllowed: () => {},
+      });
+      try {
+        await nested.run(async () => {
+          const deepest = await beginSessionWorkAdmission({
+            scope,
+            identities: [nestedIdentity],
+            assertAllowed: () => {},
+          });
+          deepest.release();
+        });
+      } finally {
+        nested.release();
+      }
+
+      await expect(
+        beginSessionWorkAdmission({
+          scope,
+          identities: [nestedIdentity],
+          assertAllowed: () => {},
+        }),
+      ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+    });
+  } finally {
+    outer.release();
+    nestedBarrier.release();
+    outerBarrier.release();
+  }
+});
+
+it("revokes an inherited barrier owner when its admission releases", async () => {
+  const scope = "store-durable-owner-released";
+  const identity = "session-durable-owner-released";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+  const outer = await beginSessionWorkAdmission({
+    scope,
+    identities: [identity],
+    barrierGrant: barrier.issueGrant({ identities: [identity] }).grant,
+    assertAllowed: () => {},
+  });
+
+  try {
+    await outer.run(async () => {
+      const childValidated = createDeferred();
+      const continueChild = createDeferred();
+      const child = beginSessionWorkAdmission({
+        scope,
+        identities: [identity],
+        assertAllowed: async () => {
+          childValidated.resolve();
+          await continueChild.promise;
+        },
+      });
+      await childValidated.promise;
+      const blockedChild = expect(child).rejects.toMatchObject({
+        name: "SessionWorkAdmissionBlockedError",
+      });
+      outer.release();
+      continueChild.resolve();
+      await blockedChild;
+    });
+  } finally {
+    outer.release();
+    barrier.release();
+  }
+});
+
+it("does not retain an inherited barrier owner after its admission run", async () => {
+  const scope = "store-durable-owner-run-ended";
+  const identity = "session-durable-owner-run-ended";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+  const outer = await beginSessionWorkAdmission({
+    scope,
+    identities: [identity],
+    barrierGrant: barrier.issueGrant({ identities: [identity] }).grant,
+    assertAllowed: () => {},
+  });
+  const continueChild = createDeferred();
+  let child: Promise<void> | undefined;
+
+  try {
+    await outer.run(async () => {
+      child = (async () => {
+        await continueChild.promise;
+        const nested = await beginSessionWorkAdmission({
+          scope,
+          identities: [identity],
+          assertAllowed: () => {},
+        });
+        nested.release();
+      })();
+    });
+    if (!child) {
+      throw new Error("detached child was not created");
+    }
+    const blockedChild = expect(child).rejects.toMatchObject({
+      name: "SessionWorkAdmissionBlockedError",
+    });
+    continueChild.resolve();
+    await blockedChild;
+  } finally {
+    continueChild.resolve();
+    await child?.catch(() => {});
+    outer.release();
+    barrier.release();
+  }
+});
+
+it("rechecks durable session barriers behind the store writer", async () => {
+  const scope = "store-durable-writer-race";
+  const identity = "session-durable-writer-race";
+  const writerStarted = createDeferred();
+  const releaseWriter = createDeferred();
+  const firstValidation = createDeferred();
+  const writer = runExclusiveSessionStoreWrite(scope, async () => {
+    writerStarted.resolve();
+    await releaseWriter.promise;
+  });
+  await writerStarted.promise;
+
+  const admission = beginSessionWorkAdmission({
+    scope,
+    identities: [identity],
+    assertAllowed: () => {
+      firstValidation.resolve();
+    },
+  });
+  await firstValidation.promise;
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+  const blockedAdmission = expect(admission).rejects.toMatchObject({
+    name: "SessionWorkAdmissionBlockedError",
+  });
+
+  try {
+    releaseWriter.resolve();
+    await writer;
+    await blockedAdmission;
+    expect(isSessionWorkAdmissionActive(scope, [identity])).toBe(true);
+    barrier.release();
+    expect(isSessionWorkAdmissionActive(scope, [identity])).toBe(false);
+  } finally {
+    releaseWriter.resolve();
+    barrier.release();
+    await Promise.allSettled([writer, admission]);
+  }
+});
+
+it("unblocks matching work after the durable barrier releases", async () => {
+  const scope = "store-durable-release";
+  const identity = "session-durable-release";
+  const barrier = registerSessionWorkAdmissionBarrier({ scope, identities: [identity] });
+
+  try {
+    await expect(
+      beginSessionWorkAdmission({
+        scope,
+        identities: [identity],
+        assertAllowed: () => {},
+      }),
+    ).rejects.toMatchObject({ name: "SessionWorkAdmissionBlockedError" });
+  } finally {
+    barrier.release();
+  }
+
+  const admission = await beginSessionWorkAdmission({
+    scope,
+    identities: [identity],
+    assertAllowed: () => {},
+  });
+  admission.release();
 });
 
 it("rejects and releases an admission invalidated by an earlier store writer", async () => {

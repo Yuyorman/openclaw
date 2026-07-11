@@ -7,6 +7,7 @@ import {
 } from "../agents/internal-runtime-context.js";
 import { formatChannelProgressDraftLine } from "../channels/streaming.js";
 import { registerAgentRunContext, resetAgentRunContextForTest } from "../infra/agent-events.js";
+import { activeRunIdentityAliases, createActiveRunIdentity } from "./active-run-registry.js";
 
 const persistGatewaySessionLifecycleEventMock = vi.fn();
 const logErrorMock = vi.fn();
@@ -209,8 +210,7 @@ describe("agent event handler", () => {
     });
 
     expect(updateRunToolErrorSummary).toHaveBeenCalledWith({
-      runId: "provider-run",
-      clientRunId: "client-run",
+      identity: createActiveRunIdentity("provider-run", "client-run"),
       summary: "edit tool validation failed: edits: must be an array",
     });
   });
@@ -247,8 +247,7 @@ describe("agent event handler", () => {
     });
 
     expect(updateRunToolErrorSummary).toHaveBeenLastCalledWith({
-      runId: "provider-run",
-      clientRunId: "client-run",
+      identity: createActiveRunIdentity("provider-run", "client-run"),
       summary: undefined,
     });
   });
@@ -2149,6 +2148,123 @@ describe("agent event handler", () => {
     resetAgentRunContextForTest();
   });
 
+  it("keeps recovered dispatch ids private across live chat and session events", async () => {
+    const sourceRunId = "private-recovery-dispatch";
+    const clientRunId = "public-chat-admission";
+    const sessionKey = "session-recovered";
+    const {
+      broadcast,
+      broadcastToConnIds,
+      chatRunState,
+      handler,
+      nodeSendToSession,
+      sessionEventSubscribers,
+    } = createHarness();
+    sessionEventSubscribers.subscribe("conn-session");
+    chatRunState.registry.add(sourceRunId, {
+      sessionKey,
+      clientRunId,
+    });
+
+    handler({
+      runId: sourceRunId,
+      seq: 1,
+      stream: "lifecycle",
+      ts: 1_000,
+      data: { phase: "start", startedAt: 1_000 },
+    });
+    handler({
+      runId: sourceRunId,
+      seq: 2,
+      stream: "assistant",
+      ts: 1_100,
+      data: { text: "Recovered output", delta: "Recovered output" },
+    });
+    handler({
+      runId: sourceRunId,
+      seq: 3,
+      stream: "lifecycle",
+      ts: 1_200,
+      data: { phase: "end", startedAt: 1_000, endedAt: 1_200 },
+    });
+
+    await vi.waitFor(() => {
+      expect(
+        broadcastToConnIds.mock.calls.filter(([event]) => event === "sessions.changed"),
+      ).toHaveLength(2);
+    });
+
+    const chatPayloads = chatBroadcastCalls(broadcast).map((call) =>
+      requireRecord(call[1], "chat payload"),
+    );
+    expect(chatPayloads.map((payload) => payload.state)).toEqual(["delta", "final"]);
+    expect(chatPayloads.map((payload) => payload.runId)).toEqual([clientRunId, clientRunId]);
+
+    const sessionsChangedPayloads = broadcastToConnIds.mock.calls
+      .filter(([event]) => event === "sessions.changed")
+      .map((call) => requireRecord(call[1], "sessions changed payload"));
+    expect(sessionsChangedPayloads.map((payload) => payload.runId)).toEqual([
+      clientRunId,
+      clientRunId,
+    ]);
+    expect(sessionsChangedPayloads.every((payload) => payload.clientRunId === undefined)).toBe(
+      true,
+    );
+
+    const clientWireCalls = [
+      ...broadcast.mock.calls,
+      ...broadcastToConnIds.mock.calls,
+      ...nodeSendToSession.mock.calls,
+    ];
+    expect(JSON.stringify(clientWireCalls)).not.toContain(sourceRunId);
+  });
+
+  it("keeps captured recovery projection after abort cleanup removes the run link", async () => {
+    const sourceRunId = "private-aborted-recovery-dispatch";
+    const clientRunId = "public-aborted-chat-admission";
+    const sessionKey = "session-aborted-recovery";
+    const {
+      broadcast,
+      broadcastToConnIds,
+      chatRunState,
+      handler,
+      nodeSendToSession,
+      sessionEventSubscribers,
+    } = createHarness();
+    sessionEventSubscribers.subscribe("conn-session");
+    chatRunState.registry.add(sourceRunId, { sessionKey, clientRunId });
+    const chatLink = chatRunState.registry.peek(sourceRunId);
+    if (!chatLink) {
+      throw new Error("expected captured recovery run link");
+    }
+    chatRunState.abortedRuns.set(clientRunId, createChatAbortMarker());
+    chatRunState.registry.remove(sourceRunId, clientRunId, sessionKey);
+
+    handler(
+      {
+        runId: sourceRunId,
+        seq: 2,
+        stream: "lifecycle",
+        ts: 1_200,
+        data: { phase: "end", aborted: true, endedAt: 1_200 },
+      },
+      { chatLink },
+    );
+
+    await vi.waitFor(() => {
+      expect(
+        broadcastToConnIds.mock.calls.filter(([event]) => event === "sessions.changed"),
+      ).toHaveLength(1);
+    });
+    const clientWireCalls = [
+      ...broadcast.mock.calls,
+      ...broadcastToConnIds.mock.calls,
+      ...nodeSendToSession.mock.calls,
+    ];
+    expect(JSON.stringify(clientWireCalls)).not.toContain(sourceRunId);
+    expect(JSON.stringify(clientWireCalls)).toContain(clientRunId);
+  });
+
   it("does not project stale pre-reset lifecycle events into session subscriber snapshots", async () => {
     vi.mocked(loadGatewaySessionRow).mockReturnValue({
       key: "session-reset",
@@ -2223,96 +2339,7 @@ describe("agent event handler", () => {
     resetAgentRunContextForTest();
   });
 
-  it("suppresses late interrupted pre-restart lifecycle events from live projections", () => {
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        abortedLastRun: true,
-        restartRecoveryRuns: [
-          {
-            runId: "interrupted-run",
-            lifecycleGeneration: "pre-restart",
-          },
-        ],
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
-    });
-    const {
-      broadcast,
-      broadcastToConnIds,
-      chatRunState,
-      clearAgentRunContext,
-      clearTrackedActiveRun,
-      handler,
-      sessionEventSubscribers,
-    } = createHarness({
-      resolveSessionKeyForRun: () => "session-recovery",
-      lifecycleErrorRetryGraceMs: 0,
-    });
-    sessionEventSubscribers.subscribe("conn-session");
-    chatRunState.registry.add("interrupted-run", {
-      sessionKey: "session-recovery",
-      clientRunId: "interrupted-run",
-    });
-
-    handler({
-      runId: "interrupted-run",
-      lifecycleGeneration: "pre-restart",
-      seq: 2,
-      stream: "lifecycle",
-      sessionKey: "session-recovery",
-      sessionId: "session-recovery",
-      ts: 2_100,
-      data: {
-        phase: "end",
-        aborted: true,
-        stopReason: "restart",
-        endedAt: 2_100,
-      },
-    });
-
-    expect(chatBroadcastCalls(broadcast)).toHaveLength(0);
-    expect(
-      broadcastToConnIds.mock.calls.filter(([event]) => event === "sessions.changed"),
-    ).toHaveLength(0);
-    expect(persistGatewaySessionLifecycleEventMock).not.toHaveBeenCalled();
-    expect(chatRunState.registry.peek("interrupted-run")).toBeUndefined();
-    expect(clearAgentRunContext).toHaveBeenCalledWith("interrupted-run");
-    expect(clearTrackedActiveRun).toHaveBeenCalledWith({
-      runId: "interrupted-run",
-      clientRunId: "interrupted-run",
-      sessionKey: "session-recovery",
-    });
-  });
-
-  it("projects successful completion when a restart marker was persisted before abort", async () => {
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        abortedLastRun: true,
-        restartRecoveryRuns: [
-          {
-            runId: "completed-during-marker-write",
-            lifecycleGeneration: "pre-restart",
-          },
-        ],
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
-    });
+  it("projects successful completion", async () => {
     const markTrackedRunTerminalPersisted = vi.fn();
     const trackTrackedRunTerminalPersistence = vi.fn();
     const {
@@ -2352,8 +2379,7 @@ describe("agent event handler", () => {
     expect(chatBroadcastCalls(broadcast)).toHaveLength(1);
     expect(persistGatewaySessionLifecycleEventMock).toHaveBeenCalledTimes(1);
     expect(trackTrackedRunTerminalPersistence).toHaveBeenCalledWith({
-      runId: "completed-during-marker-write",
-      clientRunId: "completed-during-marker-write",
+      identity: createActiveRunIdentity("completed-during-marker-write"),
       sessionKey: "session-recovery",
       sessionId: "session-recovery",
       observedAt: 2_100,
@@ -2361,8 +2387,7 @@ describe("agent event handler", () => {
     });
     await vi.waitFor(() => {
       expect(markTrackedRunTerminalPersisted).toHaveBeenCalledWith({
-        runId: "completed-during-marker-write",
-        clientRunId: "completed-during-marker-write",
+        identity: createActiveRunIdentity("completed-during-marker-write"),
         sessionKey: "session-recovery",
       });
       expect(
@@ -2372,38 +2397,12 @@ describe("agent event handler", () => {
     expect(chatRunState.registry.peek("completed-during-marker-write")).toBeUndefined();
     expect(clearAgentRunContext).toHaveBeenCalledWith("completed-during-marker-write");
     expect(clearTrackedActiveRun).toHaveBeenCalledWith({
-      runId: "completed-during-marker-write",
-      clientRunId: "completed-during-marker-write",
+      identity: createActiveRunIdentity("completed-during-marker-write"),
       sessionKey: "session-recovery",
     });
   });
 
-  it("keeps live session status running while another recovery run remains", async () => {
-    const restartRecoveryRuns = [
-      {
-        runId: "completed-run",
-        lifecycleGeneration: "pre-restart",
-      },
-      {
-        runId: "interrupted-run",
-        lifecycleGeneration: "pre-restart",
-      },
-    ];
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        abortedLastRun: true,
-        restartRecoveryRuns,
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
-    });
+  it("uses canonical live state after terminal persistence", async () => {
     vi.mocked(loadGatewaySessionRow).mockReturnValue({
       key: "session-recovery",
       kind: "direct",
@@ -2449,32 +2448,7 @@ describe("agent event handler", () => {
     });
   });
 
-  it("broadcasts canonical state after concurrent recovery completions persist", async () => {
-    const restartRecoveryRuns = [
-      {
-        runId: "run-a",
-        lifecycleGeneration: "pre-restart-a",
-      },
-      {
-        runId: "run-b",
-        lifecycleGeneration: "pre-restart-b",
-      },
-    ];
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        abortedLastRun: true,
-        restartRecoveryRuns,
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
-    });
+  it("broadcasts canonical state after concurrent terminal writes persist", async () => {
     let currentRow = {
       key: "session-recovery",
       kind: "direct" as const,
@@ -2551,20 +2525,7 @@ describe("agent event handler", () => {
     });
   });
 
-  it("reloads canonical state when a restart marker races terminal persistence", async () => {
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
-    });
+  it("reloads canonical state when it changes during terminal persistence", async () => {
     let currentRow = {
       key: "session-recovery",
       kind: "direct" as const,
@@ -2674,26 +2635,7 @@ describe("agent event handler", () => {
     expect(markTrackedRunTerminalPersisted).not.toHaveBeenCalled();
   });
 
-  it("does not clear a same-id retry when an old restart terminal arrives", () => {
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        restartRecoveryRuns: [
-          {
-            runId: "shared-run",
-            lifecycleGeneration: "pre-restart",
-          },
-        ],
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
-    });
+  it("does not clear a same-id retry when an old lifecycle generation terminates", () => {
     registerAgentRunContext("shared-run", {
       sessionKey: "session-recovery",
       sessionId: "session-recovery",
@@ -2768,25 +2710,6 @@ describe("agent event handler", () => {
     });
     expect(vi.getTimerCount()).toBe(1);
 
-    vi.mocked(loadSessionEntry).mockReturnValue({
-      cfg: {},
-      storePath: "/tmp/sessions.json",
-      store: {},
-      entry: {
-        sessionId: "session-recovery",
-        updatedAt: 2_000,
-        status: "running",
-        restartRecoveryRuns: [
-          {
-            runId: "shared-run",
-            lifecycleGeneration: "pre-restart",
-          },
-        ],
-      },
-      canonicalKey: "session-recovery",
-      storeKeys: ["session-recovery"],
-      legacyKey: undefined,
-    });
     resetAgentRunContextForTest();
     activeLifecycleGeneration = "post-restart";
     registerAgentRunContext("shared-run", {
@@ -2849,8 +2772,7 @@ describe("agent event handler", () => {
     });
 
     expect(clearTrackedActiveRun).toHaveBeenCalledWith({
-      runId: "provider-run",
-      clientRunId: "client-run",
+      identity: createActiveRunIdentity("provider-run", "client-run"),
       sessionKey: "session-finished",
     });
     await vi.waitFor(() => {
@@ -2875,8 +2797,8 @@ describe("agent event handler", () => {
       ["client-run", { sessionKey: "requested-session" }],
     ]);
     const { chatRunState, handler } = createHarness({
-      clearTrackedActiveRun: ({ runId, clientRunId }) => {
-        for (const candidateRunId of new Set([runId, clientRunId])) {
+      clearTrackedActiveRun: ({ identity }) => {
+        for (const candidateRunId of activeRunIdentityAliases(identity)) {
           const entry = trackedActiveRuns.get(candidateRunId);
           if (entry) {
             entry.projectSessionActive = false;
@@ -3667,6 +3589,56 @@ describe("agent event handler", () => {
             ?.fallbackExhaustedFailure === true,
       ),
     ).toBe(true);
+  });
+
+  it("starts durable settlement immediately for synthetic pre-run dispatch errors", async () => {
+    vi.useFakeTimers();
+    const runId = "run-restart-recovery-dispatch-error";
+    const sessionKey = "session-restart-recovery-dispatch-error";
+    const sessionId = "session-id-restart-recovery-dispatch-error";
+    const eventTs = 1_234;
+    const terminalPersistence = Promise.resolve();
+    const trackTrackedRunTerminalPersistence = vi.fn();
+    const markTrackedRunTerminalPersisted = vi.fn();
+    persistGatewaySessionLifecycleEventMock.mockReturnValueOnce(terminalPersistence);
+    const { clearAgentRunContext, handler } = createHarness({
+      resolveSessionKeyForRun: () => sessionKey,
+      lifecycleErrorRetryGraceMs: 60_000,
+      trackTrackedRunTerminalPersistence,
+      markTrackedRunTerminalPersisted,
+    });
+    registerAgentRunContext(runId, { sessionKey, sessionId });
+
+    handler({
+      runId,
+      seq: 1,
+      stream: "lifecycle",
+      ts: eventTs,
+      sessionKey,
+      sessionId,
+      data: {
+        phase: "error",
+        error: "dispatch setup failed",
+        fallbackExhaustedFailure: true,
+      },
+    });
+
+    expect(clearAgentRunContext).toHaveBeenCalledWith(runId);
+    expect(trackTrackedRunTerminalPersistence).toHaveBeenCalledWith({
+      identity: createActiveRunIdentity(runId),
+      sessionKey,
+      sessionId,
+      observedAt: eventTs,
+      persistence: terminalPersistence,
+    });
+    expect(vi.getTimerCount()).toBe(0);
+
+    await Promise.resolve();
+
+    expect(markTrackedRunTerminalPersisted).toHaveBeenCalledWith({
+      identity: createActiveRunIdentity(runId),
+      sessionKey,
+    });
   });
 
   it("keeps deferred lifecycle-error cleanup across later non-terminal events", () => {

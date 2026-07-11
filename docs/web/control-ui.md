@@ -289,6 +289,7 @@ The macOS app keeps its native link-browser sidebar for links clicked in the das
 <AccordionGroup>
   <Accordion title="Send and history semantics">
     - `chat.send` is **non-blocking**: it acks immediately with `{ runId, status: "started" }` and the response streams via `chat` events. Trusted Control UI clients may also receive optional ACK timing metadata for local diagnostics.
+    - For an eligible plain-text send to an existing main session, the Gateway persists the exact user turn and its SQLite recovery ownership before that ACK. The public `runId` stays stable if the Gateway restarts and resumes the turn automatically. See [Restart recovery](/gateway/restart-recovery).
     - Chat uploads accept images plus non-video files. Images keep the native image path; other files are stored as managed media and shown in history as attachment links.
     - Re-sending with the same `idempotencyKey` returns `{ status: "in_flight" }` while running, and `{ status: "ok" }` after completion.
     - `chat.history` responses are size-bounded for UI safety. When transcript entries are too large, Gateway may truncate long text fields, omit heavy metadata blocks, and replace oversized messages with a placeholder (`[chat.history omitted: message too large]`).

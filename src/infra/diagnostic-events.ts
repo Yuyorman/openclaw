@@ -866,7 +866,10 @@ export type TrustedToolExecutionEvent = Extract<
       | "tool.execution.error"
       | "tool.execution.blocked";
   }
->;
+> & {
+  /** Internal, non-enumerable operator identity for durable audit projection. */
+  publicRunId?: string;
+};
 
 type TrustedToolExecutionEventListener = (event: TrustedToolExecutionEvent) => void;
 
@@ -1219,6 +1222,8 @@ type EmitDiagnosticEventOptions = {
   allowSecurityEvent?: boolean;
   internal?: boolean;
   privateData?: DiagnosticEventPrivateData;
+  /** Public turn identity projected after internal tool-audit listeners receive the execution id. */
+  publicRunId?: string;
   trustedTraceContext?: boolean;
 };
 
@@ -1229,7 +1234,7 @@ function emitDiagnosticEventWithTrust(
 ) {
   const state = getDiagnosticEventsState();
   if (trusted && isToolExecutionEventInput(event)) {
-    dispatchTrustedToolExecutionEvent(state, event);
+    dispatchTrustedToolExecutionEvent(state, event, options.publicRunId);
   }
   if (!state.enabled) {
     return;
@@ -1238,7 +1243,11 @@ function emitDiagnosticEventWithTrust(
     return;
   }
 
-  const enriched = enrichDiagnosticEvent(state, event);
+  const projectedEvent =
+    options.publicRunId && "runId" in event
+      ? ({ ...event, runId: options.publicRunId } as DiagnosticDispatchInput)
+      : event;
+  const enriched = enrichDiagnosticEvent(state, projectedEvent);
   const { internal = false, privateData } = options;
   const trustedTraceContext = options.trustedTraceContext === true;
   const metadata = {
@@ -1279,13 +1288,23 @@ function isToolExecutionEventInput(
 function dispatchTrustedToolExecutionEvent(
   state: DiagnosticEventsGlobalState,
   event: TrustedToolExecutionEventInput,
+  publicRunId?: string,
 ): void {
   state.toolExecutionSeq += 1;
   let enriched: TrustedToolExecutionEvent;
   try {
-    enriched = deepFreezeDiagnosticValue(
-      structuredClone({ ...event, seq: state.toolExecutionSeq, ts: Date.now() }),
-    ) as TrustedToolExecutionEvent;
+    const cloned = structuredClone({ ...event, seq: state.toolExecutionSeq, ts: Date.now() }) as
+      | TrustedToolExecutionEvent
+      | (TrustedToolExecutionEvent & Record<string, unknown>);
+    if (publicRunId) {
+      Object.defineProperty(cloned, "publicRunId", {
+        configurable: false,
+        enumerable: false,
+        value: publicRunId,
+        writable: false,
+      });
+    }
+    enriched = deepFreezeDiagnosticValue(cloned) as TrustedToolExecutionEvent;
   } catch (error) {
     console.error(
       `[diagnostic-events] tool execution clone error type=${event.type}: ${String(error)}`,
@@ -1324,8 +1343,11 @@ export function getInternalDiagnosticEventSequence(): number {
 }
 
 /** Emits a trusted diagnostic event from core/runtime-owned instrumentation. */
-export function emitTrustedDiagnosticEvent(event: DiagnosticEventInput) {
-  emitDiagnosticEventWithTrust(event, true);
+export function emitTrustedDiagnosticEvent(
+  event: DiagnosticEventInput,
+  options?: { publicRunId?: string },
+) {
+  emitDiagnosticEventWithTrust(event, true, options);
 }
 
 /** Keeps trusted internal skill accounting alive when optional diagnostics are disabled. */
@@ -1356,8 +1378,9 @@ export function emitTrustedSkillUsedDiagnosticEvent(
 export function emitTrustedDiagnosticEventWithPrivateData(
   event: DiagnosticEventInput,
   privateData?: DiagnosticEventPrivateData,
+  options?: { publicRunId?: string },
 ) {
-  emitDiagnosticEventWithTrust(event, true, { privateData });
+  emitDiagnosticEventWithTrust(event, true, { privateData, ...options });
 }
 
 /** Emits a trusted canonical security event from core-owned enforcement boundaries. */

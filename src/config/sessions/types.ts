@@ -223,11 +223,6 @@ export type PendingSkillSuggestion = {
   detectedAt: number;
 };
 
-export type RestartRecoveryRun = {
-  runId: string;
-  lifecycleGeneration: string;
-};
-
 export type SessionEntry = {
   /**
    * Last delivered heartbeat payload (used to suppress duplicate heartbeat notifications).
@@ -301,8 +296,6 @@ export type SessionEntry = {
   pluginOwnerId?: string;
   systemSent?: boolean;
   abortedLastRun?: boolean;
-  /** Interrupted run generations whose late lifecycle events must be ignored. */
-  restartRecoveryRuns?: RestartRecoveryRun[];
   /** Durable guard state for automatic subagent orphan recovery. */
   subagentRecovery?: SubagentRecoveryState;
   /** Quota cascade protection and state-aware failover status. */
@@ -422,10 +415,6 @@ export type SessionEntry = {
   pendingFinalDeliveryContext?: DeliveryContext;
   /** Durable send intent backing pending final delivery, when already created. */
   pendingFinalDeliveryIntentId?: string | null;
-  /** Current visible run delivery context used only for restart recovery. */
-  restartRecoveryDeliveryContext?: DeliveryContext;
-  /** Active run id that owns restartRecoveryDeliveryContext cleanup. */
-  restartRecoveryDeliveryRunId?: string;
   /**
    * Whether totalTokens reflects a fresh context snapshot for the latest run.
    * Undefined means legacy/unknown freshness; false forces consumers to treat

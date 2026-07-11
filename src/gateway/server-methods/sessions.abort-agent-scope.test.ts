@@ -9,6 +9,11 @@ const resolveSessionKeyForRunMock = vi.fn();
 const listSessionsFromStoreAsyncMock = vi.fn();
 const loadCombinedSessionStoreForGatewayMock = vi.fn();
 const isEmbeddedAgentRunActiveMock = vi.fn();
+const getMainRunRecoveryMock = vi.fn();
+const findActiveMainRunRecoveryBySessionMock = vi.fn();
+const requestMainRunRecoveryCancellationMock = vi.fn();
+const createMainRunRecoveryCancellationSettlementTokenMock = vi.fn();
+const settleMainRunRecoveryCancellationMock = vi.fn();
 const loadSessionEntryMock = vi.fn((sessionKey: string, _opts?: { agentId?: string }) => ({
   canonicalKey: sessionKey,
 }));
@@ -44,6 +49,23 @@ vi.mock("../../agents/embedded-agent-runner/runs.js", async () => {
     isEmbeddedAgentRunActive: (...args: unknown[]) => isEmbeddedAgentRunActiveMock(...args),
   };
 });
+
+vi.mock("../../state/main-run-recovery-store.js", () => {
+  return {
+    getMainRunRecovery: (...args: unknown[]) => getMainRunRecoveryMock(...args),
+    findActiveMainRunRecoveryBySession: (...args: unknown[]) =>
+      findActiveMainRunRecoveryBySessionMock(...args),
+    requestMainRunRecoveryCancellation: (...args: unknown[]) =>
+      requestMainRunRecoveryCancellationMock(...args),
+  };
+});
+
+vi.mock("../../agents/main-run-recovery-runtime.js", () => ({
+  createMainRunRecoveryCancellationSettlementToken: (...args: unknown[]) =>
+    createMainRunRecoveryCancellationSettlementTokenMock(...args),
+  settleMainRunRecoveryCancellation: (...args: unknown[]) =>
+    settleMainRunRecoveryCancellationMock(...args),
+}));
 
 import { sessionsHandlers } from "./sessions.js";
 
@@ -183,6 +205,14 @@ describe("sessions.abort agent scope", () => {
     loadSessionEntryMock.mockClear();
     isEmbeddedAgentRunActiveMock.mockReset();
     isEmbeddedAgentRunActiveMock.mockReturnValue(false);
+    getMainRunRecoveryMock.mockReset();
+    getMainRunRecoveryMock.mockReturnValue(undefined);
+    findActiveMainRunRecoveryBySessionMock.mockReset();
+    findActiveMainRunRecoveryBySessionMock.mockReturnValue(undefined);
+    requestMainRunRecoveryCancellationMock.mockReset();
+    createMainRunRecoveryCancellationSettlementTokenMock.mockReset();
+    createMainRunRecoveryCancellationSettlementTokenMock.mockReturnValue({});
+    settleMainRunRecoveryCancellationMock.mockReset();
   });
 
   it("does not abort an active run whose session key belongs to another requested agent", async () => {
@@ -247,6 +277,102 @@ describe("sessions.abort agent scope", () => {
 
     expect(resolveSessionKeyForRunMock).not.toHaveBeenCalled();
     expectChatAbortParams({ sessionKey: "agent:beta:dashboard:target", runId: "run-beta" });
+  });
+
+  it("finds a recovery-pending run after the in-memory registry is lost", async () => {
+    const context = createContext({
+      agents: [{ id: "main", default: true }, { id: "work" }],
+      extra: {
+        dedupe: new Map(),
+        broadcastToConnIds: vi.fn(),
+        getSessionEventSubscriberConnIds: () => new Set(),
+      },
+    });
+    const recovery = {
+      kind: "exact_turn",
+      publicRunId: "run-recovery-pending",
+      sourceKey: "chat:run-recovery-pending",
+      sourceFingerprint: "a".repeat(64),
+      state: "recovery_pending",
+      bootId: "previous-boot",
+      lifecycleGeneration: "generation-before-restart",
+      agentId: "work",
+      ownerPrincipal: { kind: "system" },
+      authorization: { senderIsOwner: true },
+      sessionKey: "agent:work:dashboard:target",
+      sessionKeyAliases: [],
+      sessionId: "session-recovery-pending",
+      storePath: "/tmp/work-sessions.json",
+      revision: 3,
+      attemptCount: 1,
+      acceptedAtMs: 1,
+      updatedAtMs: 2,
+    };
+    const cancelling = {
+      ...recovery,
+      state: "cancelling",
+      revision: 4,
+      cancellation: { kind: "abort", epoch: "abort-epoch", requestedAtMs: 3 },
+    };
+    getMainRunRecoveryMock.mockReturnValue(recovery);
+    requestMainRunRecoveryCancellationMock.mockReturnValue(cancelling);
+    const settlementToken = {};
+    createMainRunRecoveryCancellationSettlementTokenMock.mockReturnValue(settlementToken);
+    settleMainRunRecoveryCancellationMock.mockReturnValue({
+      ...cancelling,
+      state: "terminal",
+      revision: 5,
+      terminalOutcome: { status: "cancelled", endedAtMs: 3 },
+    });
+    chatAbortMock.mockImplementationOnce(
+      async ({ respond: abortRespond }: { respond: RespondFn }) => {
+        abortRespond(true, { ok: true, runIds: [] });
+      },
+    );
+
+    const respond = await callSessions(
+      "sessions.abort",
+      { runId: "run-recovery-pending" },
+      { context, reqId: "req-recovery-pending" },
+    );
+
+    expect(resolveSessionKeyForRunMock).not.toHaveBeenCalled();
+    expect(loadSessionEntryMock).toHaveBeenCalledWith("agent:work:dashboard:target", {
+      agentId: "work",
+    });
+    expectChatAbortParams({
+      sessionKey: "agent:work:dashboard:target",
+      runId: "run-recovery-pending",
+    });
+    expect(requestMainRunRecoveryCancellationMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        publicRunId: "run-recovery-pending",
+        expectedRevision: 3,
+        expectedState: "recovery_pending",
+        agentId: "work",
+        sessionId: "session-recovery-pending",
+        storePath: "/tmp/work-sessions.json",
+        cancellation: expect.objectContaining({ kind: "abort", epoch: expect.any(String) }),
+      }),
+    );
+    expect(createMainRunRecoveryCancellationSettlementTokenMock).toHaveBeenCalledWith(cancelling);
+    expect(settleMainRunRecoveryCancellationMock).toHaveBeenCalledWith(
+      settlementToken,
+      expect.objectContaining({
+        endedAtMs: expect.any(Number),
+        nowMs: expect.any(Number),
+      }),
+    );
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      {
+        ok: true,
+        abortedRunId: "run-recovery-pending",
+        status: "aborted",
+      },
+      undefined,
+      undefined,
+    );
   });
 
   it("aborts global-scope active runs for non-default agents", async () => {

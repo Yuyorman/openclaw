@@ -51,14 +51,15 @@ export function handleCompactionStart(
 ) {
   const reason = normalizeCompactionReason(evt.reason);
   const kind = compactionLogKind(reason);
+  const publicRunId = ctx.params.publicRunId ?? ctx.params.runId;
   ctx.state.compactionInFlight = true;
   ctx.state.livenessState = "paused";
   ctx.ensureCompactionPromise();
   ctx.log.info(`embedded run ${kind} start`, {
     event: "embedded_run_compaction_start",
-    runId: ctx.params.runId,
+    runId: publicRunId,
     reason,
-    consoleMessage: `embedded run ${kind} start: runId=${ctx.params.runId} reason=${reason}`,
+    consoleMessage: `embedded run ${kind} start: runId=${publicRunId} reason=${reason}`,
   });
   emitAgentEvent({
     runId: ctx.params.runId,
@@ -100,6 +101,7 @@ export function handleCompactionStart(
 export function handleCompactionEnd(ctx: EmbeddedAgentSubscribeContext, evt: CompactionEndEvent) {
   const reason = normalizeCompactionReason(evt.reason);
   const kind = compactionLogKind(reason);
+  const publicRunId = ctx.params.publicRunId ?? ctx.params.runId;
   ctx.state.compactionInFlight = false;
   const willRetry = Boolean(evt.willRetry);
   // Increment counter whenever compaction actually produced a result, regardless
@@ -123,12 +125,12 @@ export function handleCompactionEnd(ctx: EmbeddedAgentSubscribeContext, evt: Com
     });
     ctx.log.info(`embedded run ${kind} complete`, {
       event: "embedded_run_compaction_end",
-      runId: ctx.params.runId,
+      runId: publicRunId,
       reason,
       completed: true,
       willRetry,
       compactionCount: observedCompactionCount,
-      consoleMessage: `embedded run ${kind} complete: runId=${ctx.params.runId} reason=${reason} compactionCount=${observedCompactionCount} willRetry=${willRetry}`,
+      consoleMessage: `embedded run ${kind} complete: runId=${publicRunId} reason=${reason} compactionCount=${observedCompactionCount} willRetry=${willRetry}`,
     });
     void reconcileSessionStoreCompactionCountAfterSuccess({
       sessionKey: ctx.params.sessionKey,
@@ -142,7 +144,7 @@ export function handleCompactionEnd(ctx: EmbeddedAgentSubscribeContext, evt: Com
   if (willRetry) {
     ctx.noteCompactionRetry();
     ctx.resetForCompactionRetry();
-    ctx.log.debug(`embedded run compaction retry: runId=${ctx.params.runId}`);
+    ctx.log.debug(`embedded run compaction retry: runId=${publicRunId}`);
   } else {
     if (!wasAborted) {
       ctx.state.livenessState = "working";
@@ -153,12 +155,12 @@ export function handleCompactionEnd(ctx: EmbeddedAgentSubscribeContext, evt: Com
   if (!hasResult || wasAborted) {
     ctx.log.info(`embedded run ${kind} incomplete`, {
       event: "embedded_run_compaction_end",
-      runId: ctx.params.runId,
+      runId: publicRunId,
       reason,
       completed: false,
       willRetry,
       aborted: wasAborted,
-      consoleMessage: `embedded run ${kind} incomplete: runId=${ctx.params.runId} reason=${reason} aborted=${wasAborted} willRetry=${willRetry}`,
+      consoleMessage: `embedded run ${kind} incomplete: runId=${publicRunId} reason=${reason} aborted=${wasAborted} willRetry=${willRetry}`,
     });
   }
   emitAgentEvent({

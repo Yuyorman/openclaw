@@ -11,6 +11,11 @@ import {
   registerAgentHarness,
   restoreRegisteredAgentHarnesses,
 } from "../agents/harness/registry.js";
+import {
+  clearMainRunRecoveryRuntimeForTest,
+  prepareMainRunRecoveryDispatch,
+  upsertMainRunRecoveryBarrier,
+} from "../agents/main-run-recovery-runtime.js";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import type { SessionAcpMeta } from "../config/sessions/types.js";
 import { enqueueSystemEvent, peekSystemEvents } from "../infra/system-events.js";
@@ -19,7 +24,24 @@ import {
   runExclusiveSessionLifecycle,
   runExclusiveSessionLifecycleMutation,
 } from "../sessions/session-lifecycle-admission.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import { buildPersistedUserTurnMessage } from "../sessions/user-turn-transcript.js";
+import {
+  MAIN_RUN_RECOVERY_LEASE_MS,
+  claimMainRunRecoveryLease,
+  fingerprintMainRunRecoverySource,
+  getMainRunRecovery,
+  recordMainRunRecoveryTerminalEvidenceCas,
+  requestMainRunRecoveryCancellation,
+  reserveMainRunRecovery,
+  transitionMainRunRecoveryStateCas,
+  type MainRunRecovery,
+  type MainRunRecoveryCas,
+  type MainRunRecoveryExecution,
+} from "../state/main-run-recovery-store.js";
+import {
+  closeOpenClawStateDatabaseForTest,
+  openOpenClawStateDatabase,
+} from "../state/openclaw-state-db.js";
 import { embeddedRunMock, testState, writeSessionStore } from "./test-helpers.js";
 import {
   setupGatewaySessionsTestHarness,
@@ -38,6 +60,7 @@ import {
   getGatewayConfigModule,
   getSessionsHandlers,
   sessionHookMocks,
+  sessionLifecycleHookMocks,
 } from "./test/server-sessions.test-helpers.js";
 
 const { createSessionStoreDir, seedActiveMainSession } = setupGatewaySessionsTestHarness();
@@ -62,6 +85,7 @@ type ResetAcpState = {
 type ConfigFilePatch = Parameters<(typeof import("../config/config.js"))["writeConfigFile"]>[0];
 
 afterEach(() => {
+  clearMainRunRecoveryRuntimeForTest();
   closeOpenClawStateDatabaseForTest();
 });
 
@@ -85,13 +109,137 @@ async function seedWaitingActiveMainSession() {
   embeddedRunMock.waitResults.set("sess-main", true);
 }
 
-async function resetMainSession() {
+async function resetMainSession(expectedSessionId?: string) {
   return await directSessionReq<{ ok: true; key: string; entry: { sessionId: string } }>(
     "sessions.reset",
     {
       key: "main",
+      ...(expectedSessionId ? { expectedSessionId } : {}),
     },
   );
+}
+
+function reserveMainRecovery(params: {
+  runId: string;
+  storePath: string;
+  sessionId?: string;
+}): void {
+  const acceptedAtMs = Date.now();
+  const sessionId = params.sessionId ?? "sess-main";
+  const identity = {
+    agentId: "main",
+    sessionKey: "agent:main:main",
+    sessionKeyAliases: ["main"],
+    sessionId,
+    storePath: params.storePath,
+  };
+  const envelope = {
+    kind: "exact_turn" as const,
+    approvedTurn: buildPersistedUserTurnMessage({
+      text: "continue after restart",
+      timestamp: acceptedAtMs,
+      idempotencyKey: `${params.runId}:user`,
+    }),
+  };
+  const sourceKey = envelope.approvedTurn.idempotencyKey;
+  const ownerPrincipal = { kind: "system" as const };
+  const authorization = { senderIsOwner: true };
+  reserveMainRunRecovery({
+    ...identity,
+    publicRunId: params.runId,
+    sourceKey,
+    sourceFingerprint: fingerprintMainRunRecoverySource({
+      sourceKey,
+      identity,
+      envelope,
+      ownerPrincipal,
+      authorization,
+    }),
+    bootId: "test-boot",
+    ownerPrincipal,
+    authorization,
+    envelope,
+    initialLease: {
+      owner: `test-admission:${params.runId}`,
+      expiresAtMs: acceptedAtMs + MAIN_RUN_RECOVERY_LEASE_MS,
+    },
+    acceptedAtMs,
+  });
+  upsertMainRunRecoveryBarrier({
+    aliases: [identity.sessionKey, ...identity.sessionKeyAliases],
+    ledgerRunId: params.runId,
+    sessionId,
+    storePath: params.storePath,
+  });
+}
+
+function requireMainRecovery(runId: string): MainRunRecovery {
+  const recovery = getMainRunRecovery(runId);
+  if (!recovery) {
+    throw new Error(`missing main-run recovery ${runId}`);
+  }
+  return recovery;
+}
+
+function recoveryCas(recovery: MainRunRecovery): MainRunRecoveryCas {
+  if (recovery.state === "terminal") {
+    throw new Error(`main-run recovery ${recovery.publicRunId} is terminal`);
+  }
+  return {
+    publicRunId: recovery.publicRunId,
+    expectedRevision: recovery.revision,
+    expectedState: recovery.state,
+    agentId: recovery.agentId,
+    sessionKey: recovery.sessionKey,
+    sessionKeyAliases: recovery.sessionKeyAliases,
+    sessionId: recovery.sessionId,
+    storePath: recovery.storePath,
+  };
+}
+
+function prepareMainRecoveryAdmission(runId: string) {
+  const transcriptOwned = transitionMainRunRecoveryStateCas({
+    ...recoveryCas(requireMainRecovery(runId)),
+    nextState: "transcript_owned",
+    currentBootId: "test-boot",
+    nowMs: Date.now(),
+  });
+  if (!transcriptOwned) {
+    throw new Error(`failed to transfer ${runId} to transcript ownership`);
+  }
+  return prepareMainRunRecoveryDispatch({
+    currentBootId: "test-boot",
+    dispatchRunId: runId,
+    recovery: transcriptOwned,
+  });
+}
+
+function promoteMainRecoveryToRunning(runId: string): MainRunRecoveryExecution {
+  const transcriptOwned = transitionMainRunRecoveryStateCas({
+    ...recoveryCas(requireMainRecovery(runId)),
+    nextState: "transcript_owned",
+    currentBootId: "test-boot",
+    nowMs: Date.now(),
+  });
+  if (!transcriptOwned) {
+    throw new Error(`failed to transfer ${runId} to transcript ownership`);
+  }
+  const execution = {
+    runId: `${runId}:execution`,
+    lifecycleGeneration: "generation-running-before-reset",
+    epoch: `${runId}:epoch`,
+  };
+  const running = transitionMainRunRecoveryStateCas({
+    ...recoveryCas(transcriptOwned),
+    nextState: "running",
+    currentBootId: "running-boot",
+    execution,
+    nowMs: Date.now(),
+  });
+  if (!running) {
+    throw new Error(`failed to transfer ${runId} to running`);
+  }
+  return execution;
 }
 
 function installAcpRuntimeBackendWithFreshSession() {
@@ -191,6 +339,366 @@ test("sessions.reset aborts active runs and clears queues", async () => {
   expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledWith({
     targetSessionKey: "agent:main:main",
     reason: "session-reset",
+  });
+});
+
+test("ordinary sessions.reset emits lifecycle hooks before an unbind failure", async () => {
+  const { storePath } = await seedActiveMainSession();
+  threadBindingMocks.unbindThreadBindingsBySessionKey.mockRejectedValueOnce(
+    new Error("injected ordinary reset unbind failure"),
+  );
+
+  await expect(resetMainSession()).rejects.toThrow("injected ordinary reset unbind failure");
+
+  expect(loadSessionStore(storePath, { skipCache: true })["agent:main:main"]?.sessionId).not.toBe(
+    "sess-main",
+  );
+  expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(1);
+  expect(subagentLifecycleHookMocks.runSubagentEnded).not.toHaveBeenCalled();
+  expect(sessionLifecycleHookMocks.runSessionEnd).toHaveBeenCalledTimes(1);
+  expect(sessionLifecycleHookMocks.runSessionStart).toHaveBeenCalledTimes(1);
+});
+
+test("sessions.reset keeps direct recovery cancelling after cleanup failure, then settles retry", async () => {
+  const { storePath } = await seedActiveMainSession();
+  const runId = "run-reset-direct-cancellation";
+  reserveMainRecovery({ runId, storePath });
+  const recoveryClaim = prepareMainRecoveryAdmission(runId);
+  let stateWhenInterrupted: string | undefined;
+  let releaseRecovery = () => {};
+  const recoveryLease = await beginSessionWorkAdmission({
+    scope: storePath,
+    identities: recoveryClaim.admissionIdentities,
+    barrierGrant: recoveryClaim.admissionGrant,
+    assertAllowed: () => {},
+    onInterrupt: () => {
+      stateWhenInterrupted = getMainRunRecovery(runId)?.state;
+      releaseRecovery();
+    },
+  });
+  releaseRecovery = recoveryLease.release;
+
+  embeddedRunMock.activeIds.add("sess-main");
+  embeddedRunMock.waitResults.set("sess-main", false);
+  const firstReset = await resetMainSession().finally(recoveryLease.release);
+
+  expect(firstReset.ok).toBe(false);
+  expect(firstReset.error).toMatchObject({
+    code: "UNAVAILABLE",
+    retryable: true,
+    retryAfterMs: 1_000,
+  });
+  expect(stateWhenInterrupted).toBe("cancelling");
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "cancelling",
+    cancellation: { kind: "reset", epoch: expect.any(String) },
+  });
+  expect(getMainRunRecovery(runId)?.envelope).toBeUndefined();
+
+  embeddedRunMock.waitResults.set("sess-main", true);
+  const retry = await resetMainSession();
+
+  expect(retry.ok).toBe(true);
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "terminal",
+    terminalOutcome: { status: "cancelled" },
+  });
+});
+
+test("sessions.reset rejects a foreign cancellation owner without replacing the session", async () => {
+  const { storePath } = await seedActiveMainSession();
+  const runId = "run-reset-foreign-cancellation";
+  reserveMainRecovery({ runId, storePath });
+  const current = requireMainRecovery(runId);
+  const requestedAtMs = Date.now();
+  expect(
+    requestMainRunRecoveryCancellation({
+      ...recoveryCas(current),
+      cancellation: { kind: "delete", epoch: "delete-owner", requestedAtMs },
+      nowMs: requestedAtMs,
+    }),
+  ).toMatchObject({ state: "cancelling" });
+
+  const reset = await resetMainSession();
+
+  expect(reset.ok).toBe(false);
+  expect(reset.error).toMatchObject({ code: "UNAVAILABLE", retryable: true });
+  expect(loadSessionStore(storePath, { skipCache: true })["agent:main:main"]?.sessionId).toBe(
+    "sess-main",
+  );
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "cancelling",
+    cancellation: { kind: "delete", epoch: "delete-owner" },
+  });
+});
+
+test("sessions.reset settles its cancellation across a benign lease revision", async () => {
+  const { storePath } = await seedActiveMainSession();
+  const runId = "run-reset-lease-revision";
+  reserveMainRecovery({ runId, storePath });
+  sessionHookMocks.triggerInternalHook.mockImplementationOnce(async () => {
+    const cancelling = requireMainRecovery(runId);
+    expect(cancelling.state).toBe("cancelling");
+    expect(
+      claimMainRunRecoveryLease({
+        ...recoveryCas(cancelling),
+        leaseOwner: "reset-lease-race",
+        currentBootId: "other-boot",
+        nowMs: Date.now(),
+        leaseDurationMs: 60_000,
+      }),
+    ).toMatchObject({ lease: { owner: "reset-lease-race" } });
+  });
+
+  const reset = await resetMainSession();
+
+  expect(reset.ok).toBe(true);
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "terminal",
+    terminalOutcome: { status: "cancelled" },
+  });
+});
+
+test("sessions.reset preserves exact terminal evidence that wins the cancellation race", async () => {
+  const { storePath } = await seedActiveMainSession();
+  const runId = "run-reset-terminal-evidence";
+  reserveMainRecovery({ runId, storePath });
+  const execution = promoteMainRecoveryToRunning(runId);
+  sessionHookMocks.triggerInternalHook.mockImplementationOnce(async () => {
+    const cancelling = requireMainRecovery(runId);
+    const observedAtMs = cancelling.cancellation?.requestedAtMs;
+    if (observedAtMs === undefined) {
+      throw new Error("reset cancellation was not committed");
+    }
+    expect(
+      recordMainRunRecoveryTerminalEvidenceCas({
+        ...recoveryCas(cancelling),
+        execution,
+        outcome: { status: "done", endedAtMs: observedAtMs },
+        observedAtMs,
+        nowMs: Date.now(),
+      }),
+    ).toMatchObject({ terminalEvidence: { outcome: { status: "done" } } });
+  });
+
+  const reset = await resetMainSession();
+
+  expect(reset.ok).toBe(true);
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "terminal",
+    terminalOutcome: { status: "done" },
+  });
+});
+
+test("sessions.reset does not settle a replaced cancellation token", async () => {
+  const { storePath } = await seedActiveMainSession();
+  const runId = "run-reset-stale-cancellation-token";
+  reserveMainRecovery({ runId, storePath });
+  const stateDb = openOpenClawStateDatabase().db;
+  sessionHookMocks.triggerInternalHook.mockImplementationOnce(async () => {
+    const cancelling = requireMainRecovery(runId);
+    const requestedAtMs = cancelling.cancellation?.requestedAtMs;
+    if (requestedAtMs === undefined) {
+      throw new Error("reset cancellation was not committed");
+    }
+    stateDb
+      .prepare(
+        `UPDATE main_run_recoveries
+         SET cancellation_json = ?, revision = revision + 1, updated_at_ms = ?
+         WHERE public_run_id = ?`,
+      )
+      .run(
+        JSON.stringify({ kind: "reset", epoch: "replacement-owner", requestedAtMs }),
+        Date.now(),
+        runId,
+      );
+  });
+
+  const reset = await resetMainSession();
+
+  expect(reset.ok).toBe(false);
+  expect(reset.error).toMatchObject({ code: "UNAVAILABLE", retryable: true });
+  expect(loadSessionStore(storePath, { skipCache: true })["agent:main:main"]?.sessionId).not.toBe(
+    "sess-main",
+  );
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "cancelling",
+    cancellation: { kind: "reset", epoch: "replacement-owner" },
+  });
+});
+
+test("sessions.reset fails closed after a pre-commit exception", async () => {
+  const { storePath } = await seedActiveMainSession();
+  const runId = "run-reset-pre-commit-failure";
+  reserveMainRecovery({ runId, storePath });
+  sessionHookMocks.triggerInternalHook.mockRejectedValueOnce(new Error("pre-commit reset failure"));
+  const { performGatewaySessionReset } = await import("./session-reset-service.js");
+
+  await expect(
+    performGatewaySessionReset({
+      key: "main",
+      reason: "reset",
+      commandSource: "gateway:sessions.reset",
+    }),
+  ).rejects.toThrow("pre-commit reset failure");
+
+  const store = JSON.parse(await fs.readFile(storePath, "utf-8")) as Record<
+    string,
+    { sessionId?: string }
+  >;
+  expect(store["agent:main:main"]?.sessionId).toBe("sess-main");
+  expect(getMainRunRecovery(runId)).toMatchObject({ state: "cancelling" });
+  expect(getMainRunRecovery(runId)?.envelope).toBeUndefined();
+});
+
+test("sessions.reset retries failed direct-store settlement without resetting its successor", async () => {
+  const { storePath } = await seedActiveMainSession();
+  const runId = "run-reset-post-commit-settlement";
+  reserveMainRecovery({ runId, storePath });
+  const stateDb = openOpenClawStateDatabase().db;
+  stateDb.exec(`
+    CREATE TRIGGER fail_reset_recovery_settlement
+    BEFORE UPDATE OF state ON main_run_recoveries
+    WHEN OLD.public_run_id = '${runId}' AND NEW.state = 'terminal'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected reset settlement failure');
+    END;
+  `);
+
+  let successorSessionId: string | undefined;
+  let successorEntry: unknown;
+  let mcpCleanupCallsAfterCommit = 0;
+  let unbindCallsAfterCommit = 0;
+  let sessionEndCallsAfterCommit = 0;
+  let sessionStartCallsAfterCommit = 0;
+  try {
+    const firstReset = await resetMainSession("sess-main");
+    expect(firstReset.ok).toBe(false);
+    expect(firstReset.error).toMatchObject({ code: "UNAVAILABLE", retryable: true });
+    const storedSuccessor = loadSessionStore(storePath, { skipCache: true })["agent:main:main"];
+    successorEntry = structuredClone(storedSuccessor);
+    successorSessionId = storedSuccessor?.sessionId;
+    expect(successorSessionId).toBeTruthy();
+    expect(successorSessionId).not.toBe("sess-main");
+    expect(getMainRunRecovery(runId)?.state).toBe("cancelling");
+    mcpCleanupCallsAfterCommit = bundleMcpRuntimeMocks.disposeSessionMcpRuntime.mock.calls.length;
+    unbindCallsAfterCommit = threadBindingMocks.unbindThreadBindingsBySessionKey.mock.calls.length;
+    sessionEndCallsAfterCommit = sessionLifecycleHookMocks.runSessionEnd.mock.calls.length;
+    sessionStartCallsAfterCommit = sessionLifecycleHookMocks.runSessionStart.mock.calls.length;
+    expect(unbindCallsAfterCommit).toBe(1);
+    expect(sessionEndCallsAfterCommit).toBe(1);
+    expect(sessionStartCallsAfterCommit).toBe(1);
+
+    const blockedRetry = await resetMainSession("sess-main");
+    expect(blockedRetry.ok).toBe(false);
+    expect(blockedRetry.error).toMatchObject({
+      code: "UNAVAILABLE",
+      retryable: true,
+      retryAfterMs: 1_000,
+    });
+    expect(blockedRetry.error?.message ?? "").toMatch(/still settling/i);
+    expect(loadSessionStore(storePath, { skipCache: true })["agent:main:main"]).toEqual(
+      successorEntry,
+    );
+    expect(bundleMcpRuntimeMocks.disposeSessionMcpRuntime).toHaveBeenCalledTimes(
+      mcpCleanupCallsAfterCommit,
+    );
+    expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(
+      unbindCallsAfterCommit,
+    );
+    expect(sessionLifecycleHookMocks.runSessionEnd).toHaveBeenCalledTimes(
+      sessionEndCallsAfterCommit,
+    );
+    expect(sessionLifecycleHookMocks.runSessionStart).toHaveBeenCalledTimes(
+      sessionStartCallsAfterCommit,
+    );
+    expect(getMainRunRecovery(runId)?.state).toBe("cancelling");
+  } finally {
+    stateDb.exec("DROP TRIGGER IF EXISTS fail_reset_recovery_settlement");
+  }
+
+  const retry = await resetMainSession("sess-main");
+
+  expect(retry.ok).toBe(true);
+  expect(retry.payload?.entry.sessionId).toBe(successorSessionId);
+  expect(loadSessionStore(storePath, { skipCache: true })["agent:main:main"]).toEqual(
+    successorEntry,
+  );
+  expect(bundleMcpRuntimeMocks.disposeSessionMcpRuntime).toHaveBeenCalledTimes(
+    mcpCleanupCallsAfterCommit,
+  );
+  expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(
+    unbindCallsAfterCommit,
+  );
+  expect(sessionLifecycleHookMocks.runSessionEnd).toHaveBeenCalledTimes(sessionEndCallsAfterCommit);
+  expect(sessionLifecycleHookMocks.runSessionStart).toHaveBeenCalledTimes(
+    sessionStartCallsAfterCommit,
+  );
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "terminal",
+    terminalOutcome: { status: "cancelled" },
+  });
+  if (!successorSessionId) {
+    throw new Error("expected committed reset successor");
+  }
+  const successorAdmission = await beginSessionWorkAdmission({
+    scope: storePath,
+    identities: ["agent:main:main", successorSessionId],
+    assertAllowed: () => {},
+  });
+  successorAdmission.release();
+});
+
+test("sessions.reset cancels durable work admitted to a queued reset successor", async () => {
+  const { storePath } = await seedActiveMainSession();
+  const { performGatewaySessionReset } = await import("./session-reset-service.js");
+  let releaseBlocker = () => {};
+  let markBlockerStarted = () => {};
+  const blockerStarted = new Promise<void>((resolve) => {
+    markBlockerStarted = resolve;
+  });
+  const blocker = runExclusiveSessionLifecycle({
+    scope: storePath,
+    identities: ["agent:main:main", "sess-main"],
+    run: async () => {
+      markBlockerStarted();
+      await new Promise<void>((resolve) => {
+        releaseBlocker = resolve;
+      });
+    },
+  });
+  await blockerStarted;
+
+  const runId = "run-reset-successor-admission";
+  let successorSessionId: string | undefined;
+  const firstReset = performGatewaySessionReset({
+    key: "main",
+    reason: "reset",
+    commandSource: "gateway:sessions.reset",
+    onCommitted: ({ sessionId }) => {
+      successorSessionId = sessionId;
+      reserveMainRecovery({ runId, storePath, sessionId });
+    },
+  });
+  // Both reset calls capture sess-main before the blocker releases. The first
+  // callback installs acknowledged work on its successor before the second activates.
+  const secondReset = performGatewaySessionReset({
+    key: "main",
+    reason: "reset",
+    commandSource: "gateway:sessions.reset",
+  });
+  releaseBlocker();
+
+  const [, first, second] = await Promise.all([blocker, firstReset, secondReset]);
+  expect(first.ok).toBe(true);
+  expect(second.ok).toBe(true);
+  expect(successorSessionId).toBeTruthy();
+  expect(successorSessionId).not.toBe("sess-main");
+  expect(second.ok && second.entry.sessionId).not.toBe(successorSessionId);
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    sessionId: successorSessionId,
+    state: "terminal",
+    terminalOutcome: { status: "cancelled" },
   });
 });
 
@@ -574,6 +1082,8 @@ test("sessions.reset preserves a newer session after lifecycle rotation", async 
       backendSessionId: "backend-session-1",
     }),
   });
+  const restartRunId = "run-reset-newer-owner";
+  reserveMainRecovery({ runId: restartRunId, storePath });
   let lifecycleCurrent = true;
   acpManagerMocks.closeSession.mockImplementationOnce(async () => {
     lifecycleCurrent = false;
@@ -605,6 +1115,7 @@ test("sessions.reset preserves a newer session after lifecycle rotation", async 
       storePath,
     })?.sessionId,
   ).toBe("new-owner-session");
+  expect(getMainRunRecovery(restartRunId)?.state).toBe("cancelling");
 });
 
 test("sessions.reset closes child ACP runtime handles spawned from the parent", async () => {

@@ -108,17 +108,19 @@ export function enqueueFollowupRun(
   if (isFollowupRunAborted(run)) {
     return false;
   }
+  const hasExecutionOwner = run.executionOwner !== undefined;
   if (options.position === "front") {
     run.protectFromQueueOverflow = true;
   }
   const queue = getFollowupQueue(key, settings);
-  const recentMessageIdKey = dedupeMode !== "none" ? buildRecentMessageIdKey(run, key) : undefined;
+  const recentMessageIdKey =
+    !hasExecutionOwner && dedupeMode !== "none" ? buildRecentMessageIdKey(run, key) : undefined;
   if (recentMessageIdKey && RECENT_QUEUE_MESSAGE_IDS.peek(recentMessageIdKey)) {
     return false;
   }
 
   const dedupe =
-    dedupeMode === "none"
+    hasExecutionOwner || dedupeMode === "none"
       ? undefined
       : (item: FollowupRun, items: FollowupRun[]) =>
           isRunAlreadyQueued(item, items, dedupeMode === "prompt");
@@ -130,7 +132,12 @@ export function enqueueFollowupRun(
   // drop:new rejects this source without mutating the existing queue. Do not
   // publish an external queued identity for work that will never be admitted.
   const pendingCount = countPendingQueueItems(queue.items, queue.inFlight);
-  if (queue.dropPolicy === "new" && queue.cap > 0 && pendingCount >= queue.cap) {
+  if (
+    !hasExecutionOwner &&
+    queue.dropPolicy === "new" &&
+    queue.cap > 0 &&
+    pendingCount >= queue.cap
+  ) {
     completeFollowupRunLifecycle(run);
     return false;
   }
@@ -138,7 +145,7 @@ export function enqueueFollowupRun(
     return false;
   }
 
-  const shouldEnqueue = applyQueueDropPolicy({
+  const admittedByDropPolicy = applyQueueDropPolicy({
     queue,
     inFlight: queue.inFlight,
     summarize: (item) => normalizeOptionalString(item.summaryLine) || item.prompt.trim(),
@@ -151,8 +158,12 @@ export function enqueueFollowupRun(
         completeFollowupRunLifecycle(item);
       }
     },
-    isProtected: (item) => item.protectFromQueueOverflow === true,
+    isProtected: (item) =>
+      item.executionOwner !== undefined || item.protectFromQueueOverflow === true,
   });
+  // Exact recovery ownership outranks generic queue caps. The ledger worker
+  // already bounds retries; losing this capability here would strand its row.
+  const shouldEnqueue = hasExecutionOwner || admittedByDropPolicy;
   if (queue.dropPolicy === "summarize") {
     const overflow = queue.summarySources.length - queue.summaryLines.length;
     if (overflow > 0) {

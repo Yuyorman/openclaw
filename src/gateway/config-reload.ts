@@ -4,6 +4,7 @@ import chokidar from "chokidar";
 import type { ConfigWriteNotification } from "../config/io.js";
 import { formatConfigIssueLines } from "../config/issue-format.js";
 import { resolveConfigWriteFollowUp } from "../config/runtime-snapshot.js";
+import { clearCanonicalSessionStorePathCache } from "../config/sessions/paths.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import {
@@ -259,6 +260,8 @@ export function startGatewayConfigReloader(opts: {
     if (changedPaths.length === 0) {
       return;
     }
+    // Config reload owns the lifecycle of prepared session-store identities.
+    clearCanonicalSessionStorePathCache();
 
     // Invalidate cached skills snapshots (persisted in sessions.json) whenever
     // the user touches skills.* config. Without this, sessions keep advertising

@@ -11,8 +11,9 @@ const agentCommandFromIngressMock = vi.hoisted(() => vi.fn());
 const performGatewaySessionResetMock = vi.hoisted(() => vi.fn());
 const parseMessageWithAttachmentsMock = vi.hoisted(() => vi.fn());
 
-vi.mock("../../commands/agent.js", () => ({
+vi.mock("../../agents/agent-command.js", () => ({
   agentCommandFromIngress: agentCommandFromIngressMock,
+  agentCommandFromRecoveryIngress: agentCommandFromIngressMock,
 }));
 
 vi.mock("../session-reset-service.js", () => ({

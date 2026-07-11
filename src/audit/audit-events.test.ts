@@ -620,6 +620,59 @@ describe("agent activity audit projection", () => {
     expect(projected?.runId).toBe(runId);
   });
 
+  it("keeps private execution identity for ordering while persisting only the public run id", async () => {
+    const inputs: AuditEventInput[] = [];
+    const writer: AuditEventWriter = {
+      ready: Promise.resolve(),
+      record: (input) => {
+        inputs.push(input);
+        return true;
+      },
+      stop: async () => {},
+    };
+    const recorder = createAgentEventAuditRecorder({ writer });
+    const privateRunId = "private-recovery-execution";
+    const publicRunId = "public-recovery-run";
+    const event = agentEvent({ runId: privateRunId });
+    Object.defineProperty(event, "lifecycleGeneration", {
+      value: "private-lifecycle-generation",
+      enumerable: false,
+    });
+
+    recorder.record(event, { runId: publicRunId });
+    recorder.recordTool(toolEvent({ runId: privateRunId }), { runId: publicRunId });
+    await recorder.stop();
+
+    expect(inputs.map((input) => input.runId)).toEqual([publicRunId, publicRunId]);
+    expect(inputs.map((input) => input.sourceId)).toEqual([
+      expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+    ]);
+    expect(new Set(inputs.map((input) => input.sourceId)).size).toBe(2);
+    expect(JSON.stringify(inputs)).not.toContain(privateRunId);
+    expect(event.lifecycleGeneration).toBe("private-lifecycle-generation");
+    expect(Object.keys(event)).not.toContain("lifecycleGeneration");
+  });
+
+  it("keeps distinct private attempts idempotent under one public run id", () => {
+    const database = createDatabaseOptions();
+    const occurredAt = Date.now();
+    const first = auditInput({
+      sourceId: `sha256:${"a".repeat(64)}`,
+      runId: "public-recovery-turn",
+      sourceSequence: 1,
+      occurredAt,
+    });
+    const second = {
+      ...first,
+      sourceId: `sha256:${"b".repeat(64)}`,
+    };
+
+    expect(recordAuditEvent(first, database)).toBeDefined();
+    expect(recordAuditEvent(second, database)).toBeDefined();
+    expect(listAuditEvents({ database, limit: 10 }).events).toHaveLength(2);
+  });
+
   it("settles an error followed by a cleanup end as one failed outcome", async () => {
     const inputs: AuditEventInput[] = [];
     const writer: AuditEventWriter = {

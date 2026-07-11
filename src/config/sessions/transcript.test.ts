@@ -334,6 +334,35 @@ describe("appendAssistantMessageToSessionTranscript", () => {
     }
   });
 
+  it("can append a recovery artifact without changing session activity", async () => {
+    const updatedAt = Date.parse("2026-05-18T09:00:00.000Z");
+    fs.writeFileSync(
+      fixture.storePath(),
+      JSON.stringify({
+        [sessionKey]: {
+          sessionId,
+          updatedAt,
+          status: "done",
+        },
+      }),
+      "utf-8",
+    );
+
+    const result = await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      text: "Recovery could not resume this run.",
+      storePath: fixture.storePath(),
+      touchSessionEntry: false,
+    });
+
+    expect(result.ok).toBe(true);
+    const store = JSON.parse(fs.readFileSync(fixture.storePath(), "utf-8")) as Record<
+      string,
+      { updatedAt?: number }
+    >;
+    expect(store[sessionKey]?.updatedAt).toBe(updatedAt);
+  });
+
   it("does not advance the registry marker for duplicate delivery mirror replays", async () => {
     const updatedAt = Date.parse("2026-05-18T10:00:00.000Z");
     const firstAppendAt = Date.parse("2026-05-18T10:05:00.000Z");

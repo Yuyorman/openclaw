@@ -5,6 +5,8 @@ import { testing as cliBackendsTesting } from "../../agents/cli-backends.js";
 import { formatBillingErrorMessage } from "../../agents/embedded-agent-helpers.js";
 import { FailoverError } from "../../agents/failover-error.js";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
+import { MainRunRecoveryOwnershipLostError } from "../../agents/main-run-recovery-errors.js";
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import { MissingProviderAuthError } from "../../agents/model-auth.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
 import { resolveSessionRuntimeOverrideForProvider } from "../../agents/session-runtime-compat.js";
@@ -378,7 +380,8 @@ type FallbackRunnerParams = {
 
 type EmbeddedAgentParams = {
   lifecycleGeneration?: string;
-  onExecutionStarted?: (info?: { lifecycleGeneration?: string }) => void;
+  executionOwner?: MainRunRecoveryExecutionOwner;
+  onExecutionStarted?: (info?: { lifecycleGeneration?: string }) => Promise<void> | void;
   onExecutionPhase?: (info: {
     phase:
       | "runner_entered"
@@ -1858,6 +1861,36 @@ describe("runAgentTurnWithFallback", () => {
 
     expect(clearAgentRunContext).toHaveBeenCalledWith("preflight-failure", expect.any(String));
     expect(state.runWithModelFallbackMock).not.toHaveBeenCalled();
+  });
+
+  it("clears run ownership when exact recovery ownership is rejected", async () => {
+    const agentEvents = await import("../../infra/agent-events.js");
+    const clearAgentRunContext = vi.mocked(agentEvents.clearAgentRunContext);
+    const ownershipLost = new MainRunRecoveryOwnershipLostError();
+    const followupRun = createFollowupRun();
+    followupRun.executionOwner = {
+      async start(): Promise<void> {
+        throw ownershipLost;
+      },
+    } as MainRunRecoveryExecutionOwner;
+    state.runEmbeddedAgentMock.mockImplementationOnce(async (params: EmbeddedAgentParams) => {
+      await params.executionOwner?.start({
+        lifecycleGeneration: params.lifecycleGeneration ?? "missing-generation",
+      });
+      throw new Error("provider must not run");
+    });
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    await expect(
+      runAgentTurnWithFallback(
+        createMinimalRunAgentTurnParams({
+          followupRun,
+          opts: { runId: "ownership-rejected" },
+        }),
+      ),
+    ).rejects.toBe(ownershipLost);
+
+    expect(clearAgentRunContext).toHaveBeenCalledWith("ownership-rejected", expect.any(String));
   });
 
   it("passes runtime toolsAllow to embedded agent runs", async () => {
@@ -5289,7 +5322,7 @@ describe("runAgentTurnWithFallback", () => {
     const agentEvents = await import("../../infra/agent-events.js");
     const emitAgentEvent = vi.mocked(agentEvents.emitAgentEvent);
     state.runEmbeddedAgentMock.mockImplementationOnce(async (params: EmbeddedAgentParams) => {
-      params.onExecutionStarted?.({ lifecycleGeneration: "post-restart" });
+      await params.onExecutionStarted?.({ lifecycleGeneration: "post-restart" });
       await params.onAgentEvent?.({
         stream: "lifecycle",
         data: { phase: "start", startedAt: 1_000 },

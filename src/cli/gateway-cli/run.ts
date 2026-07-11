@@ -30,6 +30,7 @@ import {
   isLoopbackHost,
   resolveGatewayBindHost,
 } from "../../gateway/net.js";
+import type { GatewayStartupWorkSuppression } from "../../gateway/server-startup-work-suppression.js";
 import type { GatewayWsLogStyle } from "../../gateway/ws-logging.js";
 import { setGatewayWsLogStyle } from "../../gateway/ws-logging.js";
 import { setVerbose } from "../../globals.js";
@@ -943,7 +944,7 @@ export async function runGatewayCommand(opts: GatewayRunOpts, hooks: GatewayRunR
       ? "defer"
       : "start";
   let crashLoopDecision: GatewayCrashLoopBreakerDecision | undefined;
-  let channelAutostartSuppression: { reason: "crash-loop-breaker"; message: string } | undefined;
+  let startupWorkSuppression: GatewayStartupWorkSuppression | undefined;
   let activeBootId: string | undefined;
   const beginBoot = async (startedAtMs: number) => {
     // run-loop calls beginBoot before every startGatewayServer invocation, so
@@ -957,17 +958,19 @@ export async function runGatewayCommand(opts: GatewayRunOpts, hooks: GatewayRunR
         ? GATEWAY_CRASH_LOOP_RECOVERED_REASON
         : undefined;
     activeBootId = recordGatewayBootStart(process.env, startedAtMs, bootStartReason);
-    channelAutostartSuppression = undefined;
+    startupWorkSuppression = undefined;
     if (crashLoopDecision.recovered) {
-      gatewayLog.info("gateway restart-loop breaker recovered; channel auto-start restored");
+      gatewayLog.info(
+        "gateway restart-loop breaker recovered; automatic startup work and channel auto-start restored",
+      );
     }
     if (!crashLoopDecision.tripped) {
       return;
     }
     const message =
       `gateway restart-loop breaker tripped: ${crashLoopDecision.uncleanBoots} unclean boot(s) within ${crashLoopDecision.windowMs}ms; ` +
-      "suppressing channel/provider account auto-start. Inspect the stability bundle and fix the startup crash before restarting the service.";
-    channelAutostartSuppression = { reason: "crash-loop-breaker", message };
+      "suppressing automatic startup work and channel/provider account auto-start. Inspect the stability bundle and fix the startup crash before restarting the service.";
+    startupWorkSuppression = { reason: "crash-loop-breaker", message };
     gatewayLog.error(message);
     if (crashLoopDecision.shouldWriteStabilityBundle) {
       await maybeWriteGatewayStartupFailureBundle(
@@ -999,7 +1002,7 @@ export async function runGatewayCommand(opts: GatewayRunOpts, hooks: GatewayRunR
             ? { startupConfigSnapshotRead: startupConfigSnapshotReadForThisStart }
             : {}),
           ...(envSidecarStartupMode !== "start" ? { sidecarStartup: envSidecarStartupMode } : {}),
-          ...(channelAutostartSuppression ? { channelAutostartSuppression } : {}),
+          ...(startupWorkSuppression ? { startupWorkSuppression } : {}),
         });
       },
     });

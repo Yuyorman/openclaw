@@ -156,7 +156,6 @@ export const migratedSessionAccessorWriteFiles = new Set([
   "src/agents/embedded-agent-subscribe.handlers.compaction.runtime.ts",
   "src/agents/embedded-agent-runner/run/attempt.ts",
   "src/agents/live-model-switch.ts",
-  "src/agents/main-session-restart-recovery.ts",
   "src/auto-reply/reply/abort.ts",
   "src/agents/subagent-control.ts",
   "src/agents/subagent-registry-helpers.ts",

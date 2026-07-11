@@ -4,6 +4,10 @@
   "sessionAccessorRead": {
     "src/acp/control-plane/manager.background-task.ts": 2,
     "src/acp/control-plane/manager.core.ts": 1,
+    "src/agents/agent-command.ts": 2,
+    "src/agents/bash-tools.exec-approval-followup.ts": 2,
+    "src/agents/command/session.ts": 5,
+    "src/agents/subagent-announce-delivery.ts": 3,
     "src/agents/subagent-announce-output.ts": 3,
     "src/agents/subagent-announce.test-support.ts": 2,
     "src/agents/tools/transcripts-tool.ts": 2,

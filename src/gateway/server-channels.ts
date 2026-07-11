@@ -27,6 +27,7 @@ import type { RuntimeEnv } from "../runtime.js";
 import { isAccountEnabled } from "../shared/account-enabled.js";
 import { runTasksWithConcurrency } from "../utils/run-with-concurrency.js";
 import type { ChannelRuntimeSnapshot } from "./server-channel-runtime.types.js";
+import type { GatewayStartupWorkSuppression } from "./server-startup-work-suppression.js";
 export type { ChannelRuntimeSnapshot };
 
 const CHANNEL_RESTART_POLICY: BackoffPolicy = {
@@ -95,10 +96,7 @@ type ChannelHealthMonitorConfig = HealthMonitorConfig & {
   accounts?: Record<string, HealthMonitorConfig>;
 };
 
-export type ChannelAutostartSuppression = {
-  reason: "crash-loop-breaker";
-  message: string;
-};
+export type ChannelAutostartSuppression = GatewayStartupWorkSuppression;
 
 type GatewayStartupTrace = {
   measure: <T>(name: string, run: () => T | Promise<T>) => Promise<T>;

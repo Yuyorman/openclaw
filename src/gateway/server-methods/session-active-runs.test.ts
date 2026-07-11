@@ -1,5 +1,6 @@
 // Tests gateway active-run matching by logical session key and backing id.
 import { expect, it } from "vitest";
+import { createActiveRunIdentity } from "../active-run-registry.js";
 import {
   hasVisibleActiveSessionRun,
   resolveVisibleActiveSessionRunState,
@@ -46,4 +47,29 @@ it("returns deterministic visible run ids for the selected session", () => {
       canonicalKey: "main",
     }),
   ).toEqual({ active: true, runIds: ["run-a", "run-z"] });
+});
+
+it("projects a recovered controller under its public client run id", () => {
+  const context = {
+    chatAbortControllers: new Map([
+      [
+        "private-recovery-dispatch",
+        {
+          sessionKey: "main",
+          runIdentity: createActiveRunIdentity(
+            "private-recovery-dispatch",
+            "public-chat-admission",
+          ),
+        },
+      ],
+    ]),
+  } as never;
+
+  expect(
+    resolveVisibleActiveSessionRunState({
+      context,
+      requestedKey: "main",
+      canonicalKey: "main",
+    }),
+  ).toEqual({ active: true, runIds: ["public-chat-admission"] });
 });

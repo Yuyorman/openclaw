@@ -713,6 +713,56 @@ describe("before_tool_call loop detection behavior", () => {
     expect(error).toHaveProperty("cause", timeout);
   });
 
+  it("projects recovery identity to before-tool hooks", async () => {
+    hookRunner.hasHooks.mockImplementation((hookName: string) => hookName === "before_tool_call");
+    hookRunner.runBeforeToolCall.mockResolvedValueOnce(undefined);
+
+    await runBeforeToolCallHook({
+      toolName: "read",
+      params: { path: "README.md" },
+      toolCallId: "tool-call-1",
+      ctx: {
+        runId: "private-recovery-attempt",
+        publicRunId: "public-recovery-turn",
+      },
+    });
+
+    expect(hookRunner.runBeforeToolCall).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: "public-recovery-turn" }),
+      expect.objectContaining({ runId: "public-recovery-turn" }),
+    );
+    expect(JSON.stringify(hookRunner.runBeforeToolCall.mock.calls)).not.toContain(
+      "private-recovery-attempt",
+    );
+  });
+
+  it("projects recovery identity to tool diagnostics", async () => {
+    const tool = wrapToolWithBeforeToolCallHook(
+      {
+        name: "read",
+        execute: vi.fn(async () => ({ content: [{ type: "text", text: "ok" }] })),
+      } as unknown as AnyAgentTool,
+      {
+        runId: "private-recovery-attempt",
+        publicRunId: "public-recovery-turn",
+      },
+    );
+
+    await withToolExecutionEvents(async (emitted, flush) => {
+      await tool.execute("tool-call-1", { path: "README.md" }, undefined, undefined);
+      await flush();
+
+      expect(emitted).toEqual([
+        expect.objectContaining({ type: "tool.execution.started", runId: "public-recovery-turn" }),
+        expect.objectContaining({
+          type: "tool.execution.completed",
+          runId: "public-recovery-turn",
+        }),
+      ]);
+      expect(JSON.stringify(emitted)).not.toContain("private-recovery-attempt");
+    });
+  });
+
   it("emits a blocked terminal diagnostic when tool approval is denied", async () => {
     hookRunner.hasHooks.mockImplementation((hookName: string) => hookName === "before_tool_call");
     hookRunner.runBeforeToolCall.mockResolvedValueOnce({

@@ -628,6 +628,7 @@ describe("plugin-sdk subpath exports", () => {
         "DEFAULT_GROUP_HISTORY_LIMIT",
         "requestedSessionId",
         "resumeRequestedSession",
+        "executionOwner",
       ],
     });
     expectSourceMentions("account-helpers", ["createAccountListHelpers"]);
@@ -1262,6 +1263,7 @@ describe("plugin-sdk subpath exports", () => {
     expectSourceOmitsSnippet("agent-runtime", "./sglang.js");
     expectSourceOmitsSnippet("agent-runtime", "./vllm.js");
     expectSourceOmitsSnippet("agent-runtime", "../../extensions/");
+    expectSourceOmitsSnippet("agent-runtime", "agentCommandFromRecoveryIngress");
     expectSourceOmitsSnippet("google-model-id", "./google.js");
     expectSourceOmitsSnippet("google-model-id", "./facade-runtime.js");
     expectSourceOmitsSnippet("google-model-id", "../../extensions/");
@@ -1342,7 +1344,7 @@ describe("plugin-sdk subpath exports", () => {
     expectTypeOf<CoreChannelMessageActionContext>().toMatchTypeOf<SharedChannelMessageActionContext>();
     type PrivateResumeOptionKeys = Extract<
       keyof ReplyRuntimeGetReplyOptions,
-      "requestedSessionId" | "resumeRequestedSession"
+      "requestedSessionId" | "resumeRequestedSession" | "executionOwner"
     >;
     expectTypeOf<PrivateResumeOptionKeys>().toEqualTypeOf<never>();
   });

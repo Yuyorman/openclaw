@@ -41,6 +41,26 @@ const RESTART_COOLDOWN_MS = 30_000;
 const LAUNCHCTL_ALREADY_LOADED_EXIT_CODE = 37;
 const GATEWAY_RESTART_INTENT_KEY = "gateway-restart";
 const GATEWAY_RESTART_INTENT_TTL_MS = 60_000;
+const GATEWAY_RESTART_PREPARATION_ERROR_CODE = "GATEWAY_RESTART_PREPARATION_FAILED";
+
+/** Restart preparation failed before the gateway entered one-way teardown. */
+export class GatewayRestartPreparationError extends Error {
+  readonly code = GATEWAY_RESTART_PREPARATION_ERROR_CODE;
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "GatewayRestartPreparationError";
+  }
+}
+
+export function isGatewayRestartPreparationError(
+  error: unknown,
+): error is GatewayRestartPreparationError {
+  return (
+    error instanceof Error &&
+    (error as { code?: unknown }).code === GATEWAY_RESTART_PREPARATION_ERROR_CODE
+  );
+}
 
 const restartLog = createSubsystemLogger("restart");
 type GatewayRestartIntentDatabase = Pick<OpenClawStateKyselyDatabase, "gateway_restart_intent">;

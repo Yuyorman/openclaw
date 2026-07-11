@@ -45,6 +45,11 @@ OpenClaw canonicalizes paths before building the archive: if config, the credent
 
 During archive creation, OpenClaw skips known live-mutation files with no restoration value: active agent session transcripts, cron run logs, rolling logs, delivery queues, socket/pid/temp files under the state directory, and related durable-queue temp files. The JSON result's `skippedVolatileCount` reports how many files were intentionally omitted. SQLite databases under the state directory are snapshotted safely (`VACUUM INTO`) rather than copied live, so open WAL/SHM files do not corrupt the backup.
 
+Backups are restore-safe snapshots, not live-run checkpoints. The staged
+snapshot removes delivery-queue and main-run recovery rows, and session rows
+captured as running are normalized to `killed`. Restoring an archive
+therefore cannot replay work that belonged to the source Gateway process.
+
 Installed plugin source and manifest files under the state directory's `extensions/` tree are included, but their nested `node_modules/` dependency trees are skipped as rebuildable install artifacts. After restoring an archive, use `openclaw plugins update <id>` or reinstall with `openclaw plugins install <spec> --force` if a restored plugin reports missing dependencies.
 
 ## Invalid config behavior

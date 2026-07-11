@@ -2,7 +2,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { loadChannelOutboundAdapter } from "../channels/plugins/outbound/load.js";
 import { getChannelPlugin } from "../channels/plugins/registry.js";
-import { emitAgentEvent, resetAgentEventsForTest } from "../infra/agent-events.js";
+import {
+  claimAgentRunContext,
+  emitAgentEvent,
+  getAgentEventLifecycleGeneration,
+  resetAgentEventsForTest,
+} from "../infra/agent-events.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 import { isPluginRegistryRetired } from "./registry-lifecycle.js";
 import {
@@ -299,6 +304,41 @@ describe("channel registry pinning", () => {
     });
 
     expect(observed.toSorted()).toEqual(["replacement:approval", "startup:approval"]);
+  });
+
+  it("projects private recovery identity before plugin agent-event subscriptions", () => {
+    const observed: unknown[] = [];
+    const registry = createEmptyPluginRegistry();
+    registry.agentEventSubscriptions = [
+      {
+        pluginId: "observer-plugin",
+        pluginName: "Observer Plugin",
+        source: "test",
+        subscription: {
+          id: "observer-subscription",
+          handle: (event) => {
+            observed.push(event);
+          },
+        },
+      },
+    ];
+    const privateRunId = "private-recovery-attempt";
+    const publicRunId = "public-recovery-turn";
+    claimAgentRunContext(privateRunId, {
+      lifecycleGeneration: getAgentEventLifecycleGeneration(),
+      publicRunId,
+    });
+    setActivePluginRegistry(registry);
+
+    emitAgentEvent({
+      runId: privateRunId,
+      stream: "approval",
+      data: { state: "queued" },
+    });
+
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({ runId: publicRunId, stream: "approval" });
+    expect(JSON.stringify(observed)).not.toContain(privateRunId);
   });
 
   it("dedupes the agent-event bridge across multiple runtime module instances", async () => {

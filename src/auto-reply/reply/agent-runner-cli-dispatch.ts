@@ -13,6 +13,7 @@ import {
   resolveFastModeForElapsed,
   type FastModeAutoProgressState,
 } from "../../agents/fast-mode.js";
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import {
   isAgentRunRestartAbortReason,
   resolveAgentRunAbortLifecycleFields,
@@ -450,10 +451,13 @@ type RunCliAgentWithLifecycleParams = {
   runId: string;
   lifecycleGeneration?: string;
   provider: string;
-  runParams: RunCliAgentParams;
+  runParams: Omit<RunCliAgentParams, "executionOwner" | "onExecutionStarted" | "publicRunId">;
+  /** Durable ownership gate. Runs before lifecycle start or provider entry. */
+  onExecutionStarted?: RunCliAgentParams["onExecutionStarted"];
   startedAt?: number;
   emitLifecycleStart?: boolean;
   emitLifecycleTerminal?: boolean;
+  executionOwner?: MainRunRecoveryExecutionOwner;
   onAgentRunStart?: () => void;
   suppressAssistantBridge?: boolean;
   /**
@@ -488,6 +492,14 @@ export function runCliAgentWithLifecycle(
 async function runCliAgentWithLifecycleInternal(
   params: RunCliAgentWithLifecycleParams,
 ): Promise<EmbeddedAgentRunResult> {
+  if (params.executionOwner) {
+    const lifecycleGeneration = params.lifecycleGeneration?.trim();
+    if (!lifecycleGeneration) {
+      throw new Error("recovery CLI execution requires a lifecycle generation");
+    }
+    await params.executionOwner.start({ lifecycleGeneration });
+  }
+  await params.onExecutionStarted?.();
   const startedAt = params.startedAt ?? Date.now();
   const fastModeStartedAtMs = params.runParams.fastModeStartedAtMs ?? startedAt;
   const fastModeAutoOnSeconds =
@@ -637,6 +649,8 @@ async function runCliAgentWithLifecycleInternal(
   try {
     const rawResult = await runCliAgent({
       ...params.runParams,
+      runId: params.runId,
+      publicRunId: params.executionOwner?.publicRunId ?? params.runId,
       emitCommentaryText: params.runParams.emitCommentaryText ?? Boolean(params.onCommentaryText),
     });
     const restartAbortReason = params.runParams.abortSignal?.reason;

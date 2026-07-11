@@ -20,6 +20,11 @@ import {
 import { resolveAssistantEventPhase } from "../shared/chat-message-content.js";
 import { setSafeTimeout } from "../utils/timer-delay.js";
 import {
+  type ActiveRunIdentity,
+  projectActiveRunIdentity,
+  resolveActiveRunIdentity,
+} from "./active-run-registry.js";
+import {
   normalizeLiveAssistantBufferedText,
   projectLiveAssistantBufferedText,
   resolveAssistantLiveChatInput,
@@ -39,7 +44,6 @@ import { loadGatewaySessionRow } from "./server-chat.load-gateway-session-row.ru
 import { persistGatewaySessionLifecycleEvent } from "./server-chat.persist-session-lifecycle.runtime.js";
 import {
   deriveGatewaySessionLifecycleProjectionPatch,
-  isRestartRecoveryLifecycleEvent,
   isStaleLifecycleEventForSession,
 } from "./session-lifecycle-state.js";
 import { loadSessionEntry } from "./session-utils.js";
@@ -63,6 +67,13 @@ export type {
   SessionMessageSubscriberRegistry,
   ToolEventRecipientRegistry,
 } from "./server-chat-state.js";
+
+function projectSessionEventRunIdentity(
+  sourceRunId: string,
+  chatLink: ChatRunEntry | undefined,
+): { runId: string } {
+  return projectActiveRunIdentity(resolveActiveRunIdentity(sourceRunId, chatLink));
+}
 
 function projectToolSearchCodeEventForChannelPayload<T extends { data?: unknown }>(payload: T): T {
   const data = payload.data;
@@ -279,19 +290,13 @@ export type AgentEventHandlerOptions = {
   loadGatewaySessionRowForSnapshot?: typeof loadGatewaySessionRow;
   lifecycleErrorRetryGraceMs?: number;
   isChatSendRunActive?: (runId: string) => boolean;
-  clearTrackedActiveRun?: (params: {
-    runId: string;
-    clientRunId: string;
-    sessionKey: string;
-  }) => void;
+  clearTrackedActiveRun?: (params: { identity: ActiveRunIdentity; sessionKey: string }) => void;
   markTrackedRunTerminalPersisted?: (params: {
-    runId: string;
-    clientRunId: string;
+    identity: ActiveRunIdentity;
     sessionKey: string;
   }) => void;
   trackTrackedRunTerminalPersistence?: (params: {
-    runId: string;
-    clientRunId: string;
+    identity: ActiveRunIdentity;
     sessionKey: string;
     sessionId?: string;
     observedAt: number;
@@ -299,8 +304,7 @@ export type AgentEventHandlerOptions = {
   }) => void;
   resolveActiveLifecycleGenerationForRun?: (runId: string) => string | undefined;
   updateRunToolErrorSummary?: (params: {
-    runId: string;
-    clientRunId: string;
+    identity: ActiveRunIdentity;
     summary: string | undefined;
   }) => void;
   resolveSessionActiveRunState?: (params: {
@@ -337,9 +341,8 @@ export function createAgentEventHandler({
   resolveSessionActiveRunState,
 }: AgentEventHandlerOptions) {
   type TerminalLifecycleOptions = {
+    chatLink?: ChatRunEntry | null;
     skipChatErrorFinal?: boolean;
-    suppressRestartRecoveryProjection?: boolean;
-    restartRecoveryState?: { suppress: boolean };
   };
   type PendingTerminalLifecycleError = {
     timer: NodeJS.Timeout;
@@ -378,22 +381,6 @@ export function createAgentEventHandler({
     }
     clearTimeout(pending.timer);
     pendingTerminalLifecycleErrors.delete(runId);
-  };
-
-  const resolveRestartRecoveryLifecycleState = (
-    sessionKey: string,
-    agentId: string | undefined,
-    event: AgentEventPayload,
-  ): { suppress: boolean } => {
-    try {
-      const { entry } = loadSessionEntry(sessionKey, {
-        ...(agentId ? { agentId } : {}),
-        clone: false,
-      });
-      return { suppress: isRestartRecoveryLifecycleEvent({ entry, event }) };
-    } catch {
-      return { suppress: false };
-    }
   };
 
   // Only subagent/acp keys can carry spawnedBy (mirrors supportsSpawnLineage in
@@ -593,17 +580,19 @@ export function createAgentEventHandler({
     const currentLifecycleGeneration =
       activeLifecycleGeneration ?? currentRunContext?.lifecycleGeneration;
 
-    const chatLink = chatRunState.registry.peek(evt.runId);
+    const chatLink =
+      opts?.chatLink === undefined
+        ? chatRunState.registry.peek(evt.runId)
+        : (opts.chatLink ?? undefined);
     const sessionAgentId = chatLink?.agentId ?? evt.agentId;
     const eventSessionKey =
       typeof evt.sessionKey === "string" && evt.sessionKey.trim() ? evt.sessionKey : undefined;
     const isControlUiVisible = currentRunContext?.isControlUiVisible ?? true;
     const sessionKey =
       chatLink?.sessionKey ?? eventSessionKey ?? resolveSessionKeyForRun(evt.runId);
-    const restartRecoverySessionKey = eventSessionKey ?? sessionKey;
-    const restartRecoveryAgentId = evt.agentId ?? sessionAgentId;
-    const clientRunId = chatLink?.clientRunId ?? evt.runId;
-    const eventRunId = chatLink?.clientRunId ?? evt.runId;
+    const runIdentity = resolveActiveRunIdentity(evt.runId, chatLink);
+    const clientRunId = runIdentity.publicRunId;
+    const eventRunId = runIdentity.publicRunId;
     const isAborted =
       isChatAbortMarkerCurrent(chatRunState.abortedRuns.get(clientRunId), chatLink) ||
       isChatAbortMarkerCurrent(chatRunState.abortedRuns.get(evt.runId), chatLink);
@@ -611,36 +600,16 @@ export function createAgentEventHandler({
     const deliverySessionKey = sessionKey
       ? resolveSessionDeliveryKey(sessionKey, sessionAgentId)
       : undefined;
-    const restartRecoveryState =
-      opts?.restartRecoveryState ??
-      (restartRecoverySessionKey
-        ? resolveRestartRecoveryLifecycleState(
-            restartRecoverySessionKey,
-            restartRecoveryAgentId,
-            evt,
-          )
-        : undefined);
-    const suppressRestartRecoveryProjection =
-      opts?.suppressRestartRecoveryProjection === true ||
-      Boolean(
-        evt.lifecycleGeneration &&
-        activeLifecycleGeneration &&
-        evt.lifecycleGeneration !== activeLifecycleGeneration,
-      ) ||
-      restartRecoveryState?.suppress === true;
-    const isSupersededRestartRecoveryEvent =
-      suppressRestartRecoveryProjection &&
-      Boolean(
-        evt.lifecycleGeneration &&
-        currentLifecycleGeneration &&
-        evt.lifecycleGeneration !== currentLifecycleGeneration,
-      );
-    if (isSupersededRestartRecoveryEvent) {
+    const isSupersededLifecycleEvent = Boolean(
+      evt.lifecycleGeneration &&
+      currentLifecycleGeneration &&
+      evt.lifecycleGeneration !== currentLifecycleGeneration,
+    );
+    if (isSupersededLifecycleEvent) {
       return;
     }
 
     if (
-      !suppressRestartRecoveryProjection &&
       sessionKey &&
       (isControlUiVisible ||
         (deliverySessionKey ? sessionMessageSubscribers.get(deliverySessionKey).size > 0 : false))
@@ -704,75 +673,67 @@ export function createAgentEventHandler({
 
     toolEventRecipients.markFinal(evt.runId);
     clearBufferedChatState(clientRunId);
-    if (suppressRestartRecoveryProjection && chatLink) {
-      chatRunState.registry.remove(evt.runId, clientRunId, sessionKey);
-    }
     clearAgentRunContext(evt.runId);
     agentRunSeq.delete(evt.runId);
     agentRunSeq.delete(clientRunId);
 
     if (sessionKey) {
-      clearTrackedActiveRun?.({ runId: evt.runId, clientRunId, sessionKey });
-      if (!suppressRestartRecoveryProjection) {
-        const persistence = persistGatewaySessionLifecycleEvent({
-          sessionKey,
-          agentId: sessionAgentId,
-          event: evt,
-        });
-        trackTrackedRunTerminalPersistence?.({
-          runId: evt.runId,
-          clientRunId,
-          sessionKey,
-          sessionId: evt.sessionId,
-          observedAt: evt.ts,
-          persistence,
-        });
-        const broadcastSessionChange = (snapshotEvent?: AgentEventPayload) => {
-          if (parseCronRunScopeSuffix(sessionKey).runId) {
-            return;
-          }
-          const sessionEventConnIds = sessionEventSubscribers.getAll();
-          if (sessionEventConnIds.size === 0) {
-            return;
-          }
-          broadcastToConnIds(
-            "sessions.changed",
-            {
-              sessionKey,
-              ...(sessionAgentId ? { agentId: sessionAgentId } : {}),
-              phase: lifecyclePhase,
-              runId: evt.runId,
-              ...(eventRunId !== evt.runId ? { clientRunId: eventRunId } : {}),
-              ts: evt.ts,
-              ...buildSessionEventSnapshot(sessionKey, snapshotEvent, sessionAgentId, true),
-            },
-            sessionEventConnIds,
-            { dropIfSlow: true },
-          );
-        };
-        const markPersisted = () => {
-          markTrackedRunTerminalPersisted?.({
-            runId: evt.runId,
-            clientRunId,
+      clearTrackedActiveRun?.({ identity: runIdentity, sessionKey });
+      const persistence = persistGatewaySessionLifecycleEvent({
+        sessionKey,
+        agentId: sessionAgentId,
+        event: evt,
+      });
+      trackTrackedRunTerminalPersistence?.({
+        identity: runIdentity,
+        sessionKey,
+        sessionId: evt.sessionId,
+        observedAt: evt.ts,
+        persistence,
+      });
+      const broadcastSessionChange = (snapshotEvent?: AgentEventPayload) => {
+        if (parseCronRunScopeSuffix(sessionKey).runId) {
+          return;
+        }
+        const sessionEventConnIds = sessionEventSubscribers.getAll();
+        if (sessionEventConnIds.size === 0) {
+          return;
+        }
+        broadcastToConnIds(
+          "sessions.changed",
+          {
             sessionKey,
-          });
-        };
-        // Terminal writes serialize with restart markers. Reload only after the
-        // write so subscribers see the canonical post-race session state.
-        void persistence
-          .then(() => {
-            markPersisted();
-            broadcastSessionChange();
-          })
-          .catch((err: unknown) => {
-            logError(
-              `gateway: terminal session persistence failed session=${formatForLog(sessionKey)} run=${formatForLog(evt.runId)} error=${formatForLog(err)}`,
-            );
-            // Persistence recovery remains tracked by the controller entry, but
-            // subscribers still need a terminal projection instead of hanging.
-            broadcastSessionChange(evt);
-          });
-      }
+            ...(sessionAgentId ? { agentId: sessionAgentId } : {}),
+            phase: lifecyclePhase,
+            ...projectSessionEventRunIdentity(evt.runId, chatLink),
+            ts: evt.ts,
+            ...buildSessionEventSnapshot(sessionKey, snapshotEvent, sessionAgentId, true),
+          },
+          sessionEventConnIds,
+          { dropIfSlow: true },
+        );
+      };
+      const markPersisted = () => {
+        markTrackedRunTerminalPersisted?.({
+          identity: runIdentity,
+          sessionKey,
+        });
+      };
+      // Reload after the write so subscribers see canonical state including
+      // any concurrent session changes.
+      void persistence
+        .then(() => {
+          markPersisted();
+          broadcastSessionChange();
+        })
+        .catch((err: unknown) => {
+          logError(
+            `gateway: terminal session persistence failed session=${formatForLog(sessionKey)} run=${formatForLog(eventRunId)} error=${formatForLog(err)}`,
+          );
+          // Persistence recovery remains tracked by the controller entry, but
+          // subscribers still need a terminal projection instead of hanging.
+          broadcastSessionChange(evt);
+        });
     }
   };
 
@@ -1192,11 +1153,13 @@ export function createAgentEventHandler({
     }
   };
 
-  return (evt: AgentEventPayload) => {
+  return (evt: AgentEventPayload, dispatchContext?: { chatLink: ChatRunEntry | undefined }) => {
     const lifecyclePhase =
       evt.stream === "lifecycle" && typeof evt.data?.phase === "string" ? evt.data.phase : null;
 
-    const chatLink = chatRunState.registry.peek(evt.runId);
+    const chatLink = dispatchContext
+      ? dispatchContext.chatLink
+      : chatRunState.registry.peek(evt.runId);
     const sessionAgentId = chatLink?.agentId ?? evt.agentId;
     const eventSessionKey =
       typeof evt.sessionKey === "string" && evt.sessionKey.trim() ? evt.sessionKey : undefined;
@@ -1206,34 +1169,23 @@ export function createAgentEventHandler({
     const isHeartbeat = runContext?.isHeartbeat;
     const sessionKey =
       chatLink?.sessionKey ?? eventSessionKey ?? resolveSessionKeyForRun(evt.runId);
-    const restartRecoverySessionKey = eventSessionKey ?? sessionKey;
-    const restartRecoveryAgentId = evt.agentId ?? sessionAgentId;
-    const clientRunId = chatLink?.clientRunId ?? evt.runId;
-    const eventRunId = chatLink?.clientRunId ?? evt.runId;
+    const runIdentity = resolveActiveRunIdentity(evt.runId, chatLink);
+    const clientRunId = runIdentity.publicRunId;
+    const eventRunId = runIdentity.publicRunId;
     const eventForClients = chatLink ? { ...evt, runId: eventRunId } : evt;
     const isAborted =
       isChatAbortMarkerCurrent(chatRunState.abortedRuns.get(clientRunId), chatLink) ||
       isChatAbortMarkerCurrent(chatRunState.abortedRuns.get(evt.runId), chatLink);
 
-    const restartRecoveryState = restartRecoverySessionKey
-      ? resolveRestartRecoveryLifecycleState(restartRecoverySessionKey, restartRecoveryAgentId, evt)
-      : undefined;
-    const suppressRestartRecoveryLifecycle =
+    const suppressLifecycle =
       lifecyclePhase !== null &&
-      (Boolean(
+      Boolean(
         evt.lifecycleGeneration &&
         activeLifecycleGeneration &&
         evt.lifecycleGeneration !== activeLifecycleGeneration,
-      ) ||
-        restartRecoveryState?.suppress === true);
-    if (suppressRestartRecoveryLifecycle) {
+      );
+    if (suppressLifecycle) {
       clearPendingTerminalLifecycleError(evt.runId, evt.lifecycleGeneration);
-      if (lifecyclePhase === "end" || lifecyclePhase === "error") {
-        finalizeLifecycleEvent(evt, {
-          suppressRestartRecoveryProjection: true,
-          restartRecoveryState,
-        });
-      }
       return;
     }
     if (lifecyclePhase !== null && lifecyclePhase !== "error") {
@@ -1294,16 +1246,15 @@ export function createAgentEventHandler({
     }
     agentRunSeq.set(evt.runId, evt.seq);
     if (evt.stream === "assistant") {
-      updateRunToolErrorSummary?.({ runId: evt.runId, clientRunId, summary: undefined });
+      updateRunToolErrorSummary?.({ identity: runIdentity, summary: undefined });
     }
     if (isToolEvent) {
       const toolPhase = typeof evt.data?.phase === "string" ? evt.data.phase : "";
       if (toolPhase === "start") {
-        updateRunToolErrorSummary?.({ runId: evt.runId, clientRunId, summary: undefined });
+        updateRunToolErrorSummary?.({ identity: runIdentity, summary: undefined });
       } else if (toolPhase === "result") {
         updateRunToolErrorSummary?.({
-          runId: evt.runId,
-          clientRunId,
+          identity: runIdentity,
           summary: readToolValidationErrorSummary(evt.data?.toolErrorSummary),
         });
       }
@@ -1487,15 +1438,21 @@ export function createAgentEventHandler({
       // the runId. Once the runner marks fallback as exhausted, clear chat state
       // immediately so webchat sessions do not stay in progress until the timer.
       if (isAborted || isFallbackExhaustedFailure || lifecycleErrorRetryGraceMs <= 0) {
-        finalizeLifecycleEvent(evt, { skipChatErrorFinal, restartRecoveryState });
+        finalizeLifecycleEvent(evt, {
+          chatLink: chatLink ?? null,
+          skipChatErrorFinal,
+        });
       } else {
-        scheduleTerminalLifecycleError(evt, { skipChatErrorFinal, restartRecoveryState });
+        scheduleTerminalLifecycleError(evt, {
+          chatLink: chatLink ?? null,
+          skipChatErrorFinal,
+        });
       }
       return;
     }
 
     if (lifecyclePhase === "end") {
-      finalizeLifecycleEvent(evt, { restartRecoveryState });
+      finalizeLifecycleEvent(evt, { chatLink: chatLink ?? null });
       return;
     }
 
@@ -1509,7 +1466,7 @@ export function createAgentEventHandler({
         // failure drops the run's start marker from restart-recovery accounting
         // with no operator trace, matching the terminal-phase log below.
         logError(
-          `gateway: start session persistence failed session=${formatForLog(sessionKey)} run=${formatForLog(evt.runId)} error=${formatForLog(err)}`,
+          `gateway: start session persistence failed session=${formatForLog(sessionKey)} run=${formatForLog(eventRunId)} error=${formatForLog(err)}`,
         );
       });
       const sessionEventConnIds = sessionEventSubscribers.getAll();
@@ -1520,8 +1477,7 @@ export function createAgentEventHandler({
             sessionKey,
             ...(sessionAgentId ? { agentId: sessionAgentId } : {}),
             phase: lifecyclePhase,
-            runId: evt.runId,
-            ...(eventRunId !== evt.runId ? { clientRunId: eventRunId } : {}),
+            ...projectSessionEventRunIdentity(evt.runId, chatLink),
             ts: evt.ts,
             ...buildSessionEventSnapshot(sessionKey, evt, sessionAgentId, true),
           },

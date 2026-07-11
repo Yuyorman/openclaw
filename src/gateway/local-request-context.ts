@@ -8,6 +8,7 @@ import {
   getPluginRuntimeGatewayRequestScope,
   withPluginRuntimeGatewayRequestScope,
 } from "../plugins/runtime/gateway-request-scope.js";
+import { ActiveRunRegistry } from "./active-run-registry.js";
 import { NodeRegistry } from "./node-registry.js";
 import type { ChannelRuntimeSnapshot } from "./server-channel-runtime.types.js";
 import { createChatRunEntry, type ChatRunEntry } from "./server-chat-state.js";
@@ -99,7 +100,7 @@ function createLocalGatewayRequestContext(
     hasConnectedTalkNode: () => false,
     nodeRegistry: new NodeRegistry(),
     agentRunSeq: new Map(),
-    chatAbortControllers: new Map(),
+    chatAbortControllers: new ActiveRunRegistry(),
     chatQueuedTurns: new Map(),
     chatAbortedRuns: new Map(),
     chatRunBuffers,
@@ -109,18 +110,18 @@ function createLocalGatewayRequestContext(
     agentDeltaSentAt,
     bufferedAgentEvents,
     clearChatRunState,
-    addChatRun: (sessionId, entry) => {
-      chatRuns.set(sessionId, createChatRunEntry(entry));
+    addChatRun: (executionRunId, entry) => {
+      chatRuns.set(executionRunId, createChatRunEntry(entry, executionRunId));
     },
-    removeChatRun: (sessionId, clientRunId, sessionKey) => {
-      const entry = chatRuns.get(sessionId);
-      if (!entry || entry.clientRunId !== clientRunId) {
+    removeChatRun: (executionRunId, publicRunId, sessionKey) => {
+      const entry = chatRuns.get(executionRunId);
+      if (!entry || entry.runIdentity.publicRunId !== publicRunId) {
         return undefined;
       }
       if (sessionKey !== undefined && entry.sessionKey !== sessionKey) {
         return undefined;
       }
-      chatRuns.delete(sessionId);
+      chatRuns.delete(executionRunId);
       return entry;
     },
     subscribeSessionEvents: (connId) => {

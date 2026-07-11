@@ -40,13 +40,24 @@ import {
   resolveAgentWorkspaceDir,
   resolveSessionAgentId,
 } from "../../agents/agent-scope.js";
+import { listActiveEmbeddedRunSessionIds } from "../../agents/embedded-agent-runner/run-state.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../agents/harness/hook-helpers.js";
+import {
+  createMainRunRecoveryCancellationSettlementToken,
+  createMainRunRecoveryExecutionSettlementToken,
+  releaseMainRunRecoveryBarrierByLedgerRunId,
+  settleMainRunRecoveryCancellation,
+  settleMainRunRecoveryExecution,
+  upsertMainRunRecoveryBarrier,
+} from "../../agents/main-run-recovery-runtime.js";
+import { wakeMainRunRecoveryWorker } from "../../agents/main-run-recovery-worker.js";
 import { modelCatalogBrowseRequiresFullDiscovery } from "../../agents/model-catalog-browse.js";
 import type { ModelCatalogEntry } from "../../agents/model-catalog.types.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
 import { ensureSandboxWorkspaceForSession } from "../../agents/sandbox/context.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
+import { hasInlineCommandTokens } from "../../auto-reply/command-detection.js";
 import { dispatchInboundMessage } from "../../auto-reply/dispatch.js";
 import {
   getReplyPayloadMetadata,
@@ -55,18 +66,32 @@ import {
   type ReplyPayload,
 } from "../../auto-reply/reply-payload.js";
 import { isBtwRequestText } from "../../auto-reply/reply/btw-command.js";
+import { parseInlineDirectives as parseExecutionDirectives } from "../../auto-reply/reply/directive-handling.parse.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
-import { isReplyRunAbortableForSignal } from "../../auto-reply/reply/reply-run-registry.js";
+import {
+  isReplyRunAbortableForSignal,
+  replyRunRegistry,
+} from "../../auto-reply/reply/reply-run-registry.js";
 import {
   stageSandboxMedia,
   type StageSandboxMediaResult,
 } from "../../auto-reply/reply/stage-sandbox-media.js";
 import type { MsgContext, TemplateContext } from "../../auto-reply/templating.js";
-import { resolveSessionWorkStartError } from "../../config/sessions.js";
+import {
+  evaluateSessionFreshness,
+  resolveChannelResetConfig,
+  resolveSessionLifecycleTimestamps,
+  resolveSessionResetPolicy,
+  resolveSessionResetType,
+  resolveSessionWorkStartError,
+  type SessionEntry,
+} from "../../config/sessions.js";
+import { hasProviderOwnedSession } from "../../config/sessions/entry-freshness.js";
 import {
   resolveSessionRoutingContract,
   SESSION_ROUTING_CHANGED_ERROR_REASON,
 } from "../../config/sessions/main-session.js";
+import { resolveCanonicalSessionStorePath } from "../../config/sessions/paths.js";
 import {
   findTranscriptEvent,
   patchSessionEntry,
@@ -89,6 +114,7 @@ import {
 } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage, formatUncaughtError } from "../../infra/errors.js";
 import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
+import { findLegacyMainRunRecoveryAdmissionBlocker } from "../../infra/main-run-recovery-admission-gate.js";
 import { normalizeReplyPayloadsForDelivery } from "../../infra/outbound/payloads.js";
 import { getSessionBindingService } from "../../infra/outbound/session-binding-service.js";
 import { logLargePayload } from "../../logging/diagnostic-payload.js";
@@ -104,21 +130,47 @@ import { deleteMediaBuffer, MEDIA_MAX_BYTES, type SavedMedia } from "../../media
 import { createChannelMessageReplyPipeline } from "../../plugin-sdk/channel-outbound.js";
 import type { ChannelRouteRef } from "../../plugin-sdk/channel-route.js";
 import { isPluginOwnedSessionBindingRecord } from "../../plugins/conversation-binding.js";
+import { hasGlobalHooks } from "../../plugins/hook-runner-global.js";
 import {
   retainGatewayRootWorkAdmissionContinuation,
   runWithGatewayIndependentRootWorkContinuation,
 } from "../../process/gateway-work-admission.js";
-import { normalizeAgentId, scopeLegacySessionKeyToAgent } from "../../routing/session-key.js";
+import {
+  isCronSessionKey,
+  isSubagentSessionKey,
+  normalizeAgentId,
+  scopeLegacySessionKeyToAgent,
+} from "../../routing/session-key.js";
 import { resolveMissingAgentHarnessSessionError } from "../../sessions/agent-harness-session-key.js";
 import { normalizeInputProvenance, type InputProvenance } from "../../sessions/input-provenance.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
-import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
 import {
+  beginSessionWorkAdmission,
+  SessionWorkAdmissionBlockedError,
+} from "../../sessions/session-lifecycle-admission.js";
+import {
+  buildPersistedUserTurnMessage,
   createUserTurnTranscriptRecorder,
+  persistUserTurnTranscript,
   type UserTurnInput,
   type UserTurnTranscriptRecorder,
 } from "../../sessions/user-turn-transcript.js";
+import {
+  discardUnacknowledgedExactTurn as discardUnacknowledgedExactTurnStore,
+  findActiveMainRunRecoveryBySession,
+  fingerprintMainRunRecoverySource,
+  getMainRunRecovery,
+  releaseMainRunRecoveryLease,
+  renewMainRunRecoveryLease,
+  requestMainRunRecoveryCancellation,
+  reserveMainRunRecovery,
+  transitionMainRunRecoveryStateCas,
+  MAIN_RUN_RECOVERY_LEASE_MS,
+  type MainRunRecovery,
+  type MainRunRecoveryCas,
+  type MainRunRecoveryIdentity,
+} from "../../state/main-run-recovery-store.js";
 import { deliveryContextFromSession } from "../../utils/delivery-context.shared.js";
 import {
   parseInlineDirectives,
@@ -128,11 +180,17 @@ import {
 } from "../../utils/directive-tags.js";
 import {
   INTERNAL_MESSAGE_CHANNEL,
+  isBrowserOperatorUiClient,
   isGatewayCliClient,
   isOperatorUiClient,
   isWebchatClient,
   normalizeMessageChannel,
 } from "../../utils/message-channel.js";
+import {
+  type ActiveRunIdentity,
+  resolveActiveRunByIdentity,
+  resolveActiveRunIdentity,
+} from "../active-run-registry.js";
 import {
   abortChatRunById,
   boundInFlightRunSnapshotForChatHistory,
@@ -267,6 +325,8 @@ type ChatAbortRequester = {
   isAdmin: boolean;
 };
 
+type ExactTurnMainRunRecovery = Extract<MainRunRecovery, { kind: "exact_turn" }>;
+
 type PreRegisteredAgentDedupePayload = {
   agentId?: unknown;
   attemptId?: unknown;
@@ -278,6 +338,7 @@ type PreRegisteredAgentDedupePayload = {
   runId?: unknown;
   sessionKey?: unknown;
   sessionKeyAliases?: unknown;
+  sourceFingerprint?: unknown;
   status?: unknown;
   turnKind?: unknown;
 };
@@ -342,6 +403,15 @@ function shouldIncludeChatSendAckServerTiming(client?: {
 }
 
 const CONTROL_UI_RECONNECT_RESUME_PARAM = "__controlUiReconnectResume";
+const DURABLE_CHAT_RETRY_AFTER_MS = 1_000;
+
+function retryableDurableChatError(message: string, details?: unknown) {
+  return errorShape(ErrorCodes.UNAVAILABLE, message, {
+    ...(details === undefined ? {} : { details }),
+    retryable: true,
+    retryAfterMs: DURABLE_CHAT_RETRY_AFTER_MS,
+  });
+}
 
 function resolveControlUiReconnectResumeParams(
   params: unknown,
@@ -650,6 +720,17 @@ const CHANNEL_AGNOSTIC_SESSION_SCOPES = new Set([
   "topic",
 ]);
 const CHANNEL_SCOPED_SESSION_SHAPES = new Set(["direct", "dm", "group", "channel"]);
+const EXACT_TURN_UNSAFE_HOOKS = [
+  "before_dispatch",
+  "before_agent_reply",
+  "before_agent_run",
+  "before_message_write",
+  "reply_dispatch",
+] as const;
+
+function hasExactTurnUnsafeHooks(): boolean {
+  return EXACT_TURN_UNSAFE_HOOKS.some((hookName) => hasGlobalHooks(hookName));
+}
 
 type ChatSendDeliveryEntry = {
   route?: ChannelRouteRef;
@@ -690,6 +771,46 @@ function buildAbortedChatSendPayload(params: {
     ...(params.stopReason ? { stopReason: params.stopReason } : {}),
     endedAt: params.endedAt,
   };
+}
+
+function buildTerminalChatSendReplay(recovery: ExactTurnMainRunRecovery) {
+  const outcome = recovery.terminalOutcome;
+  if (!outcome) {
+    return undefined;
+  }
+  if (outcome.status === "done") {
+    return {
+      ok: true,
+      payload: { runId: recovery.publicRunId, status: "ok" as const },
+      error: undefined,
+    };
+  }
+  if (outcome.status === "failed") {
+    const summary = "agent run failed";
+    return {
+      ok: false,
+      payload: {
+        runId: recovery.publicRunId,
+        status: "error" as const,
+        summary,
+        endedAt: outcome.endedAtMs,
+      },
+      error: errorShape(ErrorCodes.UNAVAILABLE, summary),
+    };
+  }
+  const payload =
+    outcome.status === "killed" || outcome.status === "cancelled"
+      ? buildAbortedChatSendPayload({
+          runId: recovery.publicRunId,
+          endedAt: outcome.endedAtMs,
+          stopReason: outcome.status === "cancelled" ? "rpc" : undefined,
+        })
+      : {
+          runId: recovery.publicRunId,
+          status: "timeout" as const,
+          endedAt: outcome.endedAtMs,
+        };
+  return { ok: true, payload, error: undefined };
 }
 
 function validateChatSelectedAgent(params: {
@@ -764,6 +885,111 @@ function resolveChatSendActiveScopeKey(params: {
       mainKey: params.mainKey,
     }) ?? params.sessionKey
   );
+}
+
+type ExactTurnRecoveryRequestShape = {
+  clientInfo?: { id?: string | null; mode?: string | null };
+  explicitOrigin: ChatSendExplicitOrigin | undefined;
+  hasAttachments: boolean;
+  hasReconnectResume: boolean;
+  hasSemanticOverrides: boolean;
+  rawMessage: string;
+  turnKind: "btw" | "main";
+};
+
+function isExactTurnRecoveryRequestShape(params: ExactTurnRecoveryRequestShape): boolean {
+  if (
+    !isBrowserOperatorUiClient(params.clientInfo) ||
+    params.turnKind !== "main" ||
+    params.hasAttachments ||
+    params.hasReconnectResume ||
+    params.hasSemanticOverrides ||
+    params.explicitOrigin !== undefined ||
+    !params.rawMessage ||
+    hasInlineCommandTokens(params.rawMessage) ||
+    ["/", "!"].some((prefix) => params.rawMessage.trimStart().startsWith(prefix))
+  ) {
+    return false;
+  }
+  const directives = parseInlineDirectives(params.rawMessage, {
+    stripAudioTag: false,
+    stripReplyTags: false,
+  });
+  if (directives.hasAudioTag || directives.hasReplyTag) {
+    return false;
+  }
+  const executionDirectives = parseExecutionDirectives(params.rawMessage);
+  if (
+    executionDirectives.hasThinkDirective ||
+    executionDirectives.hasVerboseDirective ||
+    executionDirectives.hasTraceDirective ||
+    executionDirectives.hasFastDirective ||
+    executionDirectives.hasReasoningDirective ||
+    executionDirectives.hasElevatedDirective ||
+    executionDirectives.hasExecDirective ||
+    executionDirectives.hasStatusDirective ||
+    executionDirectives.hasModelDirective ||
+    executionDirectives.hasQueueDirective
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isExactTurnRecoveryCandidate(params: {
+  cfg: OpenClawConfig;
+  entry?: SessionEntry;
+  nowMs: number;
+  requestShape: ExactTurnRecoveryRequestShape;
+  requestedSessionId?: string;
+  sessionAgentId: string;
+  sessionKey: string;
+  storePath: string;
+}): boolean {
+  const entry = params.entry;
+  if (
+    !isExactTurnRecoveryRequestShape(params.requestShape) ||
+    !entry?.sessionId ||
+    entry.status === "running" ||
+    entry.archivedAt !== undefined ||
+    entry.initializationPending === true ||
+    entry.pluginOwnerId !== undefined ||
+    entry.spawnedBy !== undefined ||
+    entry.subagentRole !== undefined ||
+    (entry.spawnDepth ?? 0) > 0 ||
+    entry.acp !== undefined ||
+    entry.cronRunContinuation !== undefined ||
+    isSubagentSessionKey(params.sessionKey) ||
+    isCronSessionKey(params.sessionKey) ||
+    isAcpSessionKey(params.sessionKey) ||
+    (params.requestedSessionId !== undefined && params.requestedSessionId !== entry.sessionId)
+  ) {
+    return false;
+  }
+  const resetPolicy = resolveSessionResetPolicy({
+    sessionCfg: params.cfg.session,
+    resetType: resolveSessionResetType({ sessionKey: params.sessionKey }),
+    resetOverride: resolveChannelResetConfig({
+      sessionCfg: params.cfg.session,
+      channel: entry.lastChannel ?? entry.channel,
+    }),
+  });
+  if (entry.modelSelectionLocked === true) {
+    return true;
+  }
+  if (resetPolicy.configured !== true && hasProviderOwnedSession(entry)) {
+    return true;
+  }
+  return evaluateSessionFreshness({
+    updatedAt: entry.updatedAt,
+    ...resolveSessionLifecycleTimestamps({
+      entry,
+      storePath: params.storePath,
+      agentId: params.sessionAgentId,
+    }),
+    now: params.nowMs,
+    policy: resetPolicy,
+  }).fresh;
 }
 
 type ChatSendExplicitOrigin = {
@@ -2063,12 +2289,13 @@ function collectSessionAbortPartials(params: {
     if (!params.runIds.has(runId)) {
       continue;
     }
-    const text = params.chatRunBuffers.get(runId);
+    const clientRunId = resolveActiveRunIdentity(runId, active).publicRunId;
+    const text = params.chatRunBuffers.get(clientRunId);
     if (!text || !text.trim()) {
       continue;
     }
     out.push({
-      runId,
+      runId: clientRunId,
       sessionId: active.sessionId,
       agentId: active.agentId,
       text,
@@ -2220,6 +2447,209 @@ function canRequesterAbortChatRunWithoutSessionMatch(
   );
 }
 
+function canRequesterAbortMainRunRecovery(
+  recovery: MainRunRecovery,
+  requester: ChatAbortRequester,
+): boolean {
+  if (requester.isAdmin) {
+    return true;
+  }
+  return Boolean(
+    recovery.ownerPrincipal?.kind === "device" &&
+    requester.deviceId &&
+    recovery.ownerPrincipal.deviceId === requester.deviceId,
+  );
+}
+
+function mainRunRecoveryCas(recovery: MainRunRecovery): MainRunRecoveryCas | undefined {
+  return recovery.state === "terminal"
+    ? undefined
+    : {
+        publicRunId: recovery.publicRunId,
+        agentId: recovery.agentId,
+        sessionKey: recovery.sessionKey,
+        sessionKeyAliases: recovery.sessionKeyAliases,
+        sessionId: recovery.sessionId,
+        storePath: recovery.storePath,
+        expectedRevision: recovery.revision,
+        expectedState: recovery.state,
+      };
+}
+
+function requestMainRunRecoveryCancellationCas(
+  recovery: MainRunRecovery,
+  kind: "abort" | "reset" | "delete",
+): MainRunRecovery {
+  let current = recovery;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (
+      current.state === "terminal" ||
+      current.state === "cancelling" ||
+      current.terminalEvidence
+    ) {
+      return current;
+    }
+    const cas = mainRunRecoveryCas(current);
+    if (!cas) {
+      return current;
+    }
+    const requestedAtMs = Date.now();
+    const cancelling = requestMainRunRecoveryCancellation({
+      ...cas,
+      cancellation: {
+        kind,
+        epoch: randomUUID(),
+        requestedAtMs,
+      },
+      nowMs: requestedAtMs,
+    });
+    if (cancelling) {
+      return cancelling;
+    }
+    const latest = getMainRunRecovery(current.publicRunId);
+    if (!latest) {
+      throw new Error(`main-run recovery ${current.publicRunId} disappeared during cancellation`);
+    }
+    if (latest.revision === current.revision) {
+      throw new Error(`main-run recovery ${current.publicRunId} rejected cancellation`);
+    }
+    current = latest;
+  }
+  throw new Error(`main-run recovery ${current.publicRunId} kept changing during cancellation`);
+}
+
+function sameMainRunRecoveryTarget(
+  recovery: MainRunRecovery,
+  params: {
+    agentId: string;
+    allowNewSessionLifecycle?: boolean;
+    sessionId?: string;
+    sessionKey?: string;
+    storePath: string;
+  },
+): boolean {
+  const sameSessionKey =
+    !params.sessionKey ||
+    recovery.sessionKey === params.sessionKey ||
+    recovery.sessionKeyAliases.includes(params.sessionKey);
+  return (
+    recovery.agentId === params.agentId &&
+    sameSessionKey &&
+    resolveCanonicalSessionStorePath(recovery.storePath) ===
+      resolveCanonicalSessionStorePath(params.storePath) &&
+    (params.allowNewSessionLifecycle ||
+      params.sessionId === undefined ||
+      recovery.sessionId === params.sessionId)
+  );
+}
+
+function beginAuthorizedMainRunRecoveryCancellation(params: {
+  requester: ChatAbortRequester;
+  agentId: string;
+  runId?: string;
+  sessionKey: string;
+  sessionId?: string;
+  storePath: string;
+}): {
+  recovery?: MainRunRecovery;
+  targetMismatch: boolean;
+  unauthorized: boolean;
+} {
+  const recovery = params.runId
+    ? getMainRunRecovery(params.runId)
+    : params.sessionId
+      ? findActiveMainRunRecoveryBySession({
+          agentId: params.agentId,
+          sessionKey: params.sessionKey,
+          storePath: params.storePath,
+          sessionId: params.sessionId,
+        })
+      : undefined;
+  if (!recovery || recovery.state === "terminal") {
+    return { targetMismatch: false, unauthorized: false };
+  }
+  if (!sameMainRunRecoveryTarget(recovery, params)) {
+    return { targetMismatch: true, unauthorized: false };
+  }
+  if (!canRequesterAbortMainRunRecovery(recovery, params.requester)) {
+    return { targetMismatch: false, unauthorized: true };
+  }
+  return {
+    recovery: requestMainRunRecoveryCancellationCas(recovery, "abort"),
+    targetMismatch: false,
+    unauthorized: false,
+  };
+}
+
+function resolveTrackedChatAbortRun(
+  context: Pick<GatewayRequestContext, "chatAbortControllers">,
+  requestedRunId: string,
+): { entry: ChatAbortControllerEntry; runId: string } | undefined {
+  const resolved = resolveActiveRunByIdentity(context.chatAbortControllers, requestedRunId);
+  return resolved ? { entry: resolved.entry, runId: resolved.identity.executionRunId } : undefined;
+}
+
+function projectMainRunRecoveryCancellationRunIds(params: {
+  publicRunId: string;
+  runIds: string[];
+}): string[] {
+  return uniqueStrings([...params.runIds, params.publicRunId]);
+}
+
+function terminalizeMainRunRecoveryIfInactive(params: {
+  recovery?: MainRunRecovery;
+  context: GatewayRequestContext;
+}): MainRunRecovery | undefined {
+  if (!params.recovery || params.recovery.state === "terminal") {
+    return params.recovery;
+  }
+  const tracked = resolveTrackedChatAbortRun(params.context, params.recovery.publicRunId);
+  const observedAtMs = tracked?.entry.projectSessionTerminalObservedAt;
+  if (
+    tracked &&
+    (observedAtMs === undefined ||
+      observedAtMs <= (params.recovery.cancellation?.requestedAtMs ?? Number.POSITIVE_INFINITY))
+  ) {
+    return params.recovery;
+  }
+  if (params.recovery.state === "cancelling" && params.recovery.cancellation) {
+    const endedAtMs = observedAtMs ?? Date.now();
+    const terminal = settleMainRunRecoveryCancellation(
+      createMainRunRecoveryCancellationSettlementToken(params.recovery),
+      {
+        endedAtMs,
+        nowMs: Math.max(Date.now(), endedAtMs),
+      },
+    );
+    if (terminal) {
+      return terminal;
+    }
+    const latest = getMainRunRecovery(params.recovery.publicRunId);
+    if (latest?.state === "terminal") {
+      return latest;
+    }
+    throw new Error(`main-run recovery ${params.recovery.publicRunId} cancellation did not settle`);
+  }
+  const current = getMainRunRecovery(params.recovery.publicRunId);
+  if (!current?.execution || !current.terminalEvidence) {
+    return current;
+  }
+  const terminal = settleMainRunRecoveryExecution(
+    createMainRunRecoveryExecutionSettlementToken(current),
+    {
+      nowMs: Math.max(Date.now(), current.terminalEvidence.outcome.endedAtMs),
+    },
+  );
+  if (!terminal) {
+    const latest = getMainRunRecovery(current.publicRunId);
+    if (latest?.state === "terminal") {
+      return latest;
+    }
+    throw new Error(`main-run recovery ${current.publicRunId} changed during terminalization`);
+  }
+  return terminal;
+}
+
 function readPreRegisteredAgentDedupePayloadForSession(params: {
   entry: GatewayRequestContext["dedupe"] extends Map<string, infer T> ? T | undefined : never;
   runId: string;
@@ -2339,6 +2769,48 @@ function resolveStoredGlobalRunAgentId(
   defaultAgentId: string,
 ): string {
   return normalizeOptionalText(agentId)?.toLowerCase() ?? defaultAgentId.toLowerCase();
+}
+
+function hasPreexistingRestartUnsafeSessionWork(params: {
+  agentId?: string;
+  context: GatewayRequestContext;
+  defaultAgentId: string;
+  sessionId: string;
+  sessionKey: string;
+  storeKey: string;
+}): boolean {
+  if (listActiveEmbeddedRunSessionIds().includes(params.sessionId)) {
+    return true;
+  }
+  if (replyRunRegistry.isActive(params.sessionKey) || replyRunRegistry.isActive(params.storeKey)) {
+    return true;
+  }
+  const selectedAgentId = resolveStoredGlobalRunAgentId(params.agentId, params.defaultAgentId);
+  for (const active of params.context.chatAbortControllers.values()) {
+    const sameSession =
+      active.sessionKey === params.sessionKey || active.sessionId === params.sessionId;
+    if (!sameSession) {
+      continue;
+    }
+    if (
+      params.sessionKey !== "global" ||
+      resolveStoredGlobalRunAgentId(active.agentId, params.defaultAgentId) === selectedAgentId
+    ) {
+      return true;
+    }
+  }
+  for (const queued of params.context.chatQueuedTurns?.values() ?? []) {
+    if (queued.sessionKey !== params.sessionKey && queued.sessionId !== params.sessionId) {
+      continue;
+    }
+    if (
+      params.sessionKey !== "global" ||
+      resolveStoredGlobalRunAgentId(queued.agentId, params.defaultAgentId) === selectedAgentId
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function writePreRegisteredAgentAbort(params: {
@@ -2480,7 +2952,7 @@ function resolveAuthorizedRunsForSessionKeys(params: {
     ),
   );
   const agentId = normalizeOptionalText(params.agentId)?.toLowerCase();
-  const authorizedRuns: Array<{ runId: string; sessionKey: string }> = [];
+  const authorizedRuns: Array<{ identity: ActiveRunIdentity; sessionKey: string }> = [];
   let matchedSessionRuns = 0;
   for (const [runId, active] of params.chatAbortControllers) {
     if (active.controlUiVisible === false) {
@@ -2501,7 +2973,10 @@ function resolveAuthorizedRunsForSessionKeys(params: {
     }
     matchedSessionRuns += 1;
     if (canRequesterAbortChatRun(active, params.requester)) {
-      authorizedRuns.push({ runId, sessionKey: active.sessionKey });
+      authorizedRuns.push({
+        identity: resolveActiveRunIdentity(runId, active),
+        sessionKey: active.sessionKey,
+      });
     }
   }
   return {
@@ -2598,6 +3073,7 @@ async function abortChatRunsForSessionKeyWithPartials(params: {
   stopReason?: string;
   requester: ChatAbortRequester;
   preserveSideRuns?: boolean;
+  onRunAbortResult?: (result: { runId: string; aborted: boolean }) => void;
 }): Promise<{ aborted: boolean; runIds: string[]; unauthorized: boolean }> {
   const sessionKeys = [params.sessionKey, ...(params.sessionKeyAliases ?? [])];
   // Queued-turn cancel MUST run before active abort so followup drain cannot
@@ -2658,7 +3134,7 @@ async function abortChatRunsForSessionKeyWithPartials(params: {
         queuedAbort.unauthorizedOnly,
     };
   }
-  const authorizedRunIdSet = new Set(authorizedRuns.map((run) => run.runId));
+  const authorizedRunIdSet = new Set(authorizedRuns.map((run) => run.identity.executionRunId));
   const snapshots = collectSessionAbortPartials({
     chatAbortControllers: params.context.chatAbortControllers,
     chatRunBuffers: params.context.chatRunBuffers,
@@ -2667,14 +3143,15 @@ async function abortChatRunsForSessionKeyWithPartials(params: {
   });
   // Queued cancellations already applied above; keep them first in the response.
   const runIds: string[] = [...queuedAbort.runIds];
-  for (const { runId, sessionKey } of authorizedRuns) {
+  for (const { identity, sessionKey } of authorizedRuns) {
     const res = abortChatRunById(params.ops, {
-      runId,
+      runId: identity.executionRunId,
       sessionKey,
       stopReason: params.stopReason,
     });
+    params.onRunAbortResult?.({ runId: identity.executionRunId, aborted: res.aborted });
     if (res.aborted) {
-      runIds.push(runId);
+      runIds.push(identity.publicRunId);
     }
   }
   const endedAt = Date.now();
@@ -3535,13 +4012,50 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
     const canonicalAbortSessionKey =
       abortAgentId && abortSessionResolvesGlobal ? "global" : rawSessionKey;
+    const abortRecoveryAgentId = resolveSessionAgentId({
+      sessionKey: canonicalAbortSessionKey,
+      config: abortCfg,
+      agentId: abortAgentId,
+    });
 
     const ops = createChatAbortOps(context);
     const requester = resolveChatAbortRequester(client);
 
     if (!runId) {
       const sessionLoadOptions = abortAgentId ? { agentId: abortAgentId } : undefined;
-      const { entry } = loadSessionEntry(rawSessionKey, sessionLoadOptions);
+      const { entry, storePath } = loadSessionEntry(rawSessionKey, sessionLoadOptions);
+      let durableCancellation:
+        | ReturnType<typeof beginAuthorizedMainRunRecoveryCancellation>
+        | undefined;
+      try {
+        durableCancellation = beginAuthorizedMainRunRecoveryCancellation({
+          requester,
+          agentId: abortRecoveryAgentId,
+          sessionKey: canonicalAbortSessionKey,
+          storePath,
+          sessionId: entry?.sessionId,
+        });
+      } catch (err) {
+        context.logGateway.warn(`failed to cancel durable chat admission: ${formatForLog(err)}`);
+        respond(
+          false,
+          undefined,
+          retryableDurableChatError("durable chat cancellation failed; retry shortly"),
+        );
+        return;
+      }
+      if (durableCancellation.unauthorized) {
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
+        return;
+      }
+      if (durableCancellation.targetMismatch) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "durable run does not match sessionKey"),
+        );
+        return;
+      }
       const res = await abortChatRunsForSessionKeyWithPartials({
         context,
         ops,
@@ -3555,17 +4069,93 @@ export const chatHandlers: GatewayRequestHandlers = {
         requester,
         preserveSideRuns,
       });
-      if (res.unauthorized) {
+      try {
+        durableCancellation.recovery = terminalizeMainRunRecoveryIfInactive({
+          recovery: durableCancellation.recovery,
+          context,
+        });
+      } catch (err) {
+        context.logGateway.warn(`failed to settle main-run cancellation: ${formatForLog(err)}`);
+        respond(
+          false,
+          undefined,
+          retryableDurableChatError("durable chat cancellation failed; retry shortly"),
+        );
+        return;
+      }
+      if (res.unauthorized && !durableCancellation.recovery) {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
         return;
       }
-      respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
+      const runIds = durableCancellation.recovery
+        ? projectMainRunRecoveryCancellationRunIds({
+            publicRunId: durableCancellation.recovery.publicRunId,
+            runIds: res.runIds,
+          })
+        : res.runIds;
+      respond(true, { ok: true, aborted: res.aborted || runIds.length > 0, runIds });
       return;
     }
     const normalizedAgentIdOverride = abortAgentId?.toLowerCase();
 
-    const active = context.chatAbortControllers.get(runId);
-    if (!active) {
+    const trackedRun = resolveTrackedChatAbortRun(context, runId);
+    if (!trackedRun) {
+      const sessionLoadOptions = abortAgentId ? { agentId: abortAgentId } : undefined;
+      const { entry: durableEntry, storePath: durableStorePath } = loadSessionEntry(
+        rawSessionKey,
+        sessionLoadOptions,
+      );
+      let durableCancellation:
+        | ReturnType<typeof beginAuthorizedMainRunRecoveryCancellation>
+        | undefined;
+      try {
+        durableCancellation = beginAuthorizedMainRunRecoveryCancellation({
+          requester,
+          agentId: abortRecoveryAgentId,
+          runId,
+          sessionKey: canonicalAbortSessionKey,
+          storePath: durableStorePath,
+          sessionId: durableEntry?.sessionId,
+        });
+      } catch (err) {
+        context.logGateway.warn(`failed to cancel durable chat admission: ${formatForLog(err)}`);
+        respond(
+          false,
+          undefined,
+          retryableDurableChatError("durable chat cancellation failed; retry shortly"),
+        );
+        return;
+      }
+      if (durableCancellation.unauthorized) {
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
+        return;
+      }
+      if (durableCancellation.targetMismatch) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "runId does not match sessionKey"),
+        );
+        return;
+      }
+      if (durableCancellation.recovery) {
+        try {
+          terminalizeMainRunRecoveryIfInactive({
+            recovery: durableCancellation.recovery,
+            context,
+          });
+        } catch (err) {
+          context.logGateway.warn(`failed to settle main-run cancellation: ${formatForLog(err)}`);
+          respond(
+            false,
+            undefined,
+            retryableDurableChatError("durable chat cancellation failed; retry shortly"),
+          );
+          return;
+        }
+        respond(true, { ok: true, aborted: true, runIds: [runId] });
+        return;
+      }
       const readPendingRunForAbort = (
         entry: GatewayRequestContext["dedupe"] extends Map<string, infer T> ? T | undefined : never,
       ) => {
@@ -3688,6 +4278,7 @@ export const chatHandlers: GatewayRequestHandlers = {
       respond(true, { ok: true, aborted: false, runIds: [] });
       return;
     }
+    const { entry: active, runId: activeRunId } = trackedRun;
     const abortSessionKeysForRun = new Set([rawSessionKey, canonicalAbortSessionKey]);
     if (
       !abortSessionKeysForRun.has(active.sessionKey) &&
@@ -3717,9 +4308,46 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
 
-    const partialText = context.chatRunBuffers.get(runId);
+    const activeSessionLoadOptions = abortAgentId ? { agentId: abortAgentId } : undefined;
+    const activeSessionTarget = loadSessionEntry(rawSessionKey, activeSessionLoadOptions);
+    let durableCancellation:
+      | ReturnType<typeof beginAuthorizedMainRunRecoveryCancellation>
+      | undefined;
+    try {
+      durableCancellation = beginAuthorizedMainRunRecoveryCancellation({
+        requester,
+        agentId: abortRecoveryAgentId,
+        runId,
+        sessionKey: canonicalAbortSessionKey,
+        storePath: activeSessionTarget.storePath,
+        sessionId: active.sessionId,
+      });
+    } catch (err) {
+      context.logGateway.warn(`failed to cancel durable chat admission: ${formatForLog(err)}`);
+      respond(
+        false,
+        undefined,
+        retryableDurableChatError("durable chat cancellation failed; retry shortly"),
+      );
+      return;
+    }
+    if (durableCancellation.unauthorized) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
+      return;
+    }
+    if (durableCancellation.targetMismatch) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "runId does not match sessionKey"),
+      );
+      return;
+    }
+
+    const activeClientRunId = resolveActiveRunIdentity(activeRunId, active).publicRunId;
+    const partialText = context.chatRunBuffers.get(activeClientRunId);
     const res = abortChatRunById(ops, {
-      runId,
+      runId: activeRunId,
       sessionKey: active.sessionKey,
       stopReason: "rpc",
     });
@@ -3729,7 +4357,7 @@ export const chatHandlers: GatewayRequestHandlers = {
         sessionKey: active.sessionKey,
         snapshots: [
           {
-            runId,
+            runId: activeClientRunId,
             sessionId: active.sessionId,
             agentId: active.agentId,
             text: partialText,
@@ -3738,11 +4366,29 @@ export const chatHandlers: GatewayRequestHandlers = {
         ],
       });
     }
-    respond(true, {
-      ok: true,
-      aborted: res.aborted,
-      runIds: res.aborted ? [runId] : [],
-    });
+    try {
+      terminalizeMainRunRecoveryIfInactive({
+        recovery: durableCancellation.recovery,
+        context,
+      });
+    } catch (err) {
+      context.logGateway.warn(`failed to settle main-run cancellation: ${formatForLog(err)}`);
+      respond(
+        false,
+        undefined,
+        retryableDurableChatError("durable chat cancellation failed; retry shortly"),
+      );
+      return;
+    }
+    const runIds = durableCancellation.recovery
+      ? projectMainRunRecoveryCancellationRunIds({
+          publicRunId: durableCancellation.recovery.publicRunId,
+          runIds: res.aborted ? [activeClientRunId] : [],
+        })
+      : res.aborted
+        ? [activeClientRunId]
+        : [];
+    respond(true, { ok: true, aborted: res.aborted || runIds.length > 0, runIds });
   },
   "chat.send": async ({ params, respond, context, client }) => {
     const chatSendReceivedAtMs = performance.now();
@@ -3944,6 +4590,72 @@ export const chatHandlers: GatewayRequestHandlers = {
       overrideMs: p.timeoutMs,
     });
     const now = Date.now();
+    const exactTurnRequestShape: ExactTurnRecoveryRequestShape = {
+      clientInfo,
+      explicitOrigin: explicitOriginResult.value,
+      hasAttachments: normalizedAttachments.length > 0,
+      hasReconnectResume: controlUiReconnectResume.resumeRequested,
+      hasSemanticOverrides:
+        p.deliver === true ||
+        p.thinking !== undefined ||
+        p.fastMode !== undefined ||
+        p.fastAutoOnSeconds !== undefined ||
+        p.timeoutMs !== undefined ||
+        systemInputProvenance !== undefined ||
+        systemProvenanceReceipt !== undefined ||
+        suppressCommandInterpretation,
+      rawMessage,
+      turnKind,
+    };
+    const exactTurnRecoveryCandidate = isExactTurnRecoveryCandidate({
+      cfg,
+      entry,
+      nowMs: now,
+      requestShape: exactTurnRequestShape,
+      requestedSessionId,
+      sessionAgentId: agentId,
+      sessionKey,
+      storePath,
+    });
+    const senderIsOwner = hasGatewayAdminScope(client);
+    const baseUserTurnInput: UserTurnInput = {
+      text: rawMessage,
+      timestamp: now,
+      idempotencyKey: `${clientRunId}:user`,
+      ...(senderIsOwner ? { senderIsOwner: true } : {}),
+      ...(systemInputProvenance ? { provenance: systemInputProvenance } : {}),
+    };
+    const exactTurnEnvelope = {
+      kind: "exact_turn" as const,
+      approvedTurn: buildPersistedUserTurnMessage(baseUserTurnInput),
+    };
+    const exactTurnOwnerDeviceId = normalizeOptionalText(client?.connect?.device?.id);
+    const exactTurnOwnerPrincipal = exactTurnOwnerDeviceId
+      ? ({ kind: "device", deviceId: exactTurnOwnerDeviceId } as const)
+      : undefined;
+    const exactTurnAuthorization = { senderIsOwner };
+    const exactTurnSourceKey = `${clientRunId}:user`;
+    const exactTurnInitialIdentity: MainRunRecoveryIdentity | undefined =
+      exactTurnRecoveryCandidate && entry?.sessionId
+        ? {
+            agentId,
+            sessionKey: legacyKey ?? sessionKey,
+            sessionKeyAliases: uniqueStrings([sessionKey, rawSessionKey]).filter(
+              (alias) => alias !== (legacyKey ?? sessionKey),
+            ),
+            sessionId: entry.sessionId,
+            storePath,
+          }
+        : undefined;
+    const exactTurnSourceFingerprint = exactTurnInitialIdentity
+      ? fingerprintMainRunRecoverySource({
+          sourceKey: exactTurnSourceKey,
+          identity: exactTurnInitialIdentity,
+          envelope: exactTurnEnvelope,
+          ownerPrincipal: exactTurnOwnerPrincipal,
+          authorization: exactTurnAuthorization,
+        })
+      : undefined;
 
     const sendPolicy = resolveSendPolicy({
       cfg,
@@ -3969,6 +4681,30 @@ export const chatHandlers: GatewayRequestHandlers = {
       const defaultAgentId = resolveDefaultAgentId(cfg);
       const stopAgentId =
         sessionKey === "global" ? (selectedAgent.agentId ?? defaultAgentId) : selectedAgent.agentId;
+      let durableCancellation:
+        | ReturnType<typeof beginAuthorizedMainRunRecoveryCancellation>
+        | undefined;
+      try {
+        durableCancellation = beginAuthorizedMainRunRecoveryCancellation({
+          requester: resolveChatAbortRequester(client),
+          agentId,
+          sessionKey,
+          storePath,
+          sessionId: entry?.sessionId,
+        });
+      } catch (err) {
+        context.logGateway.warn(`failed to cancel durable chat admission: ${formatForLog(err)}`);
+        respond(
+          false,
+          undefined,
+          retryableDurableChatError("durable chat cancellation failed; retry shortly"),
+        );
+        return;
+      }
+      if (durableCancellation.unauthorized) {
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
+        return;
+      }
       const res = await abortChatRunsForSessionKeyWithPartials({
         context,
         ops: createChatAbortOps(context),
@@ -3982,11 +4718,104 @@ export const chatHandlers: GatewayRequestHandlers = {
         stopReason: "stop",
         requester: resolveChatAbortRequester(client),
       });
-      if (res.unauthorized) {
+      try {
+        durableCancellation.recovery = terminalizeMainRunRecoveryIfInactive({
+          recovery: durableCancellation.recovery,
+          context,
+        });
+      } catch (err) {
+        context.logGateway.warn(`failed to settle main-run cancellation: ${formatForLog(err)}`);
+        respond(
+          false,
+          undefined,
+          retryableDurableChatError("durable chat cancellation failed; retry shortly"),
+        );
+        return;
+      }
+      if (res.unauthorized && !durableCancellation.recovery) {
         respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"));
         return;
       }
-      respond(true, { ok: true, aborted: res.aborted, runIds: res.runIds });
+      const runIds = durableCancellation.recovery
+        ? projectMainRunRecoveryCancellationRunIds({
+            publicRunId: durableCancellation.recovery.publicRunId,
+            runIds: res.runIds,
+          })
+        : res.runIds;
+      respond(true, { ok: true, aborted: res.aborted || runIds.length > 0, runIds });
+      return;
+    }
+
+    // SQLite is the idempotency owner for restart-safe Control UI turns. Keep
+    // terminal rows as tombstones so the same public id replays its final result.
+    let durableExisting: MainRunRecovery | undefined;
+    if (isOperatorUiClient(clientInfo)) {
+      try {
+        durableExisting = getMainRunRecovery(clientRunId);
+      } catch (err) {
+        context.logGateway.warn(
+          `failed to read durable chat admission ${clientRunId}: ${formatForLog(err)}`,
+        );
+        respond(
+          false,
+          undefined,
+          retryableDurableChatError("durable chat admission is unavailable; retry shortly"),
+        );
+        return;
+      }
+    }
+    if (durableExisting) {
+      if (
+        durableExisting.kind !== "exact_turn" ||
+        !sameMainRunRecoveryTarget(durableExisting, {
+          agentId,
+          allowNewSessionLifecycle: durableExisting.state === "terminal",
+          sessionKey: legacyKey ?? sessionKey,
+          storePath,
+          sessionId: entry?.sessionId,
+        })
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "idempotencyKey is bound to another session"),
+        );
+        return;
+      }
+      const currentSourceFingerprint = fingerprintMainRunRecoverySource({
+        sourceKey: exactTurnSourceKey,
+        identity: durableExisting,
+        envelope: exactTurnEnvelope,
+        ownerPrincipal: exactTurnOwnerPrincipal,
+        authorization: exactTurnAuthorization,
+      });
+      if (
+        !isExactTurnRecoveryRequestShape(exactTurnRequestShape) ||
+        durableExisting.sourceKey !== exactTurnSourceKey ||
+        durableExisting.sourceFingerprint !== currentSourceFingerprint
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "idempotencyKey is bound to another request"),
+        );
+        return;
+      }
+      const terminalReplay =
+        durableExisting.state === "terminal"
+          ? buildTerminalChatSendReplay(durableExisting)
+          : undefined;
+      if (terminalReplay) {
+        respond(terminalReplay.ok, terminalReplay.payload, terminalReplay.error, {
+          cached: true,
+          runId: clientRunId,
+        });
+        return;
+      }
+      respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
+        cached: true,
+        runId: clientRunId,
+      });
       return;
     }
 
@@ -4027,6 +4856,20 @@ export const chatHandlers: GatewayRequestHandlers = {
       keyPrefix: PENDING_CHAT_SEND_DEDUPE_PREFIX,
     });
     if (pendingChatSend) {
+      const pendingSourceFingerprint = normalizeUnknownText(
+        pendingChatSend.payload.sourceFingerprint,
+      );
+      if (
+        pendingSourceFingerprint &&
+        (!exactTurnSourceFingerprint || pendingSourceFingerprint !== exactTurnSourceFingerprint)
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "idempotencyKey is bound to another request"),
+        );
+        return;
+      }
       respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
         cached: true,
         runId: clientRunId,
@@ -4047,6 +4890,57 @@ export const chatHandlers: GatewayRequestHandlers = {
         cached: true,
         runId: clientRunId,
       });
+      return;
+    }
+    const legacyRecoveryBlocker = context.legacyMainRunRecoveryAdmissionGate
+      ? findLegacyMainRunRecoveryAdmissionBlocker(context.legacyMainRunRecoveryAdmissionGate, {
+          storePath,
+          sessionId: backingSessionId,
+          sessionKey,
+          entry,
+        })
+      : undefined;
+    if (legacyRecoveryBlocker) {
+      respond(
+        false,
+        undefined,
+        retryableDurableChatError(
+          `legacy restart recovery must be migrated before this session can run; ${legacyRecoveryBlocker.doctorHint}`,
+          {
+            reason: legacyRecoveryBlocker.reason,
+            doctorHint: legacyRecoveryBlocker.doctorHint,
+          },
+        ),
+      );
+      return;
+    }
+    let durableBlocking: MainRunRecovery | undefined;
+    try {
+      durableBlocking = entry?.sessionId
+        ? findActiveMainRunRecoveryBySession({
+            agentId,
+            sessionKey: legacyKey ?? sessionKey,
+            storePath,
+            sessionId: entry.sessionId,
+          })
+        : undefined;
+    } catch (err) {
+      context.logGateway.warn(
+        `failed to read durable main-run recovery ${clientRunId}: ${formatForLog(err)}`,
+      );
+      respond(
+        false,
+        undefined,
+        retryableDurableChatError("durable chat admission is unavailable; retry shortly"),
+      );
+      return;
+    }
+    if (durableBlocking) {
+      respond(
+        false,
+        undefined,
+        retryableDurableChatError("session restart recovery is still pending; retry shortly"),
+      );
       return;
     }
     // Cached/in-flight retries are already bound to their original target and
@@ -4098,6 +4992,7 @@ export const chatHandlers: GatewayRequestHandlers = {
           : {}),
         ownerConnId: normalizeOptionalText(client?.connId),
         ownerDeviceId: normalizeOptionalText(client?.connect?.device?.id),
+        ...(exactTurnSourceFingerprint ? { sourceFingerprint: exactTurnSourceFingerprint } : {}),
         expiresAtMs: pendingExpiresAtMs,
         turnKind,
       },
@@ -4118,9 +5013,145 @@ export const chatHandlers: GatewayRequestHandlers = {
     let admittedSessionId = backingSessionId ?? clientRunId;
     let gatewayWorkAdmission: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
     let admittedRunAbort: ReturnType<typeof registerChatAbortController> | undefined;
+    let exactTurnRecovery: ExactTurnMainRunRecovery | undefined;
+    const exactTurnLeaseOwner = `${lifecycleGeneration}:${randomUUID()}`;
+    let exactTurnReservationResult: ReturnType<typeof reserveMainRunRecovery> | undefined;
+    let exactTurnReservationError: unknown;
+    const readExactTurnRecovery = (): ExactTurnMainRunRecovery | undefined => {
+      const recovery = getMainRunRecovery(clientRunId);
+      return recovery?.kind === "exact_turn" ? recovery : undefined;
+    };
+    const refreshExactTurnRecoveryLease = (
+      current: ExactTurnMainRunRecovery,
+    ): ExactTurnMainRunRecovery => {
+      const cas = mainRunRecoveryCas(current);
+      if (current.state !== "accepted" || !cas || current.lease?.owner !== exactTurnLeaseOwner) {
+        throw new Error("durable exact turn lost accepted lease ownership");
+      }
+      const nowMs = Date.now();
+      if (current.lease.expiresAtMs <= nowMs) {
+        throw new Error("durable exact turn accepted lease expired before transcript ownership");
+      }
+      const leased = renewMainRunRecoveryLease({
+        ...cas,
+        leaseOwner: exactTurnLeaseOwner,
+        nowMs,
+        leaseDurationMs: MAIN_RUN_RECOVERY_LEASE_MS,
+      });
+      if (!leased) {
+        throw new Error("durable exact turn lease was not refreshed");
+      }
+      exactTurnRecovery = leased as ExactTurnMainRunRecovery;
+      return exactTurnRecovery;
+    };
+    const releaseExactTurnRecovery = (release: {
+      error?: unknown;
+      retryAfterMs: number;
+    }): boolean => {
+      if (!exactTurnRecovery) {
+        return false;
+      }
+      try {
+        const current = readExactTurnRecovery();
+        if (!current || current.state === "terminal") {
+          exactTurnRecovery = current;
+          return false;
+        }
+        if (current.execution || current.terminalEvidence || current.state === "cancelling") {
+          exactTurnRecovery = current;
+          return false;
+        }
+        if (current.lease?.owner !== exactTurnLeaseOwner) {
+          exactTurnRecovery = current;
+          return true;
+        }
+        const cas = mainRunRecoveryCas(current);
+        if (!cas) {
+          return false;
+        }
+        const nowMs = Date.now();
+        const released = releaseMainRunRecoveryLease({
+          ...cas,
+          leaseOwner: exactTurnLeaseOwner,
+          nowMs,
+          nextAttemptAtMs: nowMs + Math.max(0, release.retryAfterMs),
+          lastError: release.error === undefined ? null : formatErrorMessage(release.error),
+        });
+        if (released) {
+          exactTurnRecovery = released as ExactTurnMainRunRecovery;
+          return true;
+        }
+        const latest = readExactTurnRecovery();
+        exactTurnRecovery = latest;
+        return Boolean(
+          latest &&
+          latest.state !== "terminal" &&
+          latest.state !== "cancelling" &&
+          !latest.execution &&
+          !latest.terminalEvidence,
+        );
+      } catch (releaseError) {
+        context.logGateway.warn(
+          `failed to release main-run recovery ${clientRunId} for retry: ${formatForLog(releaseError)}`,
+        );
+        return false;
+      }
+    };
+    const cleanupUnacknowledgedExactTurn = (error?: unknown): boolean => {
+      if (!exactTurnRecovery) {
+        return true;
+      }
+      try {
+        const current = readExactTurnRecovery();
+        if (!current) {
+          exactTurnRecovery = current;
+          releaseMainRunRecoveryBarrierByLedgerRunId(clientRunId);
+          return true;
+        }
+        exactTurnRecovery = current;
+        if (current.state === "transcript_owned") {
+          return releaseExactTurnRecovery({ error, retryAfterMs: 0 });
+        }
+        const cas = mainRunRecoveryCas(current);
+        if (current.state !== "accepted" || !cas || current.lease?.owner !== exactTurnLeaseOwner) {
+          return false;
+        }
+        const discarded = discardUnacknowledgedExactTurnStore({
+          ...cas,
+          expectedState: "accepted",
+          leaseOwner: exactTurnLeaseOwner,
+        });
+        if (!discarded) {
+          exactTurnRecovery = readExactTurnRecovery();
+          return false;
+        }
+        exactTurnRecovery = undefined;
+        releaseMainRunRecoveryBarrierByLedgerRunId(clientRunId);
+        return true;
+      } catch (err) {
+        context.logGateway.warn(
+          `failed to clean up unacknowledged main-run recovery ${clientRunId}: ${formatForLog(err)}`,
+        );
+        return false;
+      }
+    };
+    const respondExactTurnCleanupUnavailable = () => {
+      context.dedupe.delete(`chat:${clientRunId}`);
+      context.chatAbortedRuns.delete(clientRunId);
+      respond(
+        false,
+        undefined,
+        retryableDurableChatError(
+          "durable chat handoff is still in flight; retry with the same idempotency key",
+        ),
+      );
+    };
     let reservationSuperseded = false;
     let supersedingResult: DedupeEntry | undefined;
-    const assertChatWorkAdmissionAllowed = (commitOutcome: boolean) => {
+    const assertChatWorkAdmissionAllowed = (
+      commitOutcome: boolean,
+      hasConcurrentAdmissions = false,
+    ) => {
       if (context.chatAbortedRuns.has(clientRunId)) {
         return;
       }
@@ -4196,45 +5227,159 @@ export const chatHandlers: GatewayRequestHandlers = {
       if (archivedError) {
         throw new Error(archivedError);
       }
+      admittedSessionId = latestEntry?.sessionId ?? backingSessionId ?? clientRunId;
+      const physicalSessionKey = latestSession.legacyKey ?? latestSession.canonicalKey;
+      const recoveryIdentity: MainRunRecoveryIdentity = {
+        agentId,
+        sessionKey: physicalSessionKey,
+        sessionKeyAliases: uniqueStrings([sessionKey, rawSessionKey]).filter(
+          (alias) => alias !== physicalSessionKey,
+        ),
+        sessionId: admittedSessionId,
+        storePath: latestSession.storePath,
+      };
+      const activeRecovery = findActiveMainRunRecoveryBySession(recoveryIdentity);
+      if (
+        activeRecovery &&
+        (!exactTurnRecoveryCandidate || activeRecovery.publicRunId !== clientRunId)
+      ) {
+        throw new SessionWorkAdmissionBlockedError();
+      }
       if (!commitOutcome) {
         return;
       }
-      admittedSessionId = latestEntry?.sessionId ?? backingSessionId ?? clientRunId;
-      admittedRunAbort = registerChatAbortController({
-        chatAbortControllers: context.chatAbortControllers,
-        runId: clientRunId,
-        sessionId: admittedSessionId,
-        sessionKey,
-        agentId: selectedAgent.agentId,
-        timeoutMs,
-        now,
-        ownerConnId: normalizeOptionalText(client?.connId),
-        ownerDeviceId: normalizeOptionalText(client?.connect?.device?.id),
-        providerId: resolvedSessionModel.provider,
-        authProviderId: resolvedSessionAuthProvider,
-        isAbortable: (active) => isReplyRunAbortableForSignal(active.controller.signal),
-        kind: "chat-send",
-        turnKind,
-        lifecycleGeneration,
+      const latestExactTurnRecoveryCandidate = isExactTurnRecoveryCandidate({
+        cfg: latestSession.cfg,
+        entry: latestEntry,
+        nowMs: Date.now(),
+        requestShape: exactTurnRequestShape,
+        requestedSessionId,
+        sessionAgentId: agentId,
+        sessionKey: latestSession.canonicalKey,
+        storePath: latestSession.storePath,
       });
+      // Another admission may clear the writer before its caller registers a
+      // controller. Keep normal queue/steer behavior, but do not add a second durable owner.
+      if (
+        latestExactTurnRecoveryCandidate &&
+        !hasConcurrentAdmissions &&
+        !hasExactTurnUnsafeHooks() &&
+        !hasPreexistingRestartUnsafeSessionWork({
+          agentId: selectedAgent.agentId,
+          context,
+          defaultAgentId: resolveDefaultAgentId(latestSession.cfg),
+          sessionId: admittedSessionId,
+          sessionKey,
+          storeKey: latestSession.legacyKey ?? latestSession.canonicalKey,
+        })
+      ) {
+        try {
+          const acceptedAtMs = Date.now();
+          exactTurnReservationResult = reserveMainRunRecovery({
+            ...recoveryIdentity,
+            publicRunId: clientRunId,
+            sourceKey: exactTurnSourceKey,
+            sourceFingerprint: fingerprintMainRunRecoverySource({
+              sourceKey: exactTurnSourceKey,
+              identity: recoveryIdentity,
+              envelope: exactTurnEnvelope,
+              ownerPrincipal: exactTurnOwnerPrincipal,
+              authorization: exactTurnAuthorization,
+            }),
+            bootId: lifecycleGeneration,
+            lifecycleGeneration,
+            ownerPrincipal: exactTurnOwnerPrincipal,
+            authorization: exactTurnAuthorization,
+            envelope: exactTurnEnvelope,
+            initialLease: {
+              owner: exactTurnLeaseOwner,
+              expiresAtMs: acceptedAtMs + MAIN_RUN_RECOVERY_LEASE_MS,
+            },
+            acceptedAtMs,
+          });
+          if (exactTurnReservationResult.status !== "inserted") {
+            throw new SessionWorkAdmissionBlockedError();
+          }
+          exactTurnRecovery = exactTurnReservationResult.recovery as ExactTurnMainRunRecovery;
+        } catch (err) {
+          exactTurnReservationError = err;
+          throw err;
+        }
+      }
+      if (!exactTurnRecovery) {
+        admittedRunAbort = registerChatAbortController({
+          chatAbortControllers: context.chatAbortControllers,
+          runId: clientRunId,
+          sessionId: admittedSessionId,
+          sessionKey,
+          agentId: selectedAgent.agentId,
+          timeoutMs,
+          now,
+          ownerConnId: normalizeOptionalText(client?.connId),
+          ownerDeviceId: normalizeOptionalText(client?.connect?.device?.id),
+          providerId: resolvedSessionModel.provider,
+          authProviderId: resolvedSessionAuthProvider,
+          isAbortable: (active) => isReplyRunAbortableForSignal(active.controller.signal),
+          kind: "chat-send",
+          turnKind,
+          lifecycleGeneration,
+        });
+      }
     };
+    let chatSendAcknowledged = false;
     try {
       gatewayWorkAdmission = await beginSessionWorkAdmission({
         scope: storePath,
-        identities: [sessionKey, backingSessionId],
+        identities: [sessionKey, backingSessionId, clientRunId],
         assertAllowed: () => assertChatWorkAdmissionAllowed(false),
-        revalidateAllowed: () => assertChatWorkAdmissionAllowed(true),
+        revalidateAllowed: ({ hasConcurrentAdmissions }) =>
+          assertChatWorkAdmissionAllowed(true, hasConcurrentAdmissions),
         onInterrupt: () => {
-          if (admittedRunAbort?.entry) {
+          if (admittedRunAbort?.entry && !admittedRunAbort.controller.signal.aborted) {
             admittedRunAbort.entry.abortStopReason = "restart";
           }
           admittedRunAbort?.controller.abort(createAgentRunRestartAbortError());
         },
       });
     } catch (err) {
+      const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn(err);
       clearPendingChatSendReservation();
+      if (!recoveryCleanupConfirmed) {
+        respondExactTurnCleanupUnavailable();
+        return;
+      }
       if (err instanceof Error && err.message === SESSION_ROUTING_CHANGED_ERROR_REASON) {
         respondSessionRoutingChanged();
+        return;
+      }
+      if (
+        exactTurnReservationResult?.status === "duplicate" ||
+        exactTurnReservationResult?.status === "session_blocked" ||
+        err instanceof SessionWorkAdmissionBlockedError
+      ) {
+        if (exactTurnReservationResult?.status === "duplicate") {
+          respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
+            cached: true,
+            runId: clientRunId,
+          });
+        } else {
+          respond(
+            false,
+            undefined,
+            retryableDurableChatError("session restart recovery is still pending; retry shortly"),
+          );
+        }
+        return;
+      }
+      if (exactTurnReservationError !== undefined) {
+        context.logGateway.warn(
+          `failed to reserve durable main-run recovery ${clientRunId}: ${formatForLog(exactTurnReservationError)}`,
+        );
+        respond(
+          false,
+          undefined,
+          retryableDurableChatError("durable chat admission failed; retry shortly"),
+        );
         return;
       }
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
@@ -4243,7 +5388,12 @@ export const chatHandlers: GatewayRequestHandlers = {
     clearPendingChatSendReservation();
     const activeRunAbort = admittedRunAbort;
     if (reservationSuperseded) {
+      const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn();
       gatewayWorkAdmission.release();
+      if (!recoveryCleanupConfirmed) {
+        respondExactTurnCleanupUnavailable();
+        return;
+      }
       const supersedingCached = supersedingResult ?? context.dedupe.get(`chat:${clientRunId}`);
       if (supersedingCached) {
         respond(supersedingCached.ok, supersedingCached.payload, supersedingCached.error, {
@@ -4259,6 +5409,9 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
     if (lifecycleGeneration !== getAgentEventLifecycleGeneration()) {
+      // The success ACK has not crossed the socket; this request is not yet a
+      // restart-recovery obligation.
+      const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn();
       if (activeRunAbort) {
         if (activeRunAbort.entry) {
           activeRunAbort.entry.abortStopReason = "restart";
@@ -4267,6 +5420,10 @@ export const chatHandlers: GatewayRequestHandlers = {
         activeRunAbort.cleanup({ force: true });
       }
       gatewayWorkAdmission.release();
+      if (!recoveryCleanupConfirmed) {
+        respondExactTurnCleanupUnavailable();
+        return;
+      }
       if (!context.dedupe.has(`chat:${clientRunId}`)) {
         writePreRegisteredChatAbort({
           context,
@@ -4282,8 +5439,145 @@ export const chatHandlers: GatewayRequestHandlers = {
       });
       return;
     }
+    if (exactTurnRecovery) {
+      try {
+        if (sessionRoutingChanged(context.getRuntimeConfig())) {
+          throw new Error(SESSION_ROUTING_CHANGED_ERROR_REASON);
+        }
+        const latestSession = loadSessionEntry(rawSessionKey, sessionLoadOptions);
+        const latestEntry = latestSession.entry;
+        const current = readExactTurnRecovery();
+        const physicalSessionKey = latestSession.legacyKey ?? latestSession.canonicalKey;
+        if (
+          !isExactTurnRecoveryCandidate({
+            cfg: latestSession.cfg,
+            entry: latestEntry,
+            nowMs: Date.now(),
+            requestShape: exactTurnRequestShape,
+            requestedSessionId,
+            sessionAgentId: agentId,
+            sessionKey: latestSession.canonicalKey,
+            storePath: latestSession.storePath,
+          }) ||
+          !latestEntry ||
+          current?.state !== "accepted" ||
+          !current.envelope ||
+          current.envelope.kind !== "exact_turn" ||
+          current.agentId !== agentId ||
+          current.sessionId !== latestEntry.sessionId ||
+          current.sessionKey !== physicalSessionKey ||
+          resolveCanonicalSessionStorePath(current.storePath) !==
+            resolveCanonicalSessionStorePath(latestSession.storePath)
+        ) {
+          throw new Error("durable exact turn changed before transcript ownership");
+        }
+        const leased = refreshExactTurnRecoveryLease(current);
+        const persisted = await persistUserTurnTranscript({
+          agentId,
+          sessionId: latestEntry.sessionId,
+          expectedSessionId: latestEntry.sessionId,
+          sessionKey: physicalSessionKey,
+          sessionEntry: latestEntry,
+          sessionStore: latestSession.store,
+          storePath: latestSession.storePath,
+          message: current.envelope.approvedTurn,
+          updateMode: "inline",
+        });
+        if (!persisted) {
+          throw new Error("durable exact turn transcript persistence failed");
+        }
+        const leasedCas = mainRunRecoveryCas(leased);
+        if (!leasedCas) {
+          throw new Error("durable exact turn lost transcript lease ownership");
+        }
+        const nowMs = Date.now();
+        const transcriptOwned = transitionMainRunRecoveryStateCas({
+          ...leasedCas,
+          nextState: "transcript_owned",
+          currentBootId: lifecycleGeneration,
+          nextAttemptAtMs: nowMs,
+          nowMs,
+        });
+        if (!transcriptOwned) {
+          throw new Error("durable exact turn was not transferred to transcript ownership");
+        }
+        exactTurnRecovery = transcriptOwned as ExactTurnMainRunRecovery;
+        upsertMainRunRecoveryBarrier({
+          aliases: [transcriptOwned.sessionKey, ...transcriptOwned.sessionKeyAliases],
+          ledgerRunId: transcriptOwned.publicRunId,
+          sessionId: transcriptOwned.sessionId,
+          storePath: transcriptOwned.storePath,
+        });
+        const serverTiming = shouldIncludeChatSendAckServerTiming(clientInfo)
+          ? {
+              receivedToAckMs: roundedChatSendTimingMs(performance.now() - chatSendReceivedAtMs),
+              loadSessionMs: sessionLoadMs,
+            }
+          : undefined;
+        const ackPayload = {
+          runId: clientRunId,
+          status: "started" as const,
+          ...(serverTiming ? { serverTiming } : {}),
+        };
+        chatSendAcknowledged = true;
+        respond(true, ackPayload, undefined, { runId: clientRunId });
+        const releasedForWorker = releaseExactTurnRecovery({ retryAfterMs: 0 });
+        gatewayWorkAdmission.release();
+        wakeMainRunRecoveryWorker();
+        if (!releasedForWorker) {
+          context.logGateway.warn(
+            `durable exact turn ${clientRunId} remains admission-leased after ACK`,
+          );
+        }
+        return;
+      } catch (err) {
+        const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn(err);
+        const recovery = readExactTurnRecovery();
+        if (recovery && recovery.state !== "terminal") {
+          try {
+            upsertMainRunRecoveryBarrier({
+              aliases: [recovery.sessionKey, ...recovery.sessionKeyAliases],
+              ledgerRunId: recovery.publicRunId,
+              sessionId: recovery.sessionId,
+              storePath: recovery.storePath,
+            });
+          } catch (barrierError) {
+            context.logGateway.warn(
+              `failed to restore main-run recovery barrier ${clientRunId}: ${formatForLog(barrierError)}`,
+            );
+          }
+        }
+        gatewayWorkAdmission.release();
+        if (recovery && recovery.state !== "terminal") {
+          wakeMainRunRecoveryWorker();
+        }
+        if (!recoveryCleanupConfirmed) {
+          respondExactTurnCleanupUnavailable();
+          return;
+        }
+        if (err instanceof Error && err.message === SESSION_ROUTING_CHANGED_ERROR_REASON) {
+          respondSessionRoutingChanged();
+          return;
+        }
+        respond(
+          false,
+          undefined,
+          retryableDurableChatError(
+            recovery
+              ? "durable chat handoff is pending; retry with the same idempotency key"
+              : "durable chat handoff failed before acknowledgement; retry with the same idempotency key",
+          ),
+        );
+        return;
+      }
+    }
     if (!activeRunAbort) {
+      const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn();
       gatewayWorkAdmission.release();
+      if (!recoveryCleanupConfirmed) {
+        respondExactTurnCleanupUnavailable();
+        return;
+      }
       const aborted = context.dedupe.get(`chat:${clientRunId}`);
       if (aborted) {
         respond(aborted.ok, aborted.payload, aborted.error, {
@@ -4296,7 +5590,12 @@ export const chatHandlers: GatewayRequestHandlers = {
       return;
     }
     if (!activeRunAbort.registered) {
+      const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn();
       gatewayWorkAdmission.release();
+      if (!recoveryCleanupConfirmed) {
+        respondExactTurnCleanupUnavailable();
+        return;
+      }
       respond(true, { runId: clientRunId, status: "in_flight" as const }, undefined, {
         cached: true,
         runId: clientRunId,
@@ -4386,9 +5685,14 @@ export const chatHandlers: GatewayRequestHandlers = {
           performance.now() - prepareAttachmentsStartedAtMs,
         );
       } catch (err) {
+        const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn(err);
         cleanupAdmittedRun({ force: true });
         clearAgentRunContext(clientRunId, lifecycleGeneration);
         logAttachmentFailure(context.logGateway, "chat.send attachment parse/stage failed", err);
+        if (!recoveryCleanupConfirmed) {
+          respondExactTurnCleanupUnavailable();
+          return;
+        }
         respond(
           false,
           undefined,
@@ -4402,12 +5706,19 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
     if (activeRunAbort.controller.signal.aborted) {
       const stopReason = activeRunAbort.entry?.abortStopReason ?? "rpc";
+      const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn();
       const endedAt = Date.now();
       const payload = buildAbortedChatSendPayload({
         runId: clientRunId,
         stopReason,
         endedAt,
       });
+      cleanupAdmittedRun({ force: true });
+      clearAgentRunContext(clientRunId, lifecycleGeneration);
+      if (!recoveryCleanupConfirmed) {
+        respondExactTurnCleanupUnavailable();
+        return;
+      }
       setGatewayDedupeEntry({
         dedupe: context.dedupe,
         key: `chat:${clientRunId}`,
@@ -4417,8 +5728,6 @@ export const chatHandlers: GatewayRequestHandlers = {
           payload,
         },
       });
-      cleanupAdmittedRun({ force: true });
-      clearAgentRunContext(clientRunId, lifecycleGeneration);
       respond(true, payload, undefined, { runId: clientRunId });
       return;
     }
@@ -4426,11 +5735,66 @@ export const chatHandlers: GatewayRequestHandlers = {
     // Attachment preparation and admission can suspend. Recheck immediately
     // before ACK/dispatch so hot config reload cannot cross the send boundary.
     if (sessionRoutingChanged(context.getRuntimeConfig())) {
+      const recoveryCleanupConfirmed = cleanupUnacknowledgedExactTurn();
       cleanupAdmittedRun({ force: true });
       clearAgentRunContext(clientRunId, lifecycleGeneration);
+      if (!recoveryCleanupConfirmed) {
+        respondExactTurnCleanupUnavailable();
+        return;
+      }
       respondSessionRoutingChanged();
       return;
     }
+
+    const persistDispatchLifecycleError = async (dispatchError: {
+      endedAt: number;
+      error: string;
+      sessionId: string;
+      startedAt: number;
+    }): Promise<boolean> => {
+      if (activeRunAbort.entry) {
+        activeRunAbort.entry.projectSessionActive = false;
+      }
+      const hasActiveRun = hasTrackedActiveSessionRun({
+        context,
+        requestedKey: rawSessionKey,
+        canonicalKey: sessionKey,
+        ...(sessionKey === "global" && agentId ? { agentId } : {}),
+        defaultAgentId: resolveDefaultAgentId(cfg),
+      });
+      if (hasActiveRun) {
+        return false;
+      }
+      try {
+        await persistGatewaySessionLifecycleEvent({
+          sessionKey,
+          ...(sessionKey === "global" && agentId ? { agentId } : {}),
+          event: {
+            runId: clientRunId,
+            sessionId: dispatchError.sessionId,
+            lifecycleGeneration,
+            ts: dispatchError.endedAt,
+            data: {
+              phase: "error",
+              startedAt: dispatchError.startedAt,
+              endedAt: dispatchError.endedAt,
+              error: dispatchError.error,
+            },
+          },
+        });
+        emitSessionsChanged(context, {
+          sessionKey,
+          ...(agentId ? { agentId } : {}),
+          reason: "chat.dispatch-error",
+        });
+        return true;
+      } catch (persistErr: unknown) {
+        context.logGateway.warn(
+          `webchat dispatch-error lifecycle persist failed: ${formatForLog(persistErr)}`,
+        );
+        return false;
+      }
+    };
 
     try {
       const serverTiming = shouldIncludeChatSendAckServerTiming(clientInfo)
@@ -4448,6 +5812,10 @@ export const chatHandlers: GatewayRequestHandlers = {
               receivedAtMs: chatSendReceivedAtMs,
             }
           : undefined;
+      const currentExactTurnRecovery = readExactTurnRecovery();
+      if (currentExactTurnRecovery) {
+        refreshExactTurnRecoveryLease(currentExactTurnRecovery);
+      }
       context.addChatRun(clientRunId, {
         sessionKey,
         agentId: selectedAgent.agentId,
@@ -4472,6 +5840,7 @@ export const chatHandlers: GatewayRequestHandlers = {
         },
         { config: cfg },
       );
+      chatSendAcknowledged = true;
       respond(true, ackPayload, undefined, { runId: clientRunId });
       const chatSendAckedAtMs = chatSendTiming?.ackedAtMs ?? performance.now();
       const titleSource = stripInlineDirectiveTagsForDisplay(rawMessage).text;
@@ -4524,13 +5893,6 @@ export const chatHandlers: GatewayRequestHandlers = {
       const preparedUserTurnMediaPromise =
         normalizedAttachments.length > 0 ? getPersistedMediaForTranscript() : Promise.resolve([]);
       const userTurnMediaPromise = preparedUserTurnMediaPromise.then(buildChatSendUserTurnMedia);
-      const baseUserTurnInput: UserTurnInput = {
-        text: rawMessage,
-        timestamp: now,
-        idempotencyKey: `${clientRunId}:user`,
-        ...(hasGatewayAdminScope(client) ? { senderIsOwner: true } : {}),
-        ...(systemInputProvenance ? { provenance: systemInputProvenance } : {}),
-      };
       const userTurnInputPromise: Promise<UserTurnInput> = userTurnMediaPromise.then((media) => ({
         ...baseUserTurnInput,
         ...(media.length > 0
@@ -5922,53 +7284,14 @@ export const chatHandlers: GatewayRequestHandlers = {
           const releaseDispatchErrorRoot = dispatchError
             ? retainGatewayRootWorkAdmissionContinuation()
             : null;
-          cleanupAdmittedRun();
-          clearAgentRunContext(clientRunId, lifecycleGeneration);
-          context.removeChatRun(clientRunId, clientRunId, sessionKey);
           if (!dispatchError) {
+            cleanupAdmittedRun();
+            clearAgentRunContext(clientRunId, lifecycleGeneration);
+            context.removeChatRun(clientRunId, clientRunId, sessionKey);
             return;
           }
-          const persistDispatchLifecycleError = async () => {
-            const hasActiveRun = hasTrackedActiveSessionRun({
-              context,
-              requestedKey: rawSessionKey,
-              canonicalKey: sessionKey,
-              ...(sessionKey === "global" && agentId ? { agentId } : {}),
-              defaultAgentId: resolveDefaultAgentId(cfg),
-            });
-            if (hasActiveRun) {
-              return;
-            }
-            try {
-              await persistGatewaySessionLifecycleEvent({
-                sessionKey,
-                ...(sessionKey === "global" && agentId ? { agentId } : {}),
-                event: {
-                  runId: clientRunId,
-                  sessionId: dispatchError.sessionId,
-                  lifecycleGeneration,
-                  ts: dispatchError.endedAt,
-                  data: {
-                    phase: "error",
-                    startedAt: dispatchError.startedAt,
-                    endedAt: dispatchError.endedAt,
-                    error: dispatchError.error,
-                  },
-                },
-              });
-              emitSessionsChanged(context, {
-                sessionKey,
-                ...(agentId ? { agentId } : {}),
-                reason: "chat.dispatch-error",
-              });
-            } catch (persistErr: unknown) {
-              context.logGateway.warn(
-                `webchat session lifecycle persist failed after error: ${formatForLog(persistErr)}`,
-              );
-            }
-          };
           void (async () => {
-            await persistDispatchLifecycleError();
+            await persistDispatchLifecycleError(dispatchError);
             await persistDispatchErrorUserTurn?.().catch((transcriptErr: unknown) => {
               context.logGateway.warn(
                 `webchat user transcript update failed after error: ${formatForLog(transcriptErr)}`,
@@ -5980,9 +7303,26 @@ export const chatHandlers: GatewayRequestHandlers = {
                 `webchat session lifecycle continuation failed: ${formatForLog(continuationErr)}`,
               );
             })
-            .finally(() => releaseDispatchErrorRoot?.());
+            .finally(() => {
+              cleanupAdmittedRun();
+              clearAgentRunContext(clientRunId, lifecycleGeneration);
+              context.removeChatRun(clientRunId, clientRunId, sessionKey);
+              releaseDispatchErrorRoot?.();
+            });
         });
     } catch (err) {
+      if (chatSendAcknowledged) {
+        const restartInterrupted = activeRunAbort.entry?.abortStopReason === "restart";
+        if (!restartInterrupted) {
+          const endedAt = Date.now();
+          await persistDispatchLifecycleError({
+            endedAt,
+            error: String(err),
+            sessionId: activeRunAbort.entry?.sessionId ?? backingSessionId ?? clientRunId,
+            startedAt: activeRunAbort.entry?.startedAtMs ?? now,
+          });
+        }
+      }
       cleanupAdmittedRun({ force: true });
       clearAgentRunContext(clientRunId, lifecycleGeneration);
       context.removeChatRun(clientRunId, clientRunId, sessionKey);
@@ -6106,7 +7446,11 @@ export const chatHandlers: GatewayRequestHandlers = {
         admission.release();
       }
     } catch (err) {
-      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
+      const error =
+        err instanceof SessionWorkAdmissionBlockedError
+          ? retryableDurableChatError(formatForLog(err))
+          : errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err));
+      respond(false, undefined, error);
       return;
     }
     if (!appended.ok || !appended.messageId || !appended.message) {

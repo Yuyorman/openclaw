@@ -14,6 +14,7 @@ import {
   onInternalDiagnosticEvent,
   onDiagnosticEvent,
   onTrustedInternalDiagnosticEvent,
+  onTrustedToolExecutionEvent,
   resetDiagnosticEventsForTest,
   setDiagnosticsEnabledForProcess,
   waitForDiagnosticEventsDrained,
@@ -905,6 +906,36 @@ describe("diagnostic-events", () => {
         systemPrompt: "secret system",
       },
     });
+  });
+
+  it("keeps execution identity for tool audit while projecting diagnostics publicly", async () => {
+    const toolAuditEvents: DiagnosticEventPayload[] = [];
+    const exporterEvents: DiagnosticEventPayload[] = [];
+    onTrustedToolExecutionEvent((event) => {
+      toolAuditEvents.push(event);
+    });
+    onTrustedInternalDiagnosticEvent((event) => {
+      exporterEvents.push(event);
+    });
+
+    emitTrustedDiagnosticEvent(
+      {
+        type: "tool.execution.started",
+        runId: "private-recovery-attempt",
+        toolName: "read",
+        toolCallId: "call-1",
+      },
+      { publicRunId: "public-recovery-turn" },
+    );
+    await waitForDiagnosticEventsDrained();
+
+    expect(toolAuditEvents[0]).toMatchObject({
+      runId: "private-recovery-attempt",
+      publicRunId: "public-recovery-turn",
+    });
+    expect(Object.keys(toolAuditEvents[0] ?? {})).not.toContain("publicRunId");
+    expect(exporterEvents[0]).toMatchObject({ runId: "public-recovery-turn" });
+    expect(JSON.stringify(exporterEvents)).not.toContain("private-recovery-attempt");
   });
 
   it("skips event enrichment and subscribers when diagnostics are disabled", () => {

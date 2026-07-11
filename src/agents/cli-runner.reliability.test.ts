@@ -2720,7 +2720,7 @@ describe("runCliAgent reliability", () => {
       await seedSqliteSessionEntry({ sessionFile, storePath });
       const context = buildPreparedContext({
         sessionKey: "agent:main:main",
-        runId: "run-persist-cli",
+        runId: "private-run-persist-cli",
       });
       const recorder = createUserTurnTranscriptRecorder({
         input: {
@@ -2751,6 +2751,7 @@ describe("runCliAgent reliability", () => {
           workspaceDir: dir,
           prompt: "runtime prompt",
           persistAssistantTranscript: true,
+          publicRunId: "public-run-persist-cli",
           storePath,
           userTurnTranscriptRecorder: recorder,
           onUserMessagePersisted,
@@ -2785,13 +2786,14 @@ describe("runCliAgent reliability", () => {
           api: "cli",
           provider: "codex-cli",
           model: "gpt-5.4",
-          idempotencyKey: "cli-assistant:run-persist-cli",
+          idempotencyKey: "cli-assistant:public-run-persist-cli",
         }),
       );
       expect(
         messages.filter((message) => (message as { role?: string }).role === "user"),
       ).toHaveLength(1);
       expect(JSON.stringify(messages)).not.toContain("runtime prompt");
+      expect(JSON.stringify(messages)).not.toContain("private-run-persist-cli");
       const events = await loadTranscriptEvents({
         agentId: "main",
         sessionId: "s1",
@@ -3735,7 +3737,7 @@ describe("runCliAgent reliability", () => {
       let resolved = false;
       const context = buildPreparedContext({
         sessionKey: "agent:main:main",
-        runId: "run-blocked-cli",
+        runId: "private-run-blocked-cli",
       });
       context.preparedBackend.backend.sessionMode = "none";
       const run = runPreparedCliAgent({
@@ -3746,6 +3748,7 @@ describe("runCliAgent reliability", () => {
           sessionFile,
           workspaceDir: dir,
           prompt: "secret prompt",
+          publicRunId: "public-run-blocked-cli",
         },
       }).then((result) => {
         resolved = true;
@@ -3787,7 +3790,7 @@ describe("runCliAgent reliability", () => {
         callArg(hookRunner.runBeforeAgentRun, 0, 1, "before_agent_run context"),
         "before_agent_run context",
       );
-      expect(beforeRunContext.runId).toBe("run-blocked-cli");
+      expect(beforeRunContext.runId).toBe("private-run-blocked-cli");
       expect(beforeRunContext.agentId).toBe("main");
       expect(beforeRunContext.sessionKey).toBe("agent:main:main");
       expect(resolved).toBe(true);
@@ -3825,6 +3828,10 @@ describe("runCliAgent reliability", () => {
       );
       expect(blockedLine.message["__openclaw"].beforeAgentRunBlocked).not.toHaveProperty("reason");
       expect(Object.hasOwn(blockedLine.message["__openclaw"], "beforeAgentRunBlocked")).toBe(true);
+      expect(blockedLine.message.idempotencyKey).toBe(
+        "hook-block:before_agent_run:user:public-run-blocked-cli",
+      );
+      expect(JSON.stringify(blockedLine)).not.toContain("private-run-blocked-cli");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

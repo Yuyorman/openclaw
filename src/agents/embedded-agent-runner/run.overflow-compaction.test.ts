@@ -20,6 +20,7 @@ import {
 import { AGENT_HARNESS_SESSION_KEY_RESERVED_MESSAGE } from "../../sessions/agent-harness-session-key.js";
 import type { AgentHarness } from "../harness/types.js";
 import type { AgentInternalEvent } from "../internal-events.js";
+import type { MainRunRecoveryExecutionOwner } from "../main-run-recovery-execution-owner.js";
 import type { AgentRuntimePlan } from "../runtime-plan/types.js";
 import {
   makeAttemptResult,
@@ -1050,6 +1051,29 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
       lifecycleGeneration: currentLifecycleGeneration,
     });
     resetAgentRunContextForTest();
+  });
+
+  it("rejects execution-start ownership before the embedded attempt", async () => {
+    const ownerStart = vi.fn(async () => {
+      throw new Error("ledger CAS rejected");
+    });
+    const executionOwner = { start: ownerStart } as unknown as MainRunRecoveryExecutionOwner;
+    const onExecutionStarted = vi.fn();
+    const lifecycleGeneration = getAgentEventLifecycleGeneration();
+
+    await expect(
+      runEmbeddedAgent({
+        ...overflowBaseRunParams,
+        runId: "rejected-execution-start",
+        lifecycleGeneration,
+        executionOwner,
+        onExecutionStarted,
+      }),
+    ).rejects.toThrow("ledger CAS rejected");
+
+    expect(ownerStart).toHaveBeenCalledWith({ lifecycleGeneration });
+    expect(onExecutionStarted).not.toHaveBeenCalled();
+    expect(mockedRunEmbeddedAttempt).not.toHaveBeenCalled();
   });
 
   it("revalidates reserved harness ownership after the global queue wait", async () => {

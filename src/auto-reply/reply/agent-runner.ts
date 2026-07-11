@@ -1,5 +1,4 @@
 // Orchestrates reply agent execution, payload building, and delivery callbacks.
-import crypto from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   hasSessionAutoModelFallbackProvenance,
@@ -21,6 +20,7 @@ import {
   queueEmbeddedAgentMessageWithOutcomeAsync,
 } from "../../agents/embedded-agent-runner/runs.js";
 import { resolveFastModeState } from "../../agents/fast-mode.js";
+import { isMainRunRecoveryOwnershipLostError } from "../../agents/main-run-recovery-errors.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import { deriveContextPromptTokens, hasNonzeroUsage } from "../../agents/usage.js";
@@ -1164,7 +1164,7 @@ export async function runReplyAgent(params: {
   const {
     commandBody,
     transcriptCommandBody,
-    followupRun,
+    followupRun: inputFollowupRun,
     queueKey,
     resolvedQueue,
     shouldSteer,
@@ -1194,6 +1194,11 @@ export async function runReplyAgent(params: {
     replyOperation: providedReplyOperation,
   } = params;
 
+  // Queue drains can outlive the request that enqueued them. Recovery authority
+  // therefore lives only on the exact turn, never on ambient reply options.
+  const followupRun = inputFollowupRun;
+  const executionOwner = followupRun.executionOwner;
+
   let activeSessionEntry = sessionEntry;
   const activeSessionStore = sessionStore;
   let activeIsNewSession = isNewSession;
@@ -1216,7 +1221,8 @@ export async function runReplyAgent(params: {
       config: followupRun.run.config,
       attributes: traceAttributes,
     });
-  const effectiveShouldSteer = !isHeartbeat && !effectiveResetTriggered && shouldSteer;
+  const effectiveShouldSteer =
+    !executionOwner && !isHeartbeat && !effectiveResetTriggered && shouldSteer;
   const effectiveShouldFollowup = !effectiveResetTriggered && shouldFollowup;
   const typingSignals = createTypingSignaler({
     typing,
@@ -1306,8 +1312,12 @@ export async function runReplyAgent(params: {
 
   const activeRunQueueAction = resolveActiveRunQueueAction({
     isActive,
-    isHeartbeat,
-    shouldFollowup: effectiveShouldFollowup || shouldQueueAfterSteerRejection,
+    // Recovery authority belongs to this exact turn. Even if stale caller
+    // metadata still classifies it as a heartbeat, it must never hit the
+    // generic busy-heartbeat drop branch.
+    isHeartbeat: isHeartbeat && executionOwner === undefined,
+    shouldFollowup:
+      executionOwner !== undefined || effectiveShouldFollowup || shouldQueueAfterSteerRejection,
     queueMode: activeRunQueueMode,
     resetTriggered: effectiveResetTriggered,
   });
@@ -1503,94 +1513,12 @@ export async function runReplyAgent(params: {
     }
   }
   let runFollowupTurn = queuedRunFollowupTurn;
-  let shouldDrainQueuedFollowupsAfterClear = false;
+  let shouldDrainQueuedFollowups = false;
   const returnWithQueuedFollowupDrain = <T>(value: T): T => {
-    shouldDrainQueuedFollowupsAfterClear = true;
+    shouldDrainQueuedFollowups = true;
     return value;
   };
-  const restartRecoveryDeliveryRunId = crypto.randomUUID();
-  let trackedRestartRecoveryDeliveryContext = false;
-  const persistRestartRecoveryDeliveryContext = async (): Promise<void> => {
-    if (!sessionKey || !storePath) {
-      return;
-    }
-    const entry = activeSessionStore?.[sessionKey] ?? activeSessionEntry;
-    const deliveryContext = resolveReplyRunDeliveryContext({
-      cfg,
-      sessionCtx,
-      sessionEntry: entry,
-      sessionKey,
-      runtimePolicySessionKey,
-      opts,
-    });
-    if (!deliveryContext) {
-      return;
-    }
-    const updatedAt = Date.now();
-    const patch: Partial<SessionEntry> = {
-      restartRecoveryDeliveryContext: deliveryContext,
-      restartRecoveryDeliveryRunId,
-      updatedAt,
-    };
-    const persisted = await updateSessionEntry(
-      {
-        storePath,
-        sessionKey,
-      },
-      async (current) =>
-        current.sessionId === replyOperation.sessionId && current.abortedLastRun !== true
-          ? patch
-          : null,
-    );
-    if (persisted) {
-      activeSessionEntry = persisted;
-      if (activeSessionStore) {
-        activeSessionStore[sessionKey] = persisted;
-      }
-      trackedRestartRecoveryDeliveryContext =
-        persisted.restartRecoveryDeliveryRunId === restartRecoveryDeliveryRunId;
-    }
-  };
-  const clearRestartRecoveryDeliveryContext = async (): Promise<void> => {
-    if (!trackedRestartRecoveryDeliveryContext || !sessionKey || !storePath) {
-      return;
-    }
-    const patch: Partial<SessionEntry> = {
-      restartRecoveryDeliveryContext: undefined,
-      restartRecoveryDeliveryRunId: undefined,
-      updatedAt: Date.now(),
-    };
-    const persisted = await updateSessionEntry(
-      {
-        storePath,
-        sessionKey,
-      },
-      async (current) =>
-        current.sessionId === replyOperation.sessionId &&
-        current.abortedLastRun !== true &&
-        current.restartRecoveryDeliveryRunId === restartRecoveryDeliveryRunId
-          ? patch
-          : null,
-    );
-    if (persisted) {
-      activeSessionEntry = persisted;
-      if (activeSessionStore) {
-        activeSessionStore[sessionKey] = persisted;
-      }
-    }
-  };
-  const isRestartRecoveryArmed = (): boolean => {
-    if (!trackedRestartRecoveryDeliveryContext || !sessionKey || !storePath) {
-      return false;
-    }
-    const persisted = loadSessionEntry({
-      sessionKey,
-      storePath,
-      clone: false,
-      hydrateSkillPromptRefs: false,
-    });
-    return persisted?.abortedLastRun === true || activeSessionEntry?.abortedLastRun === true;
-  };
+  const isRestartRecoveryArmed = (): boolean => executionOwner !== undefined;
   type SessionResetOptions = {
     failureLabel: string;
     buildLogMessage: (nextSessionId: string) => string;
@@ -1731,10 +1659,8 @@ export async function runReplyAgent(params: {
 
     replyOperation.setPhase("running");
     const runStartedAt = Date.now();
-    await persistRestartRecoveryDeliveryContext();
-    // Adoption marks run start and must never be spool-replayed (would re-run tools).
-    // Suppressed delivery has no recovery state to persist; crashed suppressed runs die
-    // silently. When a delivery context is resolvable, this still runs after its persist.
+    // Transcript adoption must never be spool-replayed (would duplicate the accepted turn).
+    // Durable execution ownership transfers later, at the actual runner boundary.
     await opts?.onTurnAdopted?.();
     const runOutcome = await traceAgentPhase("reply.run_agent_turn", () =>
       runAgentTurnWithFallback({
@@ -2739,6 +2665,9 @@ export async function runReplyAgent(params: {
 
     return result;
   } catch (error) {
+    if (isMainRunRecoveryOwnershipLostError(error)) {
+      throw error;
+    }
     // Drain/restart aborts stay silent and defer to post-restart main-session
     // recovery, which resumes the interrupted turn (or emits its own genuine
     // non-resumable notice). Surfacing a generic "try again" here is a false
@@ -2796,16 +2725,7 @@ export async function runReplyAgent(params: {
     returnWithQueuedFollowupDrain(undefined);
     throw error;
   } finally {
-    try {
-      await clearRestartRecoveryDeliveryContext();
-    } catch (error) {
-      logVerbose(
-        `failed to clear restart recovery delivery context for ${sessionKey ?? "unknown"}: ${String(
-          error,
-        )}`,
-      );
-    }
-    if (shouldDrainQueuedFollowupsAfterClear) {
+    if (shouldDrainQueuedFollowups) {
       scheduleFollowupDrainAfterReplyOperationClear({
         operation: replyOperation,
         queueKey,

@@ -2,6 +2,7 @@
 // session as busy based on Control UI-visible active chat/agent runs.
 import { isEmbeddedAgentRunActive } from "../../agents/embedded-agent-runner/runs.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
+import { resolveActiveRunIdentity } from "../active-run-registry.js";
 import type { GatewayRequestContext } from "./types.js";
 
 /**
@@ -32,7 +33,7 @@ function collectTrackedActiveSessionRuns(
         continue;
       }
       runs.push({
-        runId,
+        runId: resolveActiveRunIdentity(runId, active).publicRunId,
         ...(sessionKey ? { sessionKey } : {}),
         ...(sessionId ? { sessionId } : {}),
         agentId: typeof active.agentId === "string" ? normalizeAgentId(active.agentId) : undefined,

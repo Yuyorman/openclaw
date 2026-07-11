@@ -119,6 +119,8 @@ export function createOpenClawTools(
     runSessionKey?: string;
     agentChannel?: GatewayMessageChannel;
     runId?: string;
+    /** Operator-visible turn identity; runId remains the execution capability identity. */
+    publicRunId?: string;
     agentAccountId?: string;
     /** Delivery target for topic/thread routing. */
     agentTo?: string;
@@ -285,7 +287,7 @@ export function createOpenClawTools(
   const skillWorkshopSessionKey = normalizeOptionalString(
     options?.runSessionKey ?? options?.agentSessionKey,
   );
-  const skillWorkshopRunId = normalizeOptionalString(options?.runId);
+  const publicRunId = normalizeOptionalString(options?.publicRunId ?? options?.runId);
   const skillWorkshopMessageId = normalizeOptionalString(
     options?.currentMessageId === undefined ? undefined : String(options.currentMessageId),
   );
@@ -391,6 +393,7 @@ export function createOpenClawTools(
         agentAccountId: options?.agentAccountId,
         agentSessionKey: options?.agentSessionKey,
         runId: options?.runId,
+        idempotencyRunId: publicRunId,
         agentId: sessionAgentId,
         sessionId: options?.sessionId,
         messageActionTurnCapability: options?.messageActionTurnCapability,
@@ -555,7 +558,7 @@ export function createOpenClawTools(
             origin: {
               agentId: sessionAgentId,
               ...(skillWorkshopSessionKey ? { sessionKey: skillWorkshopSessionKey } : {}),
-              ...(skillWorkshopRunId ? { runId: skillWorkshopRunId } : {}),
+              ...(publicRunId ? { runId: publicRunId } : {}),
               ...(skillWorkshopMessageId ? { messageId: skillWorkshopMessageId } : {}),
             },
           }),

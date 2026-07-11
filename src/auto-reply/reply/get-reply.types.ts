@@ -1,4 +1,5 @@
 // Shared get-reply type contracts for command, directive, and runtime layers.
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ReplyOptionsWithHeartbeatRunScope } from "../../infra/heartbeat-run-scope.js";
 import type { GetReplyOptions } from "../get-reply-options.types.js";
@@ -12,6 +13,8 @@ export type ReplySessionBinding = {
 };
 
 type InternalReplySessionOptions = {
+  /** Opaque exact-turn recovery owner; never exposed through the plugin reply API. */
+  executionOwner?: MainRunRecoveryExecutionOwner;
   expectedExistingSessionId?: string;
   onSessionPrepared?: (binding: ReplySessionBinding) => void;
   requestedSessionId?: string;

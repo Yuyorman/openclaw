@@ -1505,6 +1505,71 @@ describe("openclaw state database", () => {
     ).toEqual({ role: "global", schema_version: OPENCLAW_STATE_SCHEMA_VERSION });
   });
 
+  it("restores missing additive recovery schema without changing version", () => {
+    const stateDir = createTempStateDir();
+    const seeded = openOpenClawStateDatabase({
+      env: { OPENCLAW_STATE_DIR: stateDir },
+    });
+    seeded.db.exec(`
+      DROP INDEX IF EXISTS idx_main_run_recoveries_active_session;
+      DROP INDEX IF EXISTS idx_main_run_recoveries_boot;
+      DROP INDEX IF EXISTS idx_main_run_recoveries_due;
+      DROP INDEX IF EXISTS idx_main_run_recoveries_execution;
+      DROP INDEX IF EXISTS idx_main_run_recoveries_terminal;
+      DROP TABLE IF EXISTS main_run_recoveries;
+      UPDATE schema_meta SET schema_version = 1 WHERE meta_key = 'primary';
+      PRAGMA user_version = 1;
+    `);
+    closeOpenClawStateDatabaseForTest();
+
+    const migrated = openOpenClawStateDatabase({
+      env: { OPENCLAW_STATE_DIR: stateDir },
+    });
+    const schemaObjects = migrated.db
+      .prepare(
+        `SELECT name, type
+           FROM sqlite_master
+          WHERE name IN (
+            'main_run_recoveries',
+            'idx_main_run_recoveries_active_session',
+            'idx_main_run_recoveries_boot',
+            'idx_main_run_recoveries_due',
+            'idx_main_run_recoveries_execution',
+            'idx_main_run_recoveries_terminal'
+          )
+          ORDER BY name`,
+      )
+      .all();
+
+    expect(schemaObjects).toEqual([
+      { name: "idx_main_run_recoveries_active_session", type: "index" },
+      { name: "idx_main_run_recoveries_boot", type: "index" },
+      { name: "idx_main_run_recoveries_due", type: "index" },
+      { name: "idx_main_run_recoveries_execution", type: "index" },
+      { name: "idx_main_run_recoveries_terminal", type: "index" },
+      { name: "main_run_recoveries", type: "table" },
+    ]);
+    expect(
+      migrated.db
+        .prepare("PRAGMA table_info(main_run_recoveries)")
+        .all()
+        .map((row) => (row as { name: string }).name),
+    ).toEqual(
+      expect.arrayContaining([
+        "public_run_id",
+        "execution_run_id",
+        "terminal_evidence_json",
+        "terminal_outcome_json",
+      ]),
+    );
+    expect(readSqliteNumberPragma(migrated.db, "user_version")).toBe(1);
+    expect(
+      migrated.db
+        .prepare("SELECT schema_version FROM schema_meta WHERE meta_key = 'primary'")
+        .get(),
+    ).toEqual({ schema_version: 1 });
+  });
+
   it("refuses to open newer global schema versions", () => {
     const stateDir = createTempStateDir();
     const databasePath = path.join(stateDir, "state", "openclaw.sqlite");

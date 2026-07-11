@@ -3,11 +3,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isAgentRunRestartAbortReason } from "../agents/run-termination.js";
 import { onAgentEvent } from "../infra/agent-events.js";
+import { ActiveRunRegistry, createActiveRunIdentity } from "./active-run-registry.js";
 import {
   abortChatRunById,
   abortChatRunsForProvider,
   boundInFlightRunSnapshotForChatHistory,
+  hasObservedChatAbortControllerTerminal,
   isChatStopCommandText,
+  notifyChatAbortControllerSessionTerminalPersistenceFailed,
+  notifyChatAbortControllerSessionTerminalPersisted,
   registerChatAbortController,
   resolveAgentRunExpiresAtMs,
   resolveChatRunExpiresAtMs,
@@ -88,9 +92,11 @@ function createOps(params: {
       },
     ],
   ]);
+  const chatAbortControllers = new ActiveRunRegistry<ChatAbortControllerEntry>();
+  chatAbortControllers.set(runId, entry);
 
   return {
-    chatAbortControllers: new Map([[runId, entry]]),
+    chatAbortControllers,
     chatRunBuffers,
     chatAbortedRuns: new Map(),
     clearChatRunState: (id: string) => {
@@ -242,6 +248,7 @@ describe("registerChatAbortController", () => {
   it("retains completed registrations until terminal persistence succeeds", async () => {
     const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
     const onRemoved = vi.fn();
+    const onSessionTerminalPersisted = vi.fn();
     const registration = registerChatAbortController({
       chatAbortControllers,
       runId: "run-persisting",
@@ -249,6 +256,7 @@ describe("registerChatAbortController", () => {
       sessionKey: "main",
       timeoutMs: 60_000,
       onRemoved,
+      onSessionTerminalPersisted,
     });
     let resolvePersistence: () => void = () => undefined;
     const persistence = new Promise<void>((resolve) => {
@@ -264,11 +272,106 @@ describe("registerChatAbortController", () => {
 
     expect(chatAbortControllers.has("run-persisting")).toBe(true);
     expect(onRemoved).not.toHaveBeenCalled();
+    expect(onSessionTerminalPersisted).not.toHaveBeenCalled();
     resolvePersistence();
     await persistence;
     await Promise.resolve();
     expect(chatAbortControllers.has("run-persisting")).toBe(false);
     expect(onRemoved).toHaveBeenCalledTimes(1);
+    expect(onSessionTerminalPersisted).toHaveBeenCalledTimes(1);
+    expect(onSessionTerminalPersisted.mock.invocationCallOrder[0]).toBeLessThan(
+      onRemoved.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+  });
+
+  it("notifies terminal persistence failure exactly once after rejection", async () => {
+    const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
+    const onSessionTerminalPersisted = vi.fn();
+    const onSessionTerminalPersistenceFailed = vi.fn(() => true);
+    const registration = registerChatAbortController({
+      chatAbortControllers,
+      runId: "run-persistence-rejected",
+      sessionId: "sess-1",
+      sessionKey: "main",
+      timeoutMs: 60_000,
+      onSessionTerminalPersisted,
+      onSessionTerminalPersistenceFailed,
+    });
+    let rejectPersistence: (error: Error) => void = () => undefined;
+    const persistence = new Promise<void>((_resolve, reject) => {
+      rejectPersistence = reject;
+    });
+    if (!registration.entry) {
+      throw new Error("expected registered entry");
+    }
+    registration.entry.projectSessionTerminalPersistence = persistence;
+
+    registration.cleanup();
+    rejectPersistence(new Error("write failed"));
+    await expect(persistence).rejects.toThrow("write failed");
+    await Promise.resolve();
+
+    expect(chatAbortControllers.has("run-persistence-rejected")).toBe(false);
+    expect(onSessionTerminalPersisted).not.toHaveBeenCalled();
+    expect(onSessionTerminalPersistenceFailed).toHaveBeenCalledTimes(1);
+    expect(notifyChatAbortControllerSessionTerminalPersistenceFailed(registration.entry)).toBe(
+      true,
+    );
+    expect(onSessionTerminalPersistenceFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it("notifies once when persistence completed before caller cleanup", () => {
+    const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
+    const onSessionTerminalPersisted = vi.fn();
+    const registration = registerChatAbortController({
+      chatAbortControllers,
+      runId: "run-already-persisted",
+      sessionId: "sess-1",
+      sessionKey: "main",
+      timeoutMs: 60_000,
+      onSessionTerminalPersisted,
+    });
+    if (!registration.entry) {
+      throw new Error("expected registered entry");
+    }
+    notifyChatAbortControllerSessionTerminalPersisted(registration.entry);
+
+    expect(onSessionTerminalPersisted).not.toHaveBeenCalled();
+    registration.cleanup();
+    registration.cleanup();
+
+    expect(chatAbortControllers.has("run-already-persisted")).toBe(false);
+    expect(onSessionTerminalPersisted).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not notify after force-removing a persisting registration", async () => {
+    const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
+    const onSessionTerminalPersisted = vi.fn();
+    const registration = registerChatAbortController({
+      chatAbortControllers,
+      runId: "run-force-removed",
+      sessionId: "sess-1",
+      sessionKey: "main",
+      timeoutMs: 60_000,
+      onSessionTerminalPersisted,
+    });
+    let resolvePersistence: () => void = () => undefined;
+    const persistence = new Promise<void>((resolve) => {
+      resolvePersistence = resolve;
+    });
+    if (!registration.entry) {
+      throw new Error("expected registered entry");
+    }
+    registration.entry.projectSessionTerminalPersistence = persistence;
+
+    registration.cleanup();
+    registration.cleanup({ force: true });
+    resolvePersistence();
+    await persistence;
+    await Promise.resolve();
+
+    expect(chatAbortControllers.has("run-force-removed")).toBe(false);
+    expect(onSessionTerminalPersisted).not.toHaveBeenCalled();
   });
 
   it("retains registrations when terminal lifecycle was observed before caller cleanup", () => {
@@ -285,10 +388,29 @@ describe("registerChatAbortController", () => {
       throw new Error("expected registered entry");
     }
     registration.entry.projectSessionTerminalPending = true;
+    registration.entry.projectSessionTerminalObservedAt = Date.now();
     registration.cleanup();
 
     expect(chatAbortControllers.has("run-awaiting-terminal")).toBe(true);
     expect(registration.entry?.registrationCleanupRequested).toBe(true);
+  });
+
+  it("distinguishes an abort reservation from observed terminal persistence", () => {
+    const entry = createActiveEntry("main");
+    entry.projectSessionTerminalPending = true;
+
+    expect(hasObservedChatAbortControllerTerminal(entry)).toBe(false);
+
+    entry.projectSessionTerminalObservedAt = Date.now();
+    expect(hasObservedChatAbortControllerTerminal(entry)).toBe(true);
+
+    entry.projectSessionTerminalObservedAt = undefined;
+    entry.projectSessionTerminalPersistence = Promise.resolve();
+    expect(hasObservedChatAbortControllerTerminal(entry)).toBe(true);
+
+    entry.projectSessionTerminalPersistence = undefined;
+    entry.projectSessionTerminalPersisted = true;
+    expect(hasObservedChatAbortControllerTerminal(entry)).toBe(true);
   });
 
   it("force-cleans registrations when dispatch fails before lifecycle starts", () => {
@@ -348,8 +470,6 @@ describe("abortChatRunById", () => {
       now,
     });
     ops.agentRunSeq.set(runId, 2);
-    ops.agentRunSeq.set("client-run-1", 4);
-    ops.removeChatRun.mockReturnValue({ sessionKey, clientRunId: "client-run-1" });
 
     const result = abortChatRunById(ops, { runId, sessionKey, stopReason: "user" });
 
@@ -362,7 +482,6 @@ describe("abortChatRunById", () => {
     expect(ops.clearedState.bufferedAgentEvents.has(`${runId}:assistant`)).toBe(false);
     expect(ops.removeChatRun).toHaveBeenCalledWith(runId, runId, sessionKey);
     expect(ops.agentRunSeq.has(runId)).toBe(false);
-    expect(ops.agentRunSeq.has("client-run-1")).toBe(false);
 
     expect(ops.broadcast).toHaveBeenCalledTimes(1);
     const payload = firstBroadcastPayload(ops) as ChatAbortPayload;
@@ -379,6 +498,54 @@ describe("abortChatRunById", () => {
       },
     });
     expect(ops.nodeSendToSession).toHaveBeenCalledWith(sessionKey, "chat", payload);
+  });
+
+  it("projects recovered aborts under the public chat run id", () => {
+    const sourceRunId = "private-recovery-dispatch";
+    const clientRunId = "public-chat-admission";
+    const sessionKey = "main";
+    const entry = {
+      ...createActiveEntry(sessionKey),
+      runIdentity: createActiveRunIdentity(sourceRunId, clientRunId),
+      kind: "agent" as const,
+    };
+    const ops = createOps({ runId: sourceRunId, entry });
+    ops.chatRunBuffers.set(clientRunId, "recovered partial");
+    ops.agentRunSeq.set(sourceRunId, 6);
+    const lifecycleRunIds: string[] = [];
+    let lifecycleObservedBeforeRunRemoval = false;
+    const unsubscribe = onAgentEvent((event) => {
+      if (event.stream === "lifecycle" && event.data.phase === "end") {
+        lifecycleRunIds.push(event.runId);
+        lifecycleObservedBeforeRunRemoval = ops.removeChatRun.mock.calls.length === 0;
+      }
+    });
+
+    try {
+      const result = abortChatRunById(ops, {
+        runId: clientRunId,
+        sessionKey,
+        stopReason: "rpc",
+      });
+
+      expectRunAborted({ result, entry, ops, runId: sourceRunId });
+      expect(ops.removeChatRun).toHaveBeenCalledWith(sourceRunId, clientRunId, sessionKey);
+      expect(ops.chatRunBuffers.has(clientRunId)).toBe(false);
+      expect(ops.chatAbortedRuns.has(clientRunId)).toBe(true);
+      expect(ops.agentRunSeq.has(sourceRunId)).toBe(false);
+      expect(firstBroadcastPayload(ops)).toMatchObject({
+        runId: clientRunId,
+        sessionKey,
+        seq: 7,
+        state: "aborted",
+        stopReason: "rpc",
+      });
+      expect(JSON.stringify(ops.broadcast.mock.calls)).not.toContain(sourceRunId);
+      expect(lifecycleRunIds).toEqual([sourceRunId]);
+      expect(lifecycleObservedBeforeRunRemoval).toBe(true);
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("omits aborted message when buffered text is empty", () => {
@@ -576,6 +743,7 @@ describe("resolveInFlightRunSnapshot", () => {
       projectSessionActive?: boolean;
       startedAtMs?: number;
       kind?: ChatAbortControllerEntry["kind"];
+      publicRunId?: string;
     },
   ): ChatAbortControllerEntry => {
     const now = Date.now();
@@ -594,6 +762,9 @@ describe("resolveInFlightRunSnapshot", () => {
       controlUiVisible: opts?.controlUiVisible,
       projectSessionActive: opts?.projectSessionActive ?? true,
       kind: opts?.kind,
+      ...(opts?.publicRunId
+        ? { runIdentity: createActiveRunIdentity("fixture-run", opts.publicRunId) }
+        : {}),
     };
   };
 
@@ -675,6 +846,20 @@ describe("resolveInFlightRunSnapshot", () => {
         sessionKey: "agent:main:s",
       }),
     ).toBeUndefined();
+  });
+
+  it("restores a recovered agent run under its public chat identity", () => {
+    const sourceRunId = "private-recovery-dispatch";
+    const clientRunId = "public-chat-admission";
+    expect(
+      snap({
+        chatAbortControllers: new Map([
+          [sourceRunId, inFlightEntry("agent:main:s", { kind: "agent", publicRunId: clientRunId })],
+        ]),
+        chatRunBuffers: new Map([[clientRunId, "recovered partial"]]),
+        sessionKey: "agent:main:s",
+      }),
+    ).toEqual({ runId: clientRunId, text: "recovered partial" });
   });
 
   it("treats an entry with undefined projectSessionActive as active (sessions.list contract)", () => {

@@ -140,6 +140,8 @@ export type HookContext = {
   sessionKey?: string;
   /** Ephemeral session UUID — regenerated on /new and /reset. */
   sessionId?: string;
+  /** Operator-visible turn identity; execution bookkeeping continues to use runId. */
+  publicRunId?: string;
   runId?: string;
   /** Device-scoped operator session allowed to review approvals initiated by this run. */
   approvalReviewerDeviceId?: string;
@@ -749,7 +751,9 @@ function emitSkillUsedDiagnostic(params: {
   emitTrustedSkillUsedDiagnosticEvent(
     {
       type: "skill.used",
-      ...(params.ctx?.runId && { runId: params.ctx.runId }),
+      ...((params.ctx?.publicRunId ?? params.ctx?.runId)
+        ? { runId: params.ctx?.publicRunId ?? params.ctx?.runId }
+        : {}),
       ...(params.ctx?.sessionKey && { sessionKey: params.ctx.sessionKey }),
       ...(params.ctx?.sessionId && { sessionId: params.ctx.sessionId }),
       ...(params.ctx?.agentId && { agentId: params.ctx.agentId }),
@@ -1396,6 +1400,7 @@ export async function runBeforeToolCallHook(args: {
 }): Promise<HookOutcome> {
   const toolName = normalizeToolName(args.toolName || "tool");
   const params = args.params;
+  const publicRunId = args.ctx?.publicRunId ?? args.ctx?.runId;
 
   try {
     if (args.ctx?.sessionKey) {
@@ -1503,7 +1508,7 @@ export async function runBeforeToolCallHook(args: {
       ...(args.ctx?.agentId && { agentId: args.ctx.agentId }),
       ...(args.ctx?.sessionKey && { sessionKey: args.ctx.sessionKey }),
       ...(args.ctx?.sessionId && { sessionId: args.ctx.sessionId }),
-      ...(args.ctx?.runId && { runId: args.ctx.runId }),
+      ...(publicRunId && { runId: publicRunId }),
       ...(args.ctx?.trace && { trace: freezeDiagnosticTraceContext(args.ctx.trace) }),
       ...(args.toolCallId && { toolCallId: args.toolCallId }),
       ...(args.ctx?.channelId && { channelId: args.ctx.channelId }),
@@ -1515,7 +1520,7 @@ export async function runBeforeToolCallHook(args: {
             toolName,
             params: normalizedParams,
             ...toolIdentity,
-            ...(args.ctx?.runId && { runId: args.ctx.runId }),
+            ...(publicRunId && { runId: publicRunId }),
             ...(args.toolCallId && { toolCallId: args.toolCallId }),
             ...(derivedToolParams.derivedPaths
               ? { derivedPaths: derivedToolParams.derivedPaths }
@@ -1622,7 +1627,7 @@ export async function runBeforeToolCallHook(args: {
         toolName,
         params: hookEventParams,
         ...policyAdjustedToolIdentity,
-        ...(args.ctx?.runId && { runId: args.ctx.runId }),
+        ...(publicRunId && { runId: publicRunId }),
         ...(args.toolCallId && { toolCallId: args.toolCallId }),
         ...(policyAdjustedDerivedToolParams.derivedPaths
           ? { derivedPaths: policyAdjustedDerivedToolParams.derivedPaths }
@@ -1721,6 +1726,7 @@ export function wrapToolWithBeforeToolCallHook(
   // Resolved once per wrap from the same opt-in config gate the model-content
   // path uses; controls whether tool input/output rides the trusted private channel.
   const toolContentPolicy = resolveDiagnosticModelContentCapturePolicy(ctx?.config);
+  const diagnosticProjection = ctx?.publicRunId ? { publicRunId: ctx.publicRunId } : undefined;
   const wrappedTool: AnyAgentTool = {
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate) => {
@@ -1753,12 +1759,15 @@ export function wrapToolWithBeforeToolCallHook(
         if (!hookOptions.emitDiagnostics) {
           return;
         }
-        emitTrustedDiagnosticEvent({
-          type: "tool.execution.error",
-          ...buildEventBase(toolParams),
-          durationMs: Date.now() - preExecutionStartedAt,
-          ...resolveToolErrorDiagnostic(error, signal, errorCategory),
-        });
+        emitTrustedDiagnosticEvent(
+          {
+            type: "tool.execution.error",
+            ...buildEventBase(toolParams),
+            durationMs: Date.now() - preExecutionStartedAt,
+            ...resolveToolErrorDiagnostic(error, signal, errorCategory),
+          },
+          diagnosticProjection,
+        );
       };
       const recordPreExecutionDisposition = (
         toolParams: unknown,
@@ -1773,21 +1782,27 @@ export function wrapToolWithBeforeToolCallHook(
         const eventBase = buildEventBase(toolParams);
         if (disposition === "blocked") {
           const reason = deniedReason ?? "plugin-before-tool-call";
-          emitTrustedDiagnosticEvent({
-            type: "tool.execution.blocked",
-            ...eventBase,
-            deniedReason: reason,
-            reason,
-          });
+          emitTrustedDiagnosticEvent(
+            {
+              type: "tool.execution.blocked",
+              ...eventBase,
+              deniedReason: reason,
+              reason,
+            },
+            diagnosticProjection,
+          );
           return;
         }
-        emitTrustedDiagnosticEvent({
-          type: "tool.execution.error",
-          ...eventBase,
-          durationMs: Date.now() - preExecutionStartedAt,
-          errorCategory: disposition === "cancelled" ? "aborted" : errorCategory,
-          terminalReason: disposition,
-        });
+        emitTrustedDiagnosticEvent(
+          {
+            type: "tool.execution.error",
+            ...eventBase,
+            durationMs: Date.now() - preExecutionStartedAt,
+            errorCategory: disposition === "cancelled" ? "aborted" : errorCategory,
+            terminalReason: disposition,
+          },
+          diagnosticProjection,
+        );
       };
       const prepare = (tool as BeforeToolCallPreparingTool).prepareBeforeToolCallParams;
       let preparedParams: unknown;
@@ -1832,12 +1847,15 @@ export function wrapToolWithBeforeToolCallHook(
         }
         const eventBase = buildEventBase(outcome.params ?? hookParams);
         if (hookOptions.emitDiagnostics) {
-          emitTrustedDiagnosticEvent({
-            type: "tool.execution.blocked",
-            ...eventBase,
-            reason: outcome.reason,
-            deniedReason: outcome.deniedReason ?? "plugin-before-tool-call",
-          });
+          emitTrustedDiagnosticEvent(
+            {
+              type: "tool.execution.blocked",
+              ...eventBase,
+              reason: outcome.reason,
+              deniedReason: outcome.deniedReason ?? "plugin-before-tool-call",
+            },
+            diagnosticProjection,
+          );
           emitToolBlockedSecurityEvent({
             ctx,
             deniedReason: outcome.deniedReason ?? "plugin-before-tool-call",
@@ -1883,10 +1901,13 @@ export function wrapToolWithBeforeToolCallHook(
       recordAdjustedParamsForToolCall(toolCallId, executeParams, ctx?.runId);
       const eventBase = buildEventBase(executeParams);
       if (hookOptions.emitDiagnostics) {
-        emitTrustedDiagnosticEvent({
-          type: "tool.execution.started",
-          ...eventBase,
-        });
+        emitTrustedDiagnosticEvent(
+          {
+            type: "tool.execution.started",
+            ...eventBase,
+          },
+          diagnosticProjection,
+        );
       }
       const startedAt = Date.now();
       try {
@@ -1938,6 +1959,7 @@ export function wrapToolWithBeforeToolCallHook(
               output: result,
               includeOutput: true,
             }),
+            diagnosticProjection,
           );
         }
         return result;
@@ -1954,6 +1976,7 @@ export function wrapToolWithBeforeToolCallHook(
               input: executeParams,
               includeOutput: false,
             }),
+            diagnosticProjection,
           );
         }
         await recordLoopOutcome({

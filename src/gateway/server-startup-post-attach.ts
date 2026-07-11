@@ -32,6 +32,7 @@ import {
   formatGatewayStartupOutcomes,
   type GatewayStartupOutcomeRecorder,
 } from "./server-startup-outcomes.js";
+import type { GatewayStartupWorkSuppression } from "./server-startup-work-suppression.js";
 import type { startGatewayTailscaleExposure } from "./server-tailscale.js";
 
 const ACP_BACKEND_READY_TIMEOUT_MS = 5_000;
@@ -59,8 +60,8 @@ type GatewayMemoryStartupPolicy =
   | { mode: "immediate" }
   | { mode: "idle"; delayMs: number };
 
-const loadMainSessionRestartRecoveryModule = createLazyRuntimeModule(
-  () => import("../agents/main-session-restart-recovery.js"),
+const loadMainRunRecoveryWorkerModule = createLazyRuntimeModule(
+  () => import("../agents/main-run-recovery-worker.js"),
 );
 
 const loadAgentDefaultsModule = createLazyRuntimeModule(() => import("../agents/defaults.js"));
@@ -431,16 +432,17 @@ function scheduleRestartSentinelWakeAfterReady(params: {
 }
 
 type CleanStaleLockFiles = typeof import("../agents/session-write-lock.js").cleanStaleLockFiles;
-type MarkRestartAbortedMainSessionsFromLocks =
-  typeof import("../agents/main-session-restart-recovery.js").markRestartAbortedMainSessionsFromLocks;
+type ReserveRestartAbortedMainSessionFromLock =
+  typeof import("../agents/main-session-restart-reservation.js").reserveRestartAbortedMainSessionFromLock;
 
 async function cleanupStaleSessionLocks(params: {
   sessionDirs: readonly string[];
+  stateDir?: string;
   cfg: OpenClawConfig;
   log: { warn: (msg: string) => void };
   isStopped: () => boolean;
   cleanStaleLockFiles: CleanStaleLockFiles;
-  markRestartAbortedMainSessionsFromLocks?: MarkRestartAbortedMainSessionsFromLocks;
+  reserveRestartAbortedMainSessionFromLock: ReserveRestartAbortedMainSessionFromLock;
   concurrency?: number;
 }): Promise<void> {
   const concurrency = Math.max(
@@ -451,13 +453,6 @@ async function cleanupStaleSessionLocks(params: {
     ),
   );
   let nextIndex = 0;
-  let markRestartAbortedMainSessionsFromLocks =
-    params.markRestartAbortedMainSessionsFromLocks ?? null;
-  const getMarker = async () => {
-    markRestartAbortedMainSessionsFromLocks ??= (await loadMainSessionRestartRecoveryModule())
-      .markRestartAbortedMainSessionsFromLocks;
-    return markRestartAbortedMainSessionsFromLocks;
-  };
   const worker = async () => {
     while (!params.isStopped()) {
       const sessionsDir = params.sessionDirs[nextIndex];
@@ -469,16 +464,26 @@ async function cleanupStaleSessionLocks(params: {
         sessionsDir,
         config: params.cfg,
         removeStale: true,
+        beforeRemoveStale: async (lock) => {
+          const reservation = await params.reserveRestartAbortedMainSessionFromLock({
+            cfg: params.cfg,
+            stateDir: params.stateDir,
+            sessionsDir,
+            lock,
+          });
+          if (reservation.kind !== "preserve") {
+            return true;
+          }
+          params.log.warn(
+            `preserving stale session lock until recovery is durable: ${lock.lockPath} (${reservation.reason})`,
+          );
+          return false;
+        },
         log: { warn: (message) => params.log.warn(message) },
       });
       if (result.cleaned.length === 0) {
         continue;
       }
-      const markRestartAbortedMainSessionsFromLocksLocal = await getMarker();
-      await markRestartAbortedMainSessionsFromLocksLocal({
-        sessionsDir,
-        cleanedLocks: result.cleaned,
-      });
     }
   };
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
@@ -707,6 +712,10 @@ export async function startGatewaySidecars(params: {
   logChannels: { info: (msg: string) => void; error: (msg: string) => void };
   startupTrace?: GatewayStartupTrace;
   startupOutcomes?: GatewayStartupOutcomeRecorder;
+  startupWorkSuppression?: GatewayStartupWorkSuppression;
+  notifyMainRunRecoveryTerminal?: import("../agents/main-run-recovery-worker.js").MainRunRecoveryWorkerOptions["notifyTerminal"];
+  abortMainRunRecoveryExecution: import("../agents/main-run-recovery-worker.js").MainRunRecoveryWorkerOptions["abortExecution"];
+  callMainRunRecoveryAgent: import("../agents/main-run-recovery-worker.js").MainRunRecoveryWorkerOptions["callAgent"];
 }) {
   const postReadySidecars: GatewayPostReadySidecarHandle[] = [];
 
@@ -746,19 +755,50 @@ export async function startGatewaySidecars(params: {
   const skipChannels =
     isTruthyEnvValue(process.env.OPENCLAW_SKIP_CHANNELS) ||
     isTruthyEnvValue(process.env.OPENCLAW_SKIP_PROVIDERS);
-  await measureStartup(params.startupTrace, "sidecars.main-session-recovery", async () => {
-    try {
-      const { markStartupOrphanedMainSessionsForRecovery } =
-        await loadMainSessionRestartRecoveryModule();
-      await markStartupOrphanedMainSessionsForRecovery({ cfg: params.cfg });
-    } catch (err) {
-      params.log.warn(
-        `main-session startup orphan marking failed before channel startup: ${String(err)}`,
-      );
-    }
+  let mainRunRecoveryWorkerModule:
+    | Awaited<ReturnType<typeof loadMainRunRecoveryWorkerModule>>
+    | undefined;
+  let mainRunRecoveryBootId: string | undefined;
+  if (!params.startupWorkSuppression) {
+    await measureStartup(params.startupTrace, "sidecars.main-run-recovery.evidence", async () => {
+      const [sessionDirsModule, sessionLocksModule, reservationModule] = await Promise.all([
+        import("../agents/session-dirs.js"),
+        import("../agents/session-write-lock.js"),
+        import("../agents/main-session-restart-reservation.js"),
+      ]);
+      const stateDir = resolveStateDir(process.env);
+      await cleanupStaleSessionLocks({
+        sessionDirs: await sessionDirsModule.resolveAgentSessionDirs(stateDir),
+        stateDir,
+        cfg: params.cfg,
+        log: params.log,
+        isStopped: () => false,
+        cleanStaleLockFiles: sessionLocksModule.cleanStaleLockFiles,
+        reserveRestartAbortedMainSessionFromLock:
+          reservationModule.reserveRestartAbortedMainSessionFromLock,
+      });
+    });
+  }
+  // Safe mode still converges durable terminal evidence and hydrates admission
+  // barriers. It only suppresses fresh recovery dispatch below.
+  await measureStartup(params.startupTrace, "sidecars.main-run-recovery.reconcile", async () => {
+    const [{ getAgentEventLifecycleGeneration }, recoveryWorkerModule] = await Promise.all([
+      import("../infra/agent-events.js"),
+      loadMainRunRecoveryWorkerModule(),
+    ]);
+    mainRunRecoveryWorkerModule = recoveryWorkerModule;
+    mainRunRecoveryBootId = getAgentEventLifecycleGeneration();
+    await recoveryWorkerModule.reconcileMainRunRecoveryStartup({
+      currentBootId: mainRunRecoveryBootId,
+      ...(params.notifyMainRunRecoveryTerminal
+        ? { notifyTerminal: params.notifyMainRunRecoveryTerminal }
+        : {}),
+    });
   });
   await measureStartup(params.startupTrace, "sidecars.channels", async () => {
-    if (!skipChannels) {
+    if (params.startupWorkSuppression) {
+      params.logChannels.info("skipping channel start (startup work suppression active)");
+    } else if (!skipChannels) {
       try {
         schedulePrimaryModelPrewarm(
           {
@@ -783,7 +823,26 @@ export async function startGatewaySidecars(params: {
       );
     }
   });
-  await params.onChannelsStarted?.();
+  if (!params.startupWorkSuppression) {
+    await params.onChannelsStarted?.();
+  }
+
+  if (
+    !params.startupWorkSuppression &&
+    params.shouldStartPluginServices?.() !== false &&
+    mainRunRecoveryWorkerModule &&
+    mainRunRecoveryBootId
+  ) {
+    mainRunRecoveryWorkerModule.startMainRunRecoveryWorker({
+      cfg: params.cfg,
+      currentBootId: mainRunRecoveryBootId,
+      abortExecution: params.abortMainRunRecoveryExecution,
+      callAgent: params.callMainRunRecoveryAgent,
+      ...(params.notifyMainRunRecoveryTerminal
+        ? { notifyTerminal: params.notifyMainRunRecoveryTerminal }
+        : {}),
+    });
+  }
 
   let pluginServices =
     params.shouldStartPluginServices?.() === false
@@ -870,31 +929,6 @@ export async function startGatewaySidecars(params: {
       return;
     }
     scheduleGatewayMemoryBackend({ cfg: params.cfg, log: params.log, policy });
-  });
-
-  schedulePostReadySidecarTask({
-    startupTrace: params.startupTrace,
-    name: "sidecars.session-locks",
-    log: params.log,
-    run: async (isStopped) => {
-      try {
-        const [{ resolveAgentSessionDirs }, { cleanStaleLockFiles }] = await Promise.all([
-          import("../agents/session-dirs.js"),
-          import("../agents/session-write-lock.js"),
-        ]);
-        const stateDir = resolveStateDir(process.env);
-        const sessionDirs = await resolveAgentSessionDirs(stateDir);
-        await cleanupStaleSessionLocks({
-          sessionDirs,
-          cfg: params.cfg,
-          log: params.log,
-          isStopped,
-          cleanStaleLockFiles,
-        });
-      } catch (err) {
-        params.log.warn(`session lock cleanup failed on startup: ${String(err)}`);
-      }
-    },
   });
 
   schedulePostReadySidecarTask({
@@ -1153,6 +1187,10 @@ export async function startGatewayPostAttachRuntime(
     isClosing?: () => boolean;
     startupTrace?: GatewayStartupTrace;
     sidecarStartup?: GatewaySidecarStartupMode;
+    startupWorkSuppression?: GatewayStartupWorkSuppression;
+    notifyMainRunRecoveryTerminal?: import("../agents/main-run-recovery-worker.js").MainRunRecoveryWorkerOptions["notifyTerminal"];
+    abortMainRunRecoveryExecution: import("../agents/main-run-recovery-worker.js").MainRunRecoveryWorkerOptions["abortExecution"];
+    callMainRunRecoveryAgent: import("../agents/main-run-recovery-worker.js").MainRunRecoveryWorkerOptions["callAgent"];
     providerAuthPrewarm?: {
       enabled?: boolean;
       delayMs?: number;
@@ -1287,6 +1325,12 @@ export async function startGatewayPostAttachRuntime(
             logHooks: params.logHooks,
             logChannels: params.logChannels,
             startupTrace: params.startupTrace,
+            startupWorkSuppression: params.startupWorkSuppression,
+            ...(params.notifyMainRunRecoveryTerminal
+              ? { notifyMainRunRecoveryTerminal: params.notifyMainRunRecoveryTerminal }
+              : {}),
+            abortMainRunRecoveryExecution: params.abortMainRunRecoveryExecution,
+            callMainRunRecoveryAgent: params.callMainRunRecoveryAgent,
             onChannelsStarted: params.onChannelsStarted,
             onPluginServices: reportPluginServices,
             shouldStartPluginServices: () => params.isClosing?.() !== true,
@@ -1310,15 +1354,8 @@ export async function startGatewayPostAttachRuntime(
             loaderStatsAfter.sourceTransformFallbacks - loaderStatsBefore.sourceTransformFallbacks,
           ],
         ]);
-        try {
-          const { scheduleRestartAbortedMainSessionRecovery } =
-            await loadMainSessionRestartRecoveryModule();
-          scheduleRestartAbortedMainSessionRecovery({ cfg: params.cfgAtStart });
-        } catch (err) {
-          params.log.warn(`main-session restart recovery failed to schedule: ${String(err)}`);
-        }
-        // Capture the orphan-recovery cutoff before new startup-gated agent
-        // work can create sessions that the recovery scan must leave alone.
+        // Reconciliation and the sole SQLite worker start before this unlock.
+        // Safe mode leaves durable ownership pending for a later ordinary boot.
         for (const method of STARTUP_UNAVAILABLE_GATEWAY_METHODS) {
           params.unavailableGatewayMethods.delete(method);
         }
@@ -1330,7 +1367,7 @@ export async function startGatewayPostAttachRuntime(
         if (workerEnvironmentSidecar) {
           gatewayLifetimeSidecars.push(workerEnvironmentSidecar);
         }
-        if (params.agentRuntimePluginPrewarm?.enabled !== false) {
+        if (!params.startupWorkSuppression && params.agentRuntimePluginPrewarm?.enabled !== false) {
           gatewayLifetimeSidecars.push(
             scheduleAgentRuntimePluginPrewarm({
               getConfig:
@@ -1344,7 +1381,11 @@ export async function startGatewayPostAttachRuntime(
             }),
           );
         }
-        if (params.providerAuthPrewarm && params.providerAuthPrewarm.enabled !== false) {
+        if (
+          !params.startupWorkSuppression &&
+          params.providerAuthPrewarm &&
+          params.providerAuthPrewarm.enabled !== false
+        ) {
           gatewayLifetimeSidecars.push(
             scheduleProviderAuthStatePrewarm({
               getConfig: params.providerAuthPrewarm.getConfig ?? (() => params.cfgAtStart),

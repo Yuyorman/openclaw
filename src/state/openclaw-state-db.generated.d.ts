@@ -654,6 +654,41 @@ export interface MacosPortGuardianRecords {
   timestamp: number;
 }
 
+export interface MainRunRecoveries {
+  accepted_at_ms: number;
+  agent_id: string;
+  attempt_count: Generated<number>;
+  boot_id: string;
+  cancellation_json: string | null;
+  envelope_json: string | null;
+  execution_epoch: string | null;
+  execution_lifecycle_generation: string | null;
+  execution_run_id: string | null;
+  last_error: string | null;
+  lease_expires_at_ms: number | null;
+  lease_owner: string | null;
+  lifecycle_fences_json: string;
+  next_attempt_at_ms: number | null;
+  owner_principal_json: string | null;
+  prune_after_ms: number | null;
+  public_run_id: string;
+  revision: Generated<number>;
+  sender_is_owner: number;
+  session_id: string;
+  session_key: string;
+  session_key_aliases_json: string;
+  source_fingerprint: string;
+  source_key: string;
+  source_kind: string;
+  state: string;
+  store_path: string;
+  terminal_at_ms: number | null;
+  terminal_evidence_at_ms: number | null;
+  terminal_evidence_json: string | null;
+  terminal_outcome_json: string | null;
+  updated_at_ms: number;
+}
+
 export interface ManagedOutgoingImageRecords {
   alt: string;
   attachment_id: string;
@@ -1170,6 +1205,7 @@ export interface DB {
   gateway_restart_sentinel: GatewayRestartSentinel;
   installed_plugin_index: InstalledPluginIndex;
   macos_port_guardian_records: MacosPortGuardianRecords;
+  main_run_recoveries: MainRunRecoveries;
   managed_outgoing_image_records: ManagedOutgoingImageRecords;
   media_blobs: MediaBlobs;
   migration_runs: MigrationRuns;

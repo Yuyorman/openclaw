@@ -815,6 +815,8 @@ export async function cleanStaleLockFiles(params: {
   removeStale?: boolean;
   nowMs?: number;
   readOwnerProcessArgs?: SessionLockOwnerProcessArgsReader;
+  /** Fail-closed removal gate for callers that must persist recovery evidence first. */
+  beforeRemoveStale?: (lock: Readonly<SessionLockInspection>) => boolean | Promise<boolean>;
   log?: {
     warn?: (message: string) => void;
     info?: (message: string) => void;
@@ -883,7 +885,11 @@ export async function cleanStaleLockFiles(params: {
       removed: false,
     };
 
-    if (removeStale && removable) {
+    const removalApproved =
+      removeStale &&
+      removable &&
+      (params.beforeRemoveStale ? await params.beforeRemoveStale(lockInfo) : true);
+    if (removalApproved) {
       await fs.rm(lockPath, { force: true });
       lockInfo.removed = true;
       cleaned.push(lockInfo);

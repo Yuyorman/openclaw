@@ -680,6 +680,227 @@ CREATE TABLE IF NOT EXISTS gateway_boot_lifecycle (
 CREATE INDEX IF NOT EXISTS idx_gateway_boot_lifecycle_started
   ON gateway_boot_lifecycle(started_at_ms);
 
+CREATE TABLE IF NOT EXISTS main_run_recoveries (
+  public_run_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(public_run_id)) > 0),
+  source_kind TEXT NOT NULL CHECK (source_kind IN ('exact_turn', 'session_resume')),
+  source_key TEXT NOT NULL CHECK (length(trim(source_key)) > 0),
+  source_fingerprint TEXT NOT NULL CHECK (
+    length(source_fingerprint) = 64
+    AND source_fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  state TEXT NOT NULL CHECK (state IN ('accepted', 'transcript_owned', 'running', 'recovery_pending', 'cancelling', 'terminal')),
+  boot_id TEXT NOT NULL CHECK (length(trim(boot_id)) > 0),
+  agent_id TEXT NOT NULL CHECK (length(trim(agent_id)) > 0),
+  owner_principal_json TEXT CHECK (
+    owner_principal_json IS NULL
+    OR (json_valid(owner_principal_json) AND json_type(owner_principal_json) = 'object')
+  ),
+  sender_is_owner INTEGER NOT NULL CHECK (sender_is_owner IN (0, 1)),
+  session_key TEXT NOT NULL CHECK (length(trim(session_key)) > 0),
+  session_key_aliases_json TEXT NOT NULL CHECK (
+    json_valid(session_key_aliases_json) AND json_type(session_key_aliases_json) = 'array'
+  ),
+  session_id TEXT NOT NULL CHECK (length(trim(session_id)) > 0),
+  store_path TEXT NOT NULL CHECK (length(trim(store_path)) > 0),
+  lifecycle_fences_json TEXT NOT NULL CHECK (
+    json_valid(lifecycle_fences_json) AND json_type(lifecycle_fences_json) = 'array'
+  ),
+  envelope_json TEXT CHECK (
+    envelope_json IS NULL
+    OR (
+      json_valid(envelope_json)
+      AND json_type(envelope_json) = 'object'
+      AND json_extract(envelope_json, '$.kind') = source_kind
+    )
+  ),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  next_attempt_at_ms INTEGER CHECK (next_attempt_at_ms IS NULL OR next_attempt_at_ms >= 0),
+  last_error TEXT,
+  lease_owner TEXT,
+  lease_expires_at_ms INTEGER CHECK (lease_expires_at_ms IS NULL OR lease_expires_at_ms >= 0),
+  execution_run_id TEXT,
+  execution_lifecycle_generation TEXT,
+  execution_epoch TEXT,
+  terminal_evidence_json TEXT CHECK (
+    terminal_evidence_json IS NULL
+    OR (
+      json_valid(terminal_evidence_json)
+      AND json_type(terminal_evidence_json) = 'object'
+      AND json_extract(terminal_evidence_json, '$.outcome.status') IN ('done', 'failed', 'timeout', 'killed', 'cancelled')
+      AND json_type(terminal_evidence_json, '$.outcome.endedAtMs') = 'integer'
+      AND json_extract(terminal_evidence_json, '$.outcome.endedAtMs') >= accepted_at_ms
+      AND length(trim(json_extract(terminal_evidence_json, '$.execution.runId'))) > 0
+      AND length(trim(json_extract(terminal_evidence_json, '$.execution.lifecycleGeneration'))) > 0
+      AND length(trim(json_extract(terminal_evidence_json, '$.execution.epoch'))) > 0
+      AND json_remove(terminal_evidence_json, '$.outcome', '$.execution') = '{}'
+    )
+  ),
+  terminal_evidence_at_ms INTEGER CHECK (
+    terminal_evidence_at_ms IS NULL OR terminal_evidence_at_ms >= accepted_at_ms
+  ),
+  cancellation_json TEXT CHECK (
+    cancellation_json IS NULL
+    OR (
+      json_valid(cancellation_json)
+      AND json_type(cancellation_json) = 'object'
+      AND json_extract(cancellation_json, '$.kind') IN ('abort', 'reset', 'delete')
+      AND length(trim(json_extract(cancellation_json, '$.epoch'))) > 0
+      AND json_type(cancellation_json, '$.requestedAtMs') = 'integer'
+      AND json_extract(cancellation_json, '$.requestedAtMs') >= accepted_at_ms
+      AND json_remove(cancellation_json, '$.kind', '$.epoch', '$.requestedAtMs') = '{}'
+    )
+  ),
+  terminal_outcome_json TEXT CHECK (
+    terminal_outcome_json IS NULL
+    OR (
+      json_valid(terminal_outcome_json)
+      AND json_type(terminal_outcome_json) = 'object'
+      AND json_extract(terminal_outcome_json, '$.status') IN ('done', 'failed', 'timeout', 'killed', 'cancelled')
+      AND json_type(terminal_outcome_json, '$.endedAtMs') = 'integer'
+      AND json_extract(terminal_outcome_json, '$.endedAtMs') >= accepted_at_ms
+      AND json_remove(terminal_outcome_json, '$.status', '$.endedAtMs') = '{}'
+    )
+  ),
+  accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= accepted_at_ms),
+  terminal_at_ms INTEGER CHECK (terminal_at_ms IS NULL OR terminal_at_ms >= accepted_at_ms),
+  prune_after_ms INTEGER CHECK (
+    prune_after_ms IS NULL
+    OR (
+      updated_at_ms >= terminal_at_ms
+      AND prune_after_ms = terminal_at_ms + 86400000
+    )
+  ),
+  UNIQUE (source_kind, source_key),
+  CHECK (
+    (lease_owner IS NULL AND lease_expires_at_ms IS NULL)
+    OR (
+      length(trim(lease_owner)) > 0
+      AND lease_expires_at_ms IS NOT NULL
+      AND lease_expires_at_ms > accepted_at_ms
+      AND state IN ('accepted', 'transcript_owned', 'recovery_pending', 'cancelling')
+    )
+  ),
+  CHECK (
+    (state = 'cancelling' AND cancellation_json IS NOT NULL)
+    OR (state <> 'cancelling' AND cancellation_json IS NULL)
+  ),
+  CHECK (
+    (
+      execution_run_id IS NULL
+      AND execution_lifecycle_generation IS NULL
+      AND execution_epoch IS NULL
+    )
+    OR (
+      length(trim(execution_run_id)) > 0
+      AND length(trim(execution_lifecycle_generation)) > 0
+      AND length(trim(execution_epoch)) > 0
+      AND state IN ('running', 'cancelling', 'terminal')
+    )
+  ),
+  CHECK (
+    (terminal_evidence_json IS NULL AND terminal_evidence_at_ms IS NULL)
+    OR (
+      terminal_evidence_json IS NOT NULL
+      AND terminal_evidence_at_ms IS NOT NULL
+      AND json_extract(terminal_evidence_json, '$.outcome.endedAtMs') <= terminal_evidence_at_ms
+      AND json_extract(terminal_evidence_json, '$.execution.runId') = execution_run_id
+      AND json_extract(terminal_evidence_json, '$.execution.lifecycleGeneration') = execution_lifecycle_generation
+      AND json_extract(terminal_evidence_json, '$.execution.epoch') = execution_epoch
+      AND state <> 'terminal'
+    )
+  ),
+  CHECK (
+    (
+      state = 'terminal'
+      AND terminal_outcome_json IS NOT NULL
+      AND terminal_at_ms IS NOT NULL
+      AND json_extract(terminal_outcome_json, '$.endedAtMs') <= terminal_at_ms
+      AND prune_after_ms IS NOT NULL
+      AND envelope_json IS NULL
+      AND terminal_evidence_json IS NULL
+      AND terminal_evidence_at_ms IS NULL
+      AND cancellation_json IS NULL
+    )
+    OR (
+      state <> 'terminal'
+      AND terminal_outcome_json IS NULL
+      AND terminal_at_ms IS NULL
+      AND prune_after_ms IS NULL
+    )
+  ),
+  CHECK (
+    (state IN ('accepted', 'transcript_owned', 'recovery_pending', 'cancelling') AND next_attempt_at_ms IS NOT NULL)
+    OR (
+      state = 'running'
+      AND (
+        (terminal_evidence_json IS NOT NULL AND next_attempt_at_ms IS NOT NULL)
+        OR (terminal_evidence_json IS NULL AND next_attempt_at_ms IS NULL)
+      )
+    )
+    OR (state = 'terminal' AND next_attempt_at_ms IS NULL)
+  ),
+  CHECK (state <> 'terminal' OR (lease_owner IS NULL AND last_error IS NULL)),
+  CHECK (
+    source_kind <> 'exact_turn'
+    OR (
+      (
+        state = 'accepted'
+        AND envelope_json IS NOT NULL
+        AND json_extract(envelope_json, '$.approvedTurn.role') = 'user'
+        AND json_type(envelope_json, '$.approvedTurn.content') = 'text'
+        AND length(trim(json_extract(envelope_json, '$.approvedTurn.idempotencyKey'))) > 0
+        AND json_type(envelope_json, '$.approvedTurn.__openclaw.senderIsOwner') IN ('true', 'false')
+        AND json_extract(envelope_json, '$.approvedTurn.__openclaw.senderIsOwner') = sender_is_owner
+        AND lifecycle_fences_json = '[]'
+      )
+      OR (state <> 'accepted' AND envelope_json IS NULL)
+    )
+  ),
+  CHECK (
+    source_kind <> 'session_resume'
+    OR state = 'terminal'
+    OR (
+      envelope_json IS NOT NULL
+      AND (
+        json_extract(envelope_json, '$.resolution.kind') = 'resume'
+        OR (
+          json_extract(envelope_json, '$.resolution.kind') = 'fail'
+          AND json_extract(envelope_json, '$.resolution.code') IN ('unresumable-tail', 'stale-approval')
+        )
+      )
+    )
+  ),
+  CHECK (
+    source_kind <> 'session_resume'
+    OR (
+      owner_principal_json IS NULL
+      AND sender_is_owner = 0
+    )
+  )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_main_run_recoveries_active_session
+  ON main_run_recoveries(store_path, session_id)
+  WHERE state <> 'terminal';
+
+CREATE INDEX IF NOT EXISTS idx_main_run_recoveries_due
+  ON main_run_recoveries(state, next_attempt_at_ms, terminal_evidence_at_ms, lease_expires_at_ms, accepted_at_ms, public_run_id)
+  WHERE state IN ('accepted', 'transcript_owned', 'running', 'recovery_pending', 'cancelling');
+
+CREATE INDEX IF NOT EXISTS idx_main_run_recoveries_boot
+  ON main_run_recoveries(boot_id, state, accepted_at_ms, public_run_id)
+  WHERE state <> 'terminal';
+
+CREATE INDEX IF NOT EXISTS idx_main_run_recoveries_terminal
+  ON main_run_recoveries(prune_after_ms, public_run_id)
+  WHERE state = 'terminal';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_main_run_recoveries_execution
+  ON main_run_recoveries(execution_run_id, execution_lifecycle_generation, execution_epoch)
+  WHERE execution_run_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS acp_sessions (
   session_key TEXT NOT NULL PRIMARY KEY,
   session_id TEXT,

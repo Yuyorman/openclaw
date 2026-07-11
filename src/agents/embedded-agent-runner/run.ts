@@ -772,6 +772,8 @@ export function runEmbeddedAgent(
       ...internalParamsInput,
       config,
       lifecycleGeneration,
+      publicRunId:
+        paramsInput.executionOwner?.publicRunId ?? paramsInput.publicRunId ?? paramsInput.runId,
     }),
   );
 }
@@ -802,6 +804,7 @@ async function runEmbeddedAgentInternal(
     sessionKey: normalizeOptionalString(effectiveSessionKey ?? runSessionTarget.sessionKey),
     sessionFile: runSessionTarget.sessionFile,
   };
+  const publicRunId = params.publicRunId ?? params.runId;
   const sessionLane = resolveSessionLane(params.sessionKey?.trim() || params.sessionId);
   const globalLane = resolveGlobalLane(params.lane);
   // Outer fallback attempts defer session suspension only while another
@@ -904,6 +907,7 @@ async function runEmbeddedAgentInternal(
       assertAgentHarnessRunAdmission(params);
       claimAgentRunContext(params.runId, {
         ...existingContext,
+        publicRunId: params.publicRunId,
         sessionKey: params.sessionKey ?? existingContext?.sessionKey,
         sessionId: params.sessionId ?? existingContext?.sessionId,
         lifecycleGeneration,
@@ -1100,7 +1104,7 @@ async function runEmbeddedAgentInternal(
           return;
         }
         const message = formatEmbeddedRunStageSummary(
-          `[trace:embedded-run] startup stages: runId=${params.runId} sessionId=${params.sessionId} phase=${phase}`,
+          `[trace:embedded-run] startup stages: runId=${publicRunId} sessionId=${params.sessionId} phase=${phase}`,
           summary,
         );
         if (shouldWarn) {
@@ -1109,7 +1113,8 @@ async function runEmbeddedAgentInternal(
           log.trace(message);
         }
       };
-      params.onExecutionStarted?.({ lifecycleGeneration });
+      await params.executionOwner?.start({ lifecycleGeneration });
+      await params.onExecutionStarted?.({ lifecycleGeneration });
       notifyExecutionPhase("runner_entered");
       const workspaceResolution = resolveRunWorkspaceDir({
         workspaceDir: params.workspaceDir,
@@ -1127,7 +1132,7 @@ async function runEmbeddedAgentInternal(
       const redactedWorkspace = redactRunIdentifier(resolvedWorkspace);
       if (workspaceResolution.usedFallback) {
         log.warn(
-          `[workspace-fallback] caller=runEmbeddedAgent reason=${workspaceResolution.fallbackReason} run=${params.runId} session=${redactedSessionId} sessionKey=${redactedSessionKey} agent=${workspaceResolution.agentId} workspace=${redactedWorkspace}`,
+          `[workspace-fallback] caller=runEmbeddedAgent reason=${workspaceResolution.fallbackReason} run=${publicRunId} session=${redactedSessionId} sessionKey=${redactedSessionKey} agent=${workspaceResolution.agentId} workspace=${redactedWorkspace}`,
         );
       }
       startupStages.mark("workspace");
@@ -1159,7 +1164,7 @@ async function runEmbeddedAgentInternal(
         normalizedSessionKey ?? params.sessionTarget?.sessionKey ?? params.sessionId;
       const hookRunner = getGlobalHookRunner();
       const hookCtx = {
-        runId: params.runId,
+        runId: publicRunId,
         jobId: params.jobId,
         agentId: workspaceResolution.agentId,
         sessionKey: resolvedSessionKey,
@@ -2031,7 +2036,7 @@ async function runEmbeddedAgentInternal(
           reason,
           cfg: params.config,
           agentDir,
-          runId: params.runId,
+          runId: publicRunId,
           modelId: failure.modelId,
         });
       };
@@ -2058,20 +2063,20 @@ async function runEmbeddedAgentInternal(
             if (durationMs >= POST_RUN_AUTH_PROFILE_SUCCESS_SLOW_MS) {
               log.warn(
                 `post-run auth-profile success bookkeeping completed after ${durationMs}ms: ` +
-                  `runId=${params.runId} sessionId=${params.sessionId} ` +
+                  `runId=${publicRunId} sessionId=${params.sessionId} ` +
                   `provider=${sanitizeForLog(successProvider)} profileId=${safeSuccessProfileId}`,
               );
             } else if (log.isEnabled("trace")) {
               log.trace(
                 `post-run auth-profile success bookkeeping completed: ` +
-                  `runId=${params.runId} sessionId=${params.sessionId} durationMs=${durationMs}`,
+                  `runId=${publicRunId} sessionId=${params.sessionId} durationMs=${durationMs}`,
               );
             }
           })
           .catch((err: unknown) => {
             log.warn(
               `post-run auth-profile success bookkeeping failed: ` +
-                `runId=${params.runId} sessionId=${params.sessionId} ` +
+                `runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `provider=${sanitizeForLog(successProvider)} profileId=${safeSuccessProfileId} ` +
                 `error=${formatErrorMessage(err)}`,
             );
@@ -2580,6 +2585,7 @@ async function runEmbeddedAgentInternal(
             timeoutMs: params.timeoutMs,
             runTimeoutOverrideMs: params.runTimeoutOverrideMs,
             runId: params.runId,
+            publicRunId: params.publicRunId,
             lifecycleGeneration,
             abortSignal: attemptAbortController.signal,
             onAttemptTimeoutArmed: pluginHarnessOwnsTransport
@@ -2964,7 +2970,7 @@ async function runEmbeddedAgentInternal(
                   }),
                   onCompactionHookMessages,
                   ...(attempt.promptCache ? { promptCache: attempt.promptCache } : {}),
-                  runId: params.runId,
+                  runId: publicRunId,
                   trigger: "timeout_recovery",
                   diagId: timeoutDiagId,
                   attempt: timeoutCompactionAttempts,
@@ -3183,7 +3189,7 @@ async function runEmbeddedAgentInternal(
                   }),
                   onCompactionHookMessages,
                   ...(attempt.promptCache ? { promptCache: attempt.promptCache } : {}),
-                  runId: params.runId,
+                  runId: publicRunId,
                   trigger: "overflow",
                   ...(overflowTokenCountForCompaction !== undefined
                     ? { currentTokenCount: overflowTokenCountForCompaction }
@@ -3489,7 +3495,7 @@ async function runEmbeddedAgentInternal(
               log.warn(
                 `codex app-server replay-safe failure; retrying once ` +
                   `failureKind=${attempt.codexAppServerFailure?.kind} ` +
-                  `runId=${params.runId} sessionId=${params.sessionId}`,
+                  `runId=${publicRunId} sessionId=${params.sessionId}`,
               );
               continue;
             }
@@ -3648,7 +3654,7 @@ async function runEmbeddedAgentInternal(
             const failedPromptProfileId = lastProfileId;
             const logPromptFailoverDecision = createFailoverDecisionLogger({
               stage: "prompt",
-              runId: params.runId,
+              runId: publicRunId,
               rawError: errorText,
               failoverReason: promptFailoverReason,
               profileFailureReason: promptProfileFailureReason,
@@ -3865,7 +3871,7 @@ async function runEmbeddedAgentInternal(
           const failedAssistantProfileId = lastProfileId;
           const logAssistantFailoverDecision = createFailoverDecisionLogger({
             stage: "assistant",
-            runId: params.runId,
+            runId: publicRunId,
             rawError: attemptAssistant?.errorMessage?.trim(),
             failoverReason: assistantFailoverReason,
             profileFailureReason: assistantProfileFailureReason,
@@ -4088,7 +4094,7 @@ async function runEmbeddedAgentInternal(
             messagingToolSourceReplyPayloads: attempt.messagingToolSourceReplyPayloads,
             sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
             agentId: params.agentId,
-            runId: params.runId,
+            runId: publicRunId,
             runAborted: aborted,
             didSendDeterministicApprovalPrompt: attempt.didSendDeterministicApprovalPrompt,
             heartbeatToolResponse: attempt.heartbeatToolResponse,
@@ -4285,7 +4291,7 @@ async function runEmbeddedAgentInternal(
             reasoningOnlyRetryAttempts += 1;
             reasoningOnlyRetryInstruction = nextReasoningOnlyRetryInstruction;
             log.warn(
-              `reasoning-only assistant turn detected: runId=${params.runId} sessionId=${params.sessionId} ` +
+              `reasoning-only assistant turn detected: runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} — retrying ${reasoningOnlyRetryAttempts}/${maxReasoningOnlyRetryAttempts} ` +
                 `with visible-answer continuation`,
             );
@@ -4307,7 +4313,7 @@ async function runEmbeddedAgentInternal(
           ) {
             missingAssistantRetryAttempts += 1;
             log.warn(
-              `missing assistant terminal message detected: runId=${params.runId} sessionId=${params.sessionId} ` +
+              `missing assistant terminal message detected: runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} — retrying ${missingAssistantRetryAttempts}/${MAX_MISSING_ASSISTANT_RETRIES} with same prompt`,
             );
             continue;
@@ -4320,7 +4326,7 @@ async function runEmbeddedAgentInternal(
             emptyResponseRetryAttempts += 1;
             emptyResponseRetryInstruction = nextEmptyResponseRetryInstruction;
             log.warn(
-              `empty response detected: runId=${params.runId} sessionId=${params.sessionId} ` +
+              `empty response detected: runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} — retrying ${emptyResponseRetryAttempts}/${maxEmptyResponseRetryAttempts} ` +
                 `with visible-answer continuation`,
             );
@@ -4364,7 +4370,7 @@ async function runEmbeddedAgentInternal(
             compactionContinuationRetryAttempts += 1;
             compactionContinuationRetryInstruction = COMPACTION_CONTINUATION_RETRY_INSTRUCTION;
             log.warn(
-              `compaction interrupted visible final answer: runId=${params.runId} sessionId=${params.sessionId} ` +
+              `compaction interrupted visible final answer: runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `compactions=${attemptCompactionCount} — retrying ${compactionContinuationRetryAttempts}/1 with compacted-transcript continuation`,
             );
             postCompactionGuard.armPostCompaction();
@@ -4373,7 +4379,7 @@ async function runEmbeddedAgentInternal(
           compactionContinuationRetryInstruction = null;
           if (reasoningOnlyRetriesExhausted && !finalAssistantVisibleText) {
             log.warn(
-              `reasoning-only retries exhausted: runId=${params.runId} sessionId=${params.sessionId} ` +
+              `reasoning-only retries exhausted: runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} attempts=${reasoningOnlyRetryAttempts}/${maxReasoningOnlyRetryAttempts} — surfacing incomplete-turn error`,
             );
           }
@@ -4449,7 +4455,7 @@ async function runEmbeddedAgentInternal(
             emptyResponseRetryAttempts >= maxEmptyResponseRetryAttempts
           ) {
             log.warn(
-              `empty response retries exhausted: runId=${params.runId} sessionId=${params.sessionId} ` +
+              `empty response retries exhausted: runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} attempts=${emptyResponseRetryAttempts}/${maxEmptyResponseRetryAttempts} — surfacing incomplete-turn error`,
             );
           }
@@ -4470,7 +4476,7 @@ async function runEmbeddedAgentInternal(
               attempt.currentAttemptAssistant?.stopReason ?? attempt.lastAssistant?.stopReason;
             const replayMetadata = resolveAttemptReplayMetadata(attempt);
             log.warn(
-              `incomplete turn detected: runId=${params.runId} sessionId=${params.sessionId} ` +
+              `incomplete turn detected: runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `provider=${activeErrorContext.provider}/${activeErrorContext.model} ` +
                 `stopReason=${incompleteStopReason ?? "missing"} hasLastAssistant=${attempt.lastAssistant ? "yes" : "no"} ` +
                 `hasCurrentAttemptAssistant=${attempt.currentAttemptAssistant ? "yes" : "no"} payloads=${payloadCount} ` +
@@ -4555,14 +4561,14 @@ async function runEmbeddedAgentInternal(
             compactionContinuationRetryInstruction = null;
             log.warn(
               `before_agent_finalize requested one more pass: ` +
-                `runId=${params.runId} sessionId=${params.sessionId} ` +
+                `runId=${publicRunId} sessionId=${params.sessionId} ` +
                 `attempt=${beforeAgentFinalizeRevisionAttempts}/${MAX_BEFORE_AGENT_FINALIZE_REVISIONS}`,
             );
             continue;
           }
 
           log.debug(
-            `embedded run done: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - started} aborted=${aborted}`,
+            `embedded run done: runId=${publicRunId} sessionId=${params.sessionId} durationMs=${Date.now() - started} aborted=${aborted}`,
           );
           markAuthProfileSuccessAfterRun();
           const successfulProfileId = lastProfileId;
@@ -4757,7 +4763,7 @@ async function runEmbeddedAgentInternal(
         forgetPromptBuildDrainCacheForRun(params.runId);
         stopRuntimeAuthRefreshTimer();
         await runAgentCleanupStep({
-          runId: params.runId,
+          runId: publicRunId,
           sessionId: params.sessionId,
           step: "context-engine-dispose",
           log,
@@ -4767,7 +4773,7 @@ async function runEmbeddedAgentInternal(
         });
         if (params.cleanupBundleMcpOnRunEnd === true) {
           await runAgentCleanupStep({
-            runId: params.runId,
+            runId: publicRunId,
             sessionId: params.sessionId,
             step: "bundle-mcp-retire",
             log,

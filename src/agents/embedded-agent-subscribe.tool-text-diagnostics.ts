@@ -80,7 +80,7 @@ export function warnIfAssistantEmittedToolText(
   ctx.log.warn(
     "Assistant reply looks like a tool call, but no structured tool invocation was emitted; treating it as text.",
     {
-      runId: ctx.params.runId,
+      runId: ctx.params.publicRunId ?? ctx.params.runId,
       ...(sessionId ? { sessionId } : {}),
       ...(provider ? { provider } : {}),
       ...(model ? { model } : {}),

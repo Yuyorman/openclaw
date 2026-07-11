@@ -52,7 +52,6 @@ const transcriptReaderNames = new Set([
 const storageSpecificTranscriptReaderAliasNames = new Set(["readSessionMessagesFromFileAsync"]);
 
 export const migratedSessionTranscriptReaderFiles = new Set([
-  "src/agents/main-session-restart-recovery.ts",
   "src/agents/subagent-announce-output.test.ts",
   "src/agents/subagent-announce-output.ts",
   "src/agents/subagent-announce.runtime.ts",

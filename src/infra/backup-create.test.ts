@@ -14,6 +14,7 @@ import {
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { withRealpathSymlinkRebindRace } from "../test-utils/symlink-rebind-race.js";
 import {
   testApi as backupCreateInternals,
   buildExtensionsNodeModulesFilter,
@@ -70,6 +71,89 @@ async function listArchiveEntryDetails(
     },
   });
   return entries;
+}
+
+const BACKUP_MAIN_RUN_RECOVERY_STATES = [
+  "accepted",
+  "transcript_owned",
+  "running",
+  "recovery_pending",
+  "cancelling",
+  "terminal",
+] as const;
+
+type BackupMainRunRecoveryState = (typeof BACKUP_MAIN_RUN_RECOVERY_STATES)[number];
+
+function insertMainRunRecoveryFixture(params: {
+  db: ReturnType<typeof openOpenClawStateDatabase>["db"];
+  runId: string;
+  state?: BackupMainRunRecoveryState;
+  storePath: string;
+}): void {
+  const state = params.state ?? "recovery_pending";
+  const terminalAtMs = state === "terminal" ? 20 : null;
+  const envelope =
+    state === "terminal"
+      ? null
+      : JSON.stringify({
+          kind: "session_resume",
+          resolution: { kind: "resume" },
+          systemMessage: "resume fixture",
+          transcriptTail: null,
+          lifecycleRevision: null,
+          delivery: { context: null, runId: null, intentId: null },
+          fences: [],
+        });
+  params.db
+    .prepare(
+      `
+        INSERT INTO main_run_recoveries (
+          public_run_id, source_kind, source_key, source_fingerprint, state,
+          boot_id, agent_id, owner_principal_json, sender_is_owner,
+          session_key, session_key_aliases_json, session_id, store_path,
+          lifecycle_fences_json, envelope_json, next_attempt_at_ms, cancellation_json,
+          terminal_outcome_json, accepted_at_ms, updated_at_ms, terminal_at_ms, prune_after_ms
+        ) VALUES (
+          ?, 'session_resume', ?, ?, ?,
+          'boot-1', 'main', NULL, 0,
+          ?, '[]', ?, ?,
+          '[]', ?, ?, ?,
+          ?, 10, ?, ?, ?
+        )
+      `,
+    )
+    .run(
+      params.runId,
+      `source:${params.runId}`,
+      "0".repeat(64),
+      state,
+      `agent:main:dashboard:${params.runId}`,
+      `session-${params.runId}`,
+      params.storePath,
+      envelope,
+      state === "accepted" ||
+        state === "transcript_owned" ||
+        state === "recovery_pending" ||
+        state === "cancelling"
+        ? 10
+        : null,
+      state === "cancelling"
+        ? JSON.stringify({ kind: "abort", epoch: `cancel:${params.runId}`, requestedAtMs: 10 })
+        : null,
+      state === "terminal" ? JSON.stringify({ status: "done", endedAtMs: 20 }) : null,
+      terminalAtMs ?? 10,
+      terminalAtMs,
+      terminalAtMs === null ? null : terminalAtMs + 86_400_000,
+    );
+}
+
+function isFileHandleRead(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "fd" in value &&
+    typeof (value as { fd?: unknown }).fd === "number"
+  );
 }
 
 describe("formatBackupCreateSummary", () => {
@@ -552,7 +636,7 @@ describe("createBackupArchive", () => {
     );
   });
 
-  it("scrubs transient SQLite delivery queue rows from archive snapshots", async () => {
+  it("scrubs transient SQLite runtime rows from archive snapshots", async () => {
     await withOpenClawTestState(
       {
         layout: "state-only",
@@ -562,8 +646,11 @@ describe("createBackupArchive", () => {
       async (state) => {
         const outputDir = state.path("backups");
         const extractDir = state.path("extract");
+        const sessionStorePath = state.statePath("agents", "main", "sessions", "sessions.json");
         await fs.mkdir(outputDir, { recursive: true });
         await fs.mkdir(extractDir, { recursive: true });
+        await fs.mkdir(path.dirname(sessionStorePath), { recursive: true });
+        await fs.writeFile(sessionStorePath, "{}\n", "utf8");
         const { db } = openOpenClawStateDatabase({ env: state.env });
         db.prepare(
           `
@@ -572,6 +659,20 @@ describe("createBackupArchive", () => {
             ) VALUES ('outbound', 'queued-1', 'pending', 0, '{"id":"queued-1"}', 10, 10)
           `,
         ).run();
+        for (const recoveryState of BACKUP_MAIN_RUN_RECOVERY_STATES) {
+          insertMainRunRecoveryFixture({
+            db,
+            runId: `run-${recoveryState}`,
+            state: recoveryState,
+            storePath: sessionStorePath,
+          });
+        }
+        const sourceRecoveryRows = db
+          .prepare("SELECT * FROM main_run_recoveries ORDER BY public_run_id")
+          .all();
+        expect(
+          sourceRecoveryRows.map((row) => (row as { state: string }).state).toSorted(),
+        ).toEqual([...BACKUP_MAIN_RUN_RECOVERY_STATES].toSorted());
 
         try {
           const result = await createBackupArchive({
@@ -597,6 +698,9 @@ describe("createBackupArchive", () => {
             expect(
               archivedDb.prepare("SELECT COUNT(*) AS count FROM delivery_queue_entries").get(),
             ).toEqual({ count: 0 });
+            expect(
+              archivedDb.prepare("SELECT COUNT(*) AS count FROM main_run_recoveries").get(),
+            ).toEqual({ count: 0 });
           } finally {
             archivedDb.close();
           }
@@ -604,7 +708,729 @@ describe("createBackupArchive", () => {
           expect(db.prepare("SELECT COUNT(*) AS count FROM delivery_queue_entries").get()).toEqual({
             count: 1,
           });
+          expect(
+            db.prepare("SELECT * FROM main_run_recoveries ORDER BY public_run_id").all(),
+          ).toEqual(sourceRecoveryRows);
         } finally {
+          closeOpenClawStateDatabase();
+        }
+      },
+    );
+  });
+
+  it("terminalizes every resumable session in a staged store", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-restart-session-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("backups");
+        const extractDir = state.path("extract");
+        const storePath = state.statePath("agents", "main", "sessions", "sessions.json");
+        const unreferencedStorePath = state.statePath(
+          "agents",
+          "new-agent",
+          "sessions",
+          "sessions.json",
+        );
+        const nowMs = Date.UTC(2026, 4, 9, 8, 45, 0);
+        const sourceStore = {
+          "agent:main:dashboard:active": {
+            sessionId: "session-active",
+            status: "running",
+            startedAt: nowMs - 1_000,
+            updatedAt: nowMs - 100,
+            abortedLastRun: true,
+            restartRecoveryRuns: [{ runId: "run-active", lifecycleGeneration: "boot-1" }],
+            pendingFinalDelivery: true,
+            pendingFinalDeliveryText: "stale reply",
+            pendingFinalDeliveryContext: { channel: "webchat", to: "dashboard" },
+            pendingFinalDeliveryIntentId: "intent-active",
+            keep: "session metadata",
+          },
+          "agent:main:dashboard:rotated": {
+            sessionId: "session-rotated-after-sqlite-snapshot",
+            status: "running",
+            startedAt: nowMs + 500,
+            updatedAt: nowMs + 750,
+            abortedLastRun: true,
+            restartRecoveryRuns: [{ runId: "run-rotated", lifecycleGeneration: "boot-2" }],
+            pendingFinalDelivery: true,
+            pendingFinalDeliveryText: "rotated stale reply",
+            keep: "rotated session metadata",
+          },
+          "agent:main:dashboard:recovery-only": {
+            sessionId: "session-recovery-only-after-sqlite-snapshot",
+            status: "done",
+            updatedAt: nowMs - 25,
+            abortedLastRun: true,
+            restartRecoveryRuns: [{ runId: "run-recovery-only", lifecycleGeneration: "boot-2" }],
+            pendingFinalDelivery: true,
+            pendingFinalDeliveryText: "recovery-only stale reply",
+            keep: "recovery-only session metadata",
+          },
+          "agent:main:dashboard:completed": {
+            sessionId: "session-completed",
+            status: "done",
+            updatedAt: nowMs - 2_000,
+            keep: "unrelated session",
+          },
+        };
+        const unreferencedSourceStore = {
+          "agent:new-agent:dashboard:active": {
+            sessionId: "session-in-store-absent-from-sqlite-snapshot",
+            status: "running",
+            startedAt: nowMs - 400,
+            updatedAt: nowMs - 40,
+            abortedLastRun: true,
+            restartRecoveryRuns: [
+              { runId: "run-in-store-absent-from-sqlite", lifecycleGeneration: "boot-2" },
+            ],
+            pendingFinalDelivery: true,
+            pendingFinalDeliveryText: "different-store stale reply",
+            keep: "different-store session metadata",
+          },
+        };
+        await fs.mkdir(outputDir, { recursive: true });
+        await fs.mkdir(extractDir, { recursive: true });
+        await state.writeJson("agents/main/sessions/sessions.json", sourceStore);
+        await state.writeJson("agents/new-agent/sessions/sessions.json", unreferencedSourceStore);
+        const { db } = openOpenClawStateDatabase({ env: state.env });
+        insertMainRunRecoveryFixture({ db, runId: "run-active", storePath });
+
+        try {
+          const result = await createBackupArchive({
+            output: outputDir,
+            includeWorkspace: false,
+            nowMs,
+          });
+          const entries = await listArchiveEntries(result.archivePath);
+          const archivedStoreEntries = entries.filter((entry) =>
+            entry.endsWith("/state/agents/main/sessions/sessions.json"),
+          );
+          const archivedUnreferencedStoreEntries = entries.filter((entry) =>
+            entry.endsWith("/state/agents/new-agent/sessions/sessions.json"),
+          );
+          expect(archivedStoreEntries).toHaveLength(1);
+          expect(archivedUnreferencedStoreEntries).toHaveLength(1);
+          const archivedStoreEntry = archivedStoreEntries[0];
+          const archivedUnreferencedStoreEntry = archivedUnreferencedStoreEntries[0];
+          expect(archivedStoreEntry).toBeDefined();
+          expect(archivedUnreferencedStoreEntry).toBeDefined();
+
+          await tar.x({ file: result.archivePath, gzip: true, cwd: extractDir });
+          const archivedStore = JSON.parse(
+            await fs.readFile(path.join(extractDir, archivedStoreEntry!), "utf8"),
+          ) as Record<string, Record<string, unknown>>;
+          expect(archivedStore["agent:main:dashboard:active"]).toEqual({
+            sessionId: "session-active",
+            status: "killed",
+            startedAt: nowMs - 1_000,
+            endedAt: nowMs,
+            updatedAt: nowMs,
+            abortedLastRun: false,
+            keep: "session metadata",
+          });
+          expect(archivedStore["agent:main:dashboard:rotated"]).toEqual({
+            sessionId: "session-rotated-after-sqlite-snapshot",
+            status: "killed",
+            startedAt: nowMs + 500,
+            endedAt: nowMs + 750,
+            updatedAt: nowMs + 750,
+            abortedLastRun: false,
+            keep: "rotated session metadata",
+          });
+          expect(archivedStore["agent:main:dashboard:recovery-only"]).toEqual({
+            sessionId: "session-recovery-only-after-sqlite-snapshot",
+            status: "done",
+            updatedAt: nowMs - 25,
+            abortedLastRun: false,
+            keep: "recovery-only session metadata",
+          });
+          expect(archivedStore["agent:main:dashboard:completed"]).toEqual(
+            sourceStore["agent:main:dashboard:completed"],
+          );
+          const archivedUnreferencedStore = JSON.parse(
+            await fs.readFile(path.join(extractDir, archivedUnreferencedStoreEntry!), "utf8"),
+          ) as Record<string, Record<string, unknown>>;
+          expect(archivedUnreferencedStore["agent:new-agent:dashboard:active"]).toEqual({
+            sessionId: "session-in-store-absent-from-sqlite-snapshot",
+            status: "killed",
+            startedAt: nowMs - 400,
+            endedAt: nowMs,
+            updatedAt: nowMs,
+            abortedLastRun: false,
+            keep: "different-store session metadata",
+          });
+          expect(JSON.parse(await fs.readFile(storePath, "utf8"))).toEqual(sourceStore);
+          expect(JSON.parse(await fs.readFile(unreferencedStorePath, "utf8"))).toEqual(
+            unreferencedSourceStore,
+          );
+        } finally {
+          closeOpenClawStateDatabase();
+        }
+      },
+    );
+  });
+
+  it("ignores invalid configured session stores while sanitizing discovered stores", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-invalid-session-store-config-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("backups");
+        const extractDir = state.path("extract");
+        const nowMs = Date.UTC(2026, 4, 9, 8, 46, 0);
+        await fs.mkdir(outputDir, { recursive: true });
+        await fs.mkdir(extractDir, { recursive: true });
+        await state.writeConfig({ session: { store: 42 } });
+        await state.writeJson("agents/main/sessions/sessions.json", {
+          "agent:main:dashboard:active": {
+            sessionId: "discovered-session",
+            status: "running",
+            startedAt: nowMs - 100,
+            updatedAt: nowMs - 50,
+            restartRecoveryRuns: [{ runId: "run-discovered", lifecycleGeneration: "boot-1" }],
+          },
+        });
+
+        const result = await createBackupArchive({
+          output: outputDir,
+          includeWorkspace: false,
+          nowMs,
+        });
+        const entries = await listArchiveEntries(result.archivePath);
+        const archivedStoreEntry = entries.find((entry) =>
+          entry.endsWith("/state/agents/main/sessions/sessions.json"),
+        );
+        expect(archivedStoreEntry).toBeDefined();
+
+        await tar.x({ file: result.archivePath, gzip: true, cwd: extractDir });
+        const archivedStore = JSON.parse(
+          await fs.readFile(path.join(extractDir, archivedStoreEntry!), "utf8"),
+        ) as Record<string, Record<string, unknown>>;
+        expect(archivedStore["agent:main:dashboard:active"]).toMatchObject({
+          sessionId: "discovered-session",
+          status: "killed",
+          endedAt: nowMs,
+          updatedAt: nowMs,
+        });
+      },
+    );
+  });
+
+  it("sanitizes a valid custom session store from otherwise invalid config", async () => {
+    const externalRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), "openclaw-backup-invalid-config-custom-store-"),
+    );
+    try {
+      await withOpenClawTestState(
+        {
+          layout: "state-only",
+          prefix: "openclaw-backup-invalid-config-custom-store-state-",
+          scenario: "minimal",
+          env: { OPENCLAW_OAUTH_DIR: externalRoot },
+        },
+        async (state) => {
+          const outputDir = state.path("backups");
+          const extractDir = state.path("extract");
+          const storeTemplate = path.join(
+            externalRoot,
+            "agents",
+            "{agentId}",
+            "sessions",
+            "sessions.json",
+          );
+          const storePath = path.join(externalRoot, "agents", "ops", "sessions", "sessions.json");
+          const nowMs = Date.UTC(2026, 4, 9, 8, 46, 30);
+          const sourceStore = {
+            "agent:ops:dashboard:active": {
+              sessionId: "custom-store-session",
+              status: "running",
+              startedAt: nowMs - 100,
+              updatedAt: nowMs - 50,
+              abortedLastRun: true,
+              restartRecoveryRuns: [{ runId: "run-custom", lifecycleGeneration: "boot-1" }],
+            },
+          };
+          await fs.mkdir(outputDir, { recursive: true });
+          await fs.mkdir(extractDir, { recursive: true });
+          await fs.mkdir(path.dirname(storePath), { recursive: true });
+          await fs.writeFile(storePath, `${JSON.stringify(sourceStore, null, 2)}\n`, "utf8");
+          await state.writeConfig({
+            gateway: { port: "invalid" },
+            agents: { list: [{ id: "ops", default: true }] },
+            session: { store: storeTemplate },
+          });
+
+          const result = await createBackupArchive({
+            output: outputDir,
+            includeWorkspace: false,
+            nowMs,
+          });
+          const entries = await listArchiveEntries(result.archivePath);
+          const archivedStoreEntries = entries.filter((entry) =>
+            entry.endsWith("/agents/ops/sessions/sessions.json"),
+          );
+          expect(archivedStoreEntries).toHaveLength(1);
+
+          await tar.x({ file: result.archivePath, gzip: true, cwd: extractDir });
+          const archivedStore = JSON.parse(
+            await fs.readFile(path.join(extractDir, archivedStoreEntries[0]!), "utf8"),
+          ) as Record<string, Record<string, unknown>>;
+          expect(archivedStore["agent:ops:dashboard:active"]).toEqual({
+            sessionId: "custom-store-session",
+            status: "killed",
+            startedAt: nowMs - 100,
+            endedAt: nowMs,
+            updatedAt: nowMs,
+            abortedLastRun: false,
+          });
+          expect(JSON.parse(await fs.readFile(storePath, "utf8"))).toEqual(sourceStore);
+        },
+      );
+    } finally {
+      await fs.rm(externalRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects configured session stores that escape through symlinked parents", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-symlinked-session-parent-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("backups");
+        const externalDir = state.path("external-session-store");
+        const linkedDir = state.statePath("linked-session-store");
+        const linkedStorePath = path.join(linkedDir, "sessions.json");
+        await fs.mkdir(outputDir, { recursive: true });
+        await fs.mkdir(externalDir, { recursive: true });
+        await fs.writeFile(
+          path.join(externalDir, "sessions.json"),
+          `${JSON.stringify({
+            "agent:main:dashboard:active": {
+              sessionId: "external-session",
+              status: "running",
+              marker: "must-not-enter-backup",
+            },
+          })}\n`,
+          "utf8",
+        );
+        await fs.symlink(externalDir, linkedDir);
+        await state.writeConfig({ session: { store: linkedStorePath } });
+
+        await expect(
+          createBackupArchive({
+            output: outputDir,
+            includeWorkspace: false,
+            nowMs: Date.UTC(2026, 4, 9, 8, 47, 0),
+          }),
+        ).rejects.toThrow(/Session store is outside the backup assets/);
+        expect(await fs.readdir(outputDir)).toEqual([]);
+        expect(await fs.readFile(path.join(externalDir, "sessions.json"), "utf8")).toContain(
+          "must-not-enter-backup",
+        );
+      },
+    );
+  });
+
+  it("rejects a session store parent that escapes after canonicalization", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-session-rebind-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("backups");
+        const sessionSlot = state.statePath("session-slot");
+        const storePath = path.join(sessionSlot, "sessions.json");
+        const externalDir = state.path("external-session-store");
+        await fs.mkdir(outputDir, { recursive: true });
+        await fs.mkdir(sessionSlot, { recursive: true });
+        await fs.mkdir(externalDir, { recursive: true });
+        await fs.writeFile(
+          storePath,
+          `${JSON.stringify({
+            "agent:main:dashboard:completed": {
+              sessionId: "safe-session",
+              status: "done",
+            },
+          })}\n`,
+          "utf8",
+        );
+        await fs.writeFile(
+          path.join(externalDir, "sessions.json"),
+          `${JSON.stringify({
+            "agent:main:dashboard:active": {
+              sessionId: "external-session",
+              status: "running",
+              marker: "must-not-enter-backup",
+            },
+          })}\n`,
+          "utf8",
+        );
+        await state.writeConfig({ session: { store: storePath } });
+
+        await withRealpathSymlinkRebindRace({
+          shouldFlip: (realpathInput) => path.resolve(realpathInput) === storePath,
+          symlinkPath: sessionSlot,
+          symlinkTarget: externalDir,
+          timing: "after-realpath",
+          run: async () => {
+            await expect(
+              createBackupArchive({
+                output: outputDir,
+                includeWorkspace: false,
+                nowMs: Date.UTC(2026, 4, 9, 8, 47, 30),
+              }),
+            ).rejects.toThrow(/Session store cannot be snapshotted for backup/);
+          },
+        });
+        expect(await fs.readdir(outputDir)).toEqual([]);
+        expect(await fs.readFile(path.join(externalDir, "sessions.json"), "utf8")).toContain(
+          "must-not-enter-backup",
+        );
+      },
+    );
+  });
+
+  it("sanitizes a configured state session store reached through a symlink alias", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-session-store-alias-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("backups");
+        const extractDir = state.path("extract");
+        const stateAlias = state.path("state-alias");
+        const storePath = state.statePath("custom-sessions.json");
+        const aliasedStorePath = path.join(stateAlias, "custom-sessions.json");
+        const nowMs = Date.UTC(2026, 4, 9, 8, 48, 0);
+        const sourceStore = {
+          "agent:main:dashboard:active": {
+            sessionId: "session-through-state-alias",
+            status: "running",
+            startedAt: nowMs - 1_000,
+            updatedAt: nowMs - 100,
+            abortedLastRun: true,
+            restartRecoveryRuns: [{ runId: "run-alias", lifecycleGeneration: "boot-1" }],
+            pendingFinalDelivery: true,
+            pendingFinalDeliveryText: "stale reply",
+            keep: "session metadata",
+          },
+        };
+        await fs.mkdir(outputDir, { recursive: true });
+        await fs.mkdir(extractDir, { recursive: true });
+        await fs.writeFile(storePath, `${JSON.stringify(sourceStore, null, 2)}\n`, "utf8");
+        await fs.symlink(state.stateDir, stateAlias);
+        await state.writeConfig({ session: { store: aliasedStorePath } });
+        const { db } = openOpenClawStateDatabase({ env: state.env });
+        insertMainRunRecoveryFixture({ db, runId: "run-alias", storePath: aliasedStorePath });
+
+        try {
+          const result = await createBackupArchive({
+            output: outputDir,
+            includeWorkspace: false,
+            nowMs,
+          });
+          const entries = await listArchiveEntries(result.archivePath);
+          const archivedStoreEntries = entries.filter((entry) =>
+            entry.endsWith("/state/custom-sessions.json"),
+          );
+          expect(archivedStoreEntries).toHaveLength(1);
+
+          await tar.x({ file: result.archivePath, gzip: true, cwd: extractDir });
+          const archivedStore = JSON.parse(
+            await fs.readFile(path.join(extractDir, archivedStoreEntries[0]!), "utf8"),
+          ) as Record<string, Record<string, unknown>>;
+          expect(archivedStore["agent:main:dashboard:active"]).toEqual({
+            sessionId: "session-through-state-alias",
+            status: "killed",
+            startedAt: nowMs - 1_000,
+            endedAt: nowMs,
+            updatedAt: nowMs,
+            abortedLastRun: false,
+            keep: "session metadata",
+          });
+          expect(JSON.parse(await fs.readFile(storePath, "utf8"))).toEqual(sourceStore);
+        } finally {
+          closeOpenClawStateDatabase();
+        }
+      },
+    );
+  });
+
+  it("rejects a late agent store under a configured external template root", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-late-template-session-store-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("backups");
+        const agentStoresRoot = path.join(state.workspaceDir, "session-roots", "agents");
+        const storePath = path.join(agentStoresRoot, "main", "sessions", "sessions.json");
+        const lateStorePath = path.join(agentStoresRoot, "late-agent", "sessions", "sessions.json");
+        const nowMs = Date.UTC(2026, 4, 9, 8, 49, 0);
+        const lateSourceStore = {
+          "agent:late-agent:dashboard:active": {
+            sessionId: "late-external-template-session",
+            status: "running",
+            startedAt: nowMs - 100,
+            updatedAt: nowMs - 10,
+            abortedLastRun: true,
+            restartRecoveryRuns: [{ runId: "run-late-template", lifecycleGeneration: "boot-2" }],
+          },
+        };
+        await fs.mkdir(outputDir, { recursive: true });
+        await fs.mkdir(path.dirname(storePath), { recursive: true });
+        await fs.writeFile(
+          storePath,
+          `${JSON.stringify({
+            "agent:main:dashboard:completed": {
+              sessionId: "session-main",
+              status: "done",
+              updatedAt: nowMs - 1_000,
+            },
+          })}\n`,
+          "utf8",
+        );
+        await state.writeConfig({
+          agents: {
+            list: [{ id: "main", default: true, workspace: state.workspaceDir }],
+          },
+          session: {
+            store: path.join(
+              state.workspaceDir,
+              "session-roots",
+              "agents",
+              "{agentId}",
+              "sessions",
+              "sessions.json",
+            ),
+          },
+        });
+        openOpenClawStateDatabase({ env: state.env });
+
+        const originalReadFile = fs.readFile.bind(fs);
+        let injectedLateStore = false;
+        const readFileSpy = vi.spyOn(fs, "readFile").mockImplementation((async (...args) => {
+          const result = await originalReadFile(...args);
+          const filePath = args[0];
+          if (
+            !injectedLateStore &&
+            ((typeof filePath === "string" && path.resolve(filePath) === path.resolve(storePath)) ||
+              isFileHandleRead(filePath))
+          ) {
+            injectedLateStore = true;
+            await fs.mkdir(path.dirname(lateStorePath), { recursive: true });
+            await fs.writeFile(lateStorePath, `${JSON.stringify(lateSourceStore)}\n`, "utf8");
+          }
+          return result;
+        }) as typeof fs.readFile);
+
+        try {
+          await expect(
+            createBackupArchive({
+              output: outputDir,
+              includeWorkspace: true,
+              nowMs,
+            }),
+          ).rejects.toThrow(/Session store appeared after snapshot discovery/);
+          expect(injectedLateStore).toBe(true);
+          expect(await fs.readdir(outputDir)).toEqual([]);
+          expect(JSON.parse(await originalReadFile(lateStorePath, "utf8"))).toEqual(
+            lateSourceStore,
+          );
+        } finally {
+          readFileSpy.mockRestore();
+          closeOpenClawStateDatabase();
+        }
+      },
+    );
+  });
+
+  it("sanitizes restart state when an ancestor workspace covers the state root", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-covered-state-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-backup-output-"));
+        const extractDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-backup-extract-"));
+        const storePath = state.statePath("agents", "main", "sessions", "sessions.json");
+        const nowMs = Date.UTC(2026, 4, 9, 8, 49, 30);
+        const sourceStore = {
+          "agent:main:dashboard:active": {
+            sessionId: "session-under-covered-state",
+            status: "running",
+            startedAt: nowMs - 1_000,
+            updatedAt: nowMs - 100,
+            abortedLastRun: true,
+            restartRecoveryRuns: [{ runId: "run-covered-state", lifecycleGeneration: "boot-1" }],
+            pendingFinalDelivery: true,
+            pendingFinalDeliveryText: "stale reply",
+            keep: "session metadata",
+          },
+        };
+        await state.writeConfig({
+          agents: {
+            list: [{ id: "main", default: true, workspace: state.root }],
+          },
+        });
+        await state.writeJson("agents/main/sessions/sessions.json", sourceStore);
+        const { db } = openOpenClawStateDatabase({ env: state.env });
+        insertMainRunRecoveryFixture({ db, runId: "run-covered-state", storePath });
+
+        try {
+          const result = await createBackupArchive({
+            output: outputDir,
+            includeWorkspace: true,
+            nowMs,
+          });
+          expect(result.assets.some((asset) => asset.kind === "state")).toBe(false);
+          expect(
+            result.assets.some(
+              (asset) =>
+                asset.kind === "workspace" && path.resolve(asset.sourcePath) === state.root,
+            ),
+          ).toBe(true);
+          const entries = await listArchiveEntries(result.archivePath);
+          const archivedDbEntry = entries.find((entry) =>
+            entry.endsWith("/state/state/openclaw.sqlite"),
+          );
+          const archivedStoreEntry = entries.find((entry) =>
+            entry.endsWith("/state/agents/main/sessions/sessions.json"),
+          );
+          expect(archivedDbEntry).toBeDefined();
+          expect(archivedStoreEntry).toBeDefined();
+
+          await tar.x({ file: result.archivePath, gzip: true, cwd: extractDir });
+          const sqlite = requireNodeSqlite();
+          const archivedDb = new sqlite.DatabaseSync(path.join(extractDir, archivedDbEntry!), {
+            readOnly: true,
+          });
+          try {
+            expect(
+              archivedDb.prepare("SELECT COUNT(*) AS count FROM main_run_recoveries").get(),
+            ).toEqual({ count: 0 });
+          } finally {
+            archivedDb.close();
+          }
+          const archivedStore = JSON.parse(
+            await fs.readFile(path.join(extractDir, archivedStoreEntry!), "utf8"),
+          ) as Record<string, Record<string, unknown>>;
+          expect(archivedStore["agent:main:dashboard:active"]).toEqual({
+            sessionId: "session-under-covered-state",
+            status: "killed",
+            startedAt: nowMs - 1_000,
+            endedAt: nowMs,
+            updatedAt: nowMs,
+            abortedLastRun: false,
+            keep: "session metadata",
+          });
+          expect(db.prepare("SELECT COUNT(*) AS count FROM main_run_recoveries").get()).toEqual({
+            count: 1,
+          });
+          expect(JSON.parse(await fs.readFile(storePath, "utf8"))).toEqual(sourceStore);
+        } finally {
+          closeOpenClawStateDatabase();
+          await fs.rm(outputDir, { recursive: true, force: true });
+          await fs.rm(extractDir, { recursive: true, force: true });
+        }
+      },
+    );
+  });
+
+  it("rejects a new agent session store that appears after store discovery", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-late-session-store-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("backups");
+        const storePath = state.statePath("agents", "main", "sessions", "sessions.json");
+        const lateStorePath = state.statePath("agents", "late-agent", "sessions", "sessions.json");
+        const nowMs = Date.UTC(2026, 4, 9, 8, 50, 0);
+        const lateSourceStore = {
+          "agent:late-agent:dashboard:active": {
+            sessionId: "session-created-after-store-discovery",
+            status: "running",
+            startedAt: nowMs - 100,
+            updatedAt: nowMs - 10,
+            abortedLastRun: true,
+            restartRecoveryRuns: [{ runId: "run-late", lifecycleGeneration: "boot-2" }],
+          },
+        };
+        await fs.mkdir(outputDir, { recursive: true });
+        await state.writeJson("agents/main/sessions/sessions.json", {
+          "agent:main:dashboard:completed": {
+            sessionId: "session-main",
+            status: "done",
+            updatedAt: nowMs - 1_000,
+          },
+        });
+        openOpenClawStateDatabase({ env: state.env });
+
+        const originalReadFile = fs.readFile.bind(fs);
+        let injectedLateStore = false;
+        const readFileSpy = vi.spyOn(fs, "readFile").mockImplementation((async (...args) => {
+          const result = await originalReadFile(...args);
+          const filePath = args[0];
+          if (
+            !injectedLateStore &&
+            ((typeof filePath === "string" && path.resolve(filePath) === path.resolve(storePath)) ||
+              isFileHandleRead(filePath))
+          ) {
+            injectedLateStore = true;
+            await state.writeJson("agents/late-agent/sessions/sessions.json", lateSourceStore);
+          }
+          return result;
+        }) as typeof fs.readFile);
+
+        try {
+          await expect(
+            createBackupArchive({
+              output: outputDir,
+              includeWorkspace: false,
+              nowMs,
+            }),
+          ).rejects.toThrow(/Session store appeared after snapshot discovery/);
+          expect(injectedLateStore).toBe(true);
+          expect(await fs.readdir(outputDir)).toEqual([]);
+          expect(JSON.parse(await originalReadFile(lateStorePath, "utf8"))).toEqual(
+            lateSourceStore,
+          );
+        } finally {
+          readFileSpy.mockRestore();
           closeOpenClawStateDatabase();
         }
       },

@@ -30,8 +30,8 @@ const log = createSubsystemLogger("audit/events");
 let persistenceFailureWarned = false;
 
 export type AgentEventAuditRecorder = {
-  record: (event: AgentEventPayload) => void;
-  recordTool: (event: TrustedToolExecutionEvent) => void;
+  record: (event: AgentEventPayload, projection?: AuditRunProjection) => void;
+  recordTool: (event: TrustedToolExecutionEvent, projection?: AuditRunProjection) => void;
   stop: () => Promise<void>;
 };
 
@@ -57,17 +57,6 @@ function auditToolCallId(value: unknown): string | undefined {
   // Call ids remain useful for correlation, but their provider-owned bytes
   // are not operator metadata and must never enter the ledger verbatim.
   return `sha256:${createHash("sha256").update(toolCallId).digest("hex")}`;
-}
-
-function legacyAuditSourceId(params: {
-  runId: string;
-  sourceSequence: number;
-  occurredAt: number;
-  action: string;
-}): string {
-  // Preserve the original store-owned identity byte-for-byte so replayed
-  // run/tool events still deduplicate after the versioned contract refactor.
-  return `${params.runId}:${params.sourceSequence}:${params.occurredAt}:${params.action}`;
 }
 
 function rememberRunProvenance(
@@ -180,25 +169,48 @@ type AgentAuditProjection = {
   terminal?: { outcome: AgentRunTerminalOutcome; phase: "end" | "error" };
 };
 
-function projectAgentEvent(event: AgentEventPayload): AgentAuditProjection | undefined {
-  const runId = nonEmptyString(event.runId);
+/** Public run identity applied only to durable operator-facing audit metadata. */
+export type AuditRunProjection = { runId: string };
+
+function auditSourceId(parts: readonly (number | string | undefined)[]): string {
+  const hash = createHash("sha256");
+  for (const part of parts) {
+    const value = part === undefined ? "" : String(part);
+    hash.update(String(Buffer.byteLength(value)));
+    hash.update(":");
+    hash.update(value);
+    hash.update(";");
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+function projectAgentEvent(
+  event: AgentEventPayload,
+  projection?: AuditRunProjection,
+): AgentAuditProjection | undefined {
+  const sourceRunId = nonEmptyString(event.runId);
+  const runId = nonEmptyString(projection?.runId) ?? sourceRunId;
   const phase = nonEmptyString(event.data.phase);
-  if (!runId || !phase) {
+  if (!sourceRunId || !runId || !phase) {
     return undefined;
   }
-  const provenance = resolveProvenance(runId, event);
+  const provenance = resolveProvenance(sourceRunId, event);
+  const sourceId = auditSourceId([
+    "agent",
+    sourceRunId,
+    event.lifecycleGeneration,
+    event.seq,
+    event.ts,
+    event.stream,
+    phase,
+  ]);
   if (event.stream === "lifecycle" && phase === "start") {
-    rememberRunProvenance(runId, provenance);
+    rememberRunProvenance(sourceRunId, provenance);
     const occurredAt = asDateTimestampMs(event.data.startedAt) ?? event.ts;
     const action = "agent.run.started" as const;
     return {
       input: {
-        sourceId: legacyAuditSourceId({
-          runId,
-          sourceSequence: event.seq,
-          occurredAt,
-          action,
-        }),
+        sourceId,
         sourceSequence: event.seq,
         occurredAt,
         kind: "agent_run",
@@ -214,18 +226,13 @@ function projectAgentEvent(event: AgentEventPayload): AgentAuditProjection | und
     };
   }
   if (event.stream === "lifecycle" && (phase === "end" || phase === "error")) {
-    rememberRunProvenance(runId, provenance);
+    rememberRunProvenance(sourceRunId, provenance);
     const { outcome, ...terminal } = classifyRunTerminal(event.data, phase);
     const occurredAt = asDateTimestampMs(event.data.endedAt) ?? event.ts;
     const action = "agent.run.finished" as const;
     return {
       input: {
-        sourceId: legacyAuditSourceId({
-          runId,
-          sourceSequence: event.seq,
-          occurredAt,
-          action,
-        }),
+        sourceId,
         sourceSequence: event.seq,
         occurredAt,
         kind: "agent_run",
@@ -245,13 +252,17 @@ function projectAgentEvent(event: AgentEventPayload): AgentAuditProjection | und
 }
 
 /** Return a metadata-only audit input for supported run lifecycle events. */
-export function projectAgentEventToAudit(event: AgentEventPayload): AuditEventInput | undefined {
-  return projectAgentEvent(event)?.input;
+export function projectAgentEventToAudit(
+  event: AgentEventPayload,
+  projection?: AuditRunProjection,
+): AuditEventInput | undefined {
+  return projectAgentEvent(event, projection)?.input;
 }
 
 /** Project the complete trusted tool-execution lifecycle without private diagnostic content. */
 export function projectToolExecutionEventToAudit(
   event: TrustedToolExecutionEvent,
+  projection?: AuditRunProjection,
 ): ToolActionAuditEventInput | undefined {
   // Schema quarantine describes tool availability before invocation. Without
   // a call identity it must not become a durable tool-action claim.
@@ -262,14 +273,23 @@ export function projectToolExecutionEventToAudit(
   ) {
     return undefined;
   }
-  const runId = nonEmptyString(event.runId);
+  const sourceRunId = nonEmptyString(event.runId);
+  const runId = nonEmptyString(projection?.runId) ?? sourceRunId;
   const toolName = auditToolName(event.toolName);
-  if (!runId || !toolName) {
+  if (!sourceRunId || !runId || !toolName) {
     return undefined;
   }
   const toolCallId = auditToolCallId(event.toolCallId);
-  const provenance = resolveToolProvenance(runId, event);
+  const provenance = resolveToolProvenance(sourceRunId, event);
   const occurredAt = asDateTimestampMs(event.sourceTimestampMs) ?? event.ts;
+  const sourceId = auditSourceId([
+    "tool",
+    sourceRunId,
+    event.seq,
+    event.ts,
+    event.type,
+    event.toolCallId,
+  ]);
   const attribution = {
     sourceSequence: event.seq,
     occurredAt,
@@ -286,12 +306,7 @@ export function projectToolExecutionEventToAudit(
   if (event.type === "tool.execution.started") {
     const action = "tool.action.started" as const;
     return {
-      sourceId: legacyAuditSourceId({
-        runId,
-        sourceSequence: event.seq,
-        occurredAt,
-        action,
-      }),
+      sourceId,
       ...attribution,
       action,
       status: "started",
@@ -332,12 +347,7 @@ export function projectToolExecutionEventToAudit(
               : { status: "failed" as const, errorCode: "tool_failed" as const };
   const action = "tool.action.finished" as const;
   return {
-    sourceId: legacyAuditSourceId({
-      runId,
-      sourceSequence: event.seq,
-      occurredAt,
-      action,
-    }),
+    sourceId,
     ...attribution,
     action,
     ...terminal,
@@ -433,13 +443,13 @@ export function createAgentEventAuditRecorder(options?: {
   };
 
   return {
-    record: (event) => {
-      const projection = projectAgentEvent(event);
-      if (!projection) {
+    record: (event, runProjection) => {
+      const auditProjection = projectAgentEvent(event, runProjection);
+      if (!auditProjection) {
         return;
       }
       const runInstance = `${event.lifecycleGeneration ?? "unknown"}\0${event.runId}`;
-      if (!projection.terminal) {
+      if (!auditProjection.terminal) {
         const alreadyOpen = openRunInstances.has(runInstance);
         clearPending(runInstance);
         settledRunInstances.delete(runInstance);
@@ -449,26 +459,29 @@ export function createAgentEventAuditRecorder(options?: {
         // Retry starts cancel a provisional terminal for the same logical run.
         // Keep the original start so one run cannot acquire unmatched starts.
         openRunInstances.add(runInstance);
-        writer.record(projection.input);
+        writer.record(auditProjection.input);
         return;
       }
       if (settledRunInstances.has(runInstance)) {
         return;
       }
       if (
-        projection.terminal.outcome.reason === "completed" &&
+        auditProjection.terminal.outcome.reason === "completed" &&
         !pendingTerminals.has(runInstance)
       ) {
         openRunInstances.delete(runInstance);
-        if (writer.record(projection.input)) {
+        if (writer.record(auditProjection.input)) {
           rememberSettled(runInstance);
         }
         return;
       }
-      scheduleTerminal(runInstance, { input: projection.input, ...projection.terminal });
+      scheduleTerminal(runInstance, {
+        input: auditProjection.input,
+        ...auditProjection.terminal,
+      });
     },
-    recordTool: (event) => {
-      const input = projectToolExecutionEventToAudit(event);
+    recordTool: (event, runProjection) => {
+      const input = projectToolExecutionEventToAudit(event, runProjection);
       if (input) {
         writer.record(input);
       }

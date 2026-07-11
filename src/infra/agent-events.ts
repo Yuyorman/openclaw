@@ -117,6 +117,8 @@ export type AgentEventPayload = {
   data: Record<string, unknown>;
   /** Internal, non-enumerable gateway lifecycle generation that owns this run. */
   lifecycleGeneration?: string;
+  /** Internal, non-enumerable operator identity for public boundary projection. */
+  publicRunId?: string;
   sessionKey?: string;
   /**
    * sessionId the run was bound to when it started. Lifecycle persistence uses
@@ -129,6 +131,8 @@ export type AgentEventPayload = {
 
 /** Per-run metadata used to stamp events and gate Control UI visibility. */
 export type AgentRunContext = {
+  /** Stable operator identity; differs from runId only for private recovery attempts. */
+  publicRunId?: string;
   sessionKey?: string;
   /** Resolved agent owner, including for unscoped session keys. */
   agentId?: string;
@@ -244,6 +248,11 @@ export function registerAgentRunContext(runId: string, context: AgentRunContext)
   }
   if (context.sessionKey && existing.sessionKey !== context.sessionKey) {
     existing.sessionKey = context.sessionKey;
+  }
+  // Public identity is immutable within one lifecycle. Later registrations may
+  // fill a missing value but cannot relabel an already admitted execution.
+  if (context.publicRunId && !existing.publicRunId) {
+    existing.publicRunId = context.publicRunId;
   }
   if (context.sessionId && existing.sessionId !== context.sessionId) {
     existing.sessionId = context.sessionId;
@@ -464,6 +473,7 @@ function enrichAgentEvent(
       ? (ownedLifecycleGeneration ?? state.lifecycleGeneration)
       : ownedLifecycleGeneration;
   const agentId = event.agentId ?? context?.agentId;
+  const publicRunId = context?.publicRunId?.trim() || event.publicRunId?.trim() || event.runId;
   const enriched: AgentEventPayload = {
     ...event,
     sessionKey,
@@ -480,7 +490,19 @@ function enrichAgentEvent(
       enumerable: false,
     });
   }
+  Object.defineProperty(enriched, "publicRunId", {
+    value: publicRunId,
+    enumerable: false,
+  });
   return enriched;
+}
+
+/** Copies an internal event into the stable operator/plugin identity domain. */
+export function projectAgentEventForPublicBoundary(event: AgentEventPayload): AgentEventPayload {
+  return {
+    ...event,
+    runId: event.publicRunId?.trim() || event.runId,
+  };
 }
 
 /** Emits an agent event after assigning per-run sequence, timestamp, and context metadata. */

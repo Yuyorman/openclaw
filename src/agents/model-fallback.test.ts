@@ -32,6 +32,7 @@ import { MissingAgentHarnessError } from "./harness/errors.js";
 import { clearAgentHarnesses, registerAgentHarness } from "./harness/registry.js";
 import type { AgentHarness } from "./harness/types.js";
 import { LiveSessionModelSwitchError } from "./live-model-switch-error.js";
+import { MainRunRecoveryOwnershipLostError } from "./main-run-recovery-errors.js";
 import {
   FallbackSummaryError,
   testing,
@@ -3181,6 +3182,31 @@ describe("runWithModelFallback", () => {
     ).rejects.toThrow("agent run aborted for restart");
 
     expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fall back after main-run recovery ownership is lost", async () => {
+    const cfg = makeCfg();
+    const ownershipLost = new MainRunRecoveryOwnershipLostError();
+    const run = vi
+      .fn()
+      .mockRejectedValueOnce(ownershipLost)
+      .mockResolvedValueOnce("fallback should not run");
+
+    await expect(
+      runWithModelFallback({
+        cfg,
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        run,
+      }),
+    ).rejects.toBe(ownershipLost);
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(
+      testing.shouldDiscardDeferredSessionSuspension({
+        error: ownershipLost,
+      }),
+    ).toBe(true);
   });
 
   it("does not fall back on direct active-run aborts without an aborted signal", async () => {

@@ -16,13 +16,23 @@ import {
   resolveBackupPlanFromDisk,
 } from "../commands/backup-shared.js";
 import { isPathWithin } from "../commands/cleanup-utils.js";
+import { readConfigFileSnapshot } from "../config/config.js";
+import { resolveAgentsDirFromSessionStorePath } from "../config/sessions/paths.js";
+import {
+  resolveAllAgentSessionStoreTargetsSync,
+  resolveSessionStoreTargets,
+} from "../config/sessions/targets.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { resolveHomeDir, resolveUserPath } from "../utils.js";
 import { sleep } from "../utils/sleep.js";
 import { resolveRuntimeServiceVersion } from "../version.js";
 import { isVolatileBackupPath } from "./backup-volatile-filter.js";
+import { root as openFsSafeRoot } from "./fs-safe.js";
 import { writeJson } from "./json-files.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
 import { requireNodeSqlite } from "./node-sqlite.js";
 
 const loadTarRuntime = createLazyRuntimeModule(() => import("tar"));
@@ -531,6 +541,19 @@ type SqliteBackupAsset = {
 type StateSqliteBackupPlan = {
   snapshots: SqliteBackupAsset[];
   discoveredSourcePaths: Set<string>;
+  restartRecoveryStorePaths: string[];
+};
+
+type SessionStoreBackupAsset = {
+  sourcePath: string;
+  archiveSourcePath: string;
+  skippedSourcePaths: Set<string>;
+};
+
+type SessionStoreBackupPlan = {
+  snapshots: SessionStoreBackupAsset[];
+  guardedAgentStoreRoots: Set<string>;
+  guardedSourcePaths: Set<string>;
 };
 
 const SQLITE_BACKUP_SOURCE_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
@@ -602,11 +625,358 @@ function tableExistsSql(db: DatabaseSync, tableName: string): boolean {
   return row?.ok === 1;
 }
 
-function sanitizeGlobalStateSqliteSnapshot(db: DatabaseSync): void {
+type BackupSanitizationDatabase = Pick<
+  OpenClawStateKyselyDatabase,
+  "delivery_queue_entries" | "main_run_recoveries"
+>;
+
+function sanitizeGlobalStateSqliteSnapshot(db: DatabaseSync): string[] {
+  let changed = false;
+  let restartRecoveryStorePaths: string[] = [];
+  const snapshotDb = getNodeSqliteKysely<BackupSanitizationDatabase>(db);
   if (tableExistsSql(db, "delivery_queue_entries")) {
-    db.prepare("DELETE FROM delivery_queue_entries").run();
+    executeSqliteQuerySync(db, snapshotDb.deleteFrom("delivery_queue_entries"));
+    changed = true;
+  }
+  // A restored backup must never replay work that belonged to the live process.
+  if (tableExistsSql(db, "main_run_recoveries")) {
+    restartRecoveryStorePaths = executeSqliteQuerySync(
+      db,
+      snapshotDb.selectFrom("main_run_recoveries").select("store_path").distinct(),
+    ).rows.map((row) => row.store_path);
+    executeSqliteQuerySync(db, snapshotDb.deleteFrom("main_run_recoveries"));
+    changed = true;
+  }
+  if (changed) {
     db.exec("VACUUM;");
   }
+  return restartRecoveryStorePaths;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+type SessionStoreDiscoveryAgentConfig = NonNullable<
+  NonNullable<OpenClawConfig["agents"]>["list"]
+>[number];
+
+function projectInvalidSessionStoreDiscoveryConfig(rawConfig: unknown): OpenClawConfig {
+  if (!isJsonObject(rawConfig)) {
+    return {};
+  }
+
+  // An unrelated invalid field must not hide configured stores from backup
+  // sanitization. Only structurally checked discovery inputs cross this seam.
+  const projected: OpenClawConfig = {};
+  const rawSession = rawConfig.session;
+  if (isJsonObject(rawSession) && typeof rawSession.store === "string") {
+    projected.session = { store: rawSession.store };
+  }
+
+  const rawAgents = rawConfig.agents;
+  if (isJsonObject(rawAgents) && Array.isArray(rawAgents.list)) {
+    const list = rawAgents.list.flatMap((rawAgent): SessionStoreDiscoveryAgentConfig[] => {
+      if (!isJsonObject(rawAgent) || typeof rawAgent.id !== "string") {
+        return [];
+      }
+      const agent: SessionStoreDiscoveryAgentConfig = { id: rawAgent.id };
+      if (typeof rawAgent.default === "boolean") {
+        agent.default = rawAgent.default;
+      }
+      const rawRuntime = rawAgent.runtime;
+      const rawRuntimeAcp = isJsonObject(rawRuntime) ? rawRuntime.acp : undefined;
+      if (
+        isJsonObject(rawRuntime) &&
+        rawRuntime.type === "acp" &&
+        isJsonObject(rawRuntimeAcp) &&
+        typeof rawRuntimeAcp.agent === "string"
+      ) {
+        agent.runtime = { type: "acp", acp: { agent: rawRuntimeAcp.agent } };
+      }
+      return [agent];
+    });
+    if (list.length > 0) {
+      projected.agents = { list };
+    }
+  }
+
+  const rawAcp = rawConfig.acp;
+  if (isJsonObject(rawAcp)) {
+    const defaultAgent = typeof rawAcp.defaultAgent === "string" ? rawAcp.defaultAgent : undefined;
+    const allowedAgents = Array.isArray(rawAcp.allowedAgents)
+      ? rawAcp.allowedAgents.filter((value): value is string => typeof value === "string")
+      : undefined;
+    if (defaultAgent !== undefined || allowedAgents !== undefined) {
+      projected.acp = {
+        ...(defaultAgent !== undefined ? { defaultAgent } : {}),
+        ...(allowedAgents !== undefined ? { allowedAgents } : {}),
+      };
+    }
+  }
+
+  return projected;
+}
+
+function isCanonicalStateSessionStorePath(sourcePath: string, stateDir: string): boolean {
+  const relativePath = path.relative(path.resolve(stateDir), path.resolve(sourcePath));
+  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+    return false;
+  }
+  const parts = relativePath.split(path.sep);
+  return (
+    (parts.length === 2 && parts[0] === "sessions" && parts[1] === "sessions.json") ||
+    (parts.length === 4 &&
+      parts[0] === "agents" &&
+      Boolean(parts[1]) &&
+      parts[2] === "sessions" &&
+      parts[3] === "sessions.json")
+  );
+}
+
+async function listStateSessionStoreCandidatePaths(stateDir: string): Promise<string[]> {
+  const candidates = new Set<string>([path.join(stateDir, "sessions", "sessions.json")]);
+  const agentsDir = path.join(stateDir, "agents");
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(agentsDir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return [...candidates];
+    }
+    throw err;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      candidates.add(path.join(agentsDir, entry.name, "sessions", "sessions.json"));
+    }
+  }
+  return [...candidates];
+}
+
+function findCoveringBackupAsset(
+  sourcePath: string,
+  assets: readonly BackupAsset[],
+): BackupAsset | undefined {
+  return assets.find((asset) => isPathWithin(sourcePath, asset.sourcePath));
+}
+
+async function canonicalizeBackupStorePath(targetPath: string): Promise<string> {
+  const resolved = path.resolve(targetPath);
+  const suffix: string[] = [];
+  let probe = resolved;
+
+  while (true) {
+    try {
+      const realProbe = await fs.realpath(probe);
+      return suffix.length === 0 ? realProbe : path.join(realProbe, ...suffix.toReversed());
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw err;
+      }
+      const parent = path.dirname(probe);
+      if (parent === probe) {
+        throw err;
+      }
+      suffix.push(path.basename(probe));
+      probe = parent;
+    }
+  }
+}
+
+function isAgentSessionStorePathWithinRoots(
+  sourcePath: string,
+  agentStoreRoots: ReadonlySet<string>,
+): boolean {
+  for (const root of agentStoreRoots) {
+    const relativePath = path.relative(root, sourcePath);
+    if (
+      relativePath === ".." ||
+      relativePath.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relativePath)
+    ) {
+      continue;
+    }
+    const parts = relativePath.split(path.sep);
+    if (
+      parts.length === 3 &&
+      Boolean(parts[0]) &&
+      parts[1] === "sessions" &&
+      parts[2] === "sessions.json"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function sanitizeSessionEntryForBackup(entry: Record<string, unknown>, nowMs: number): void {
+  const hasRestartState =
+    entry.status === "running" ||
+    entry.abortedLastRun === true ||
+    (Array.isArray(entry.restartRecoveryRuns) && entry.restartRecoveryRuns.length > 0);
+  if (!hasRestartState) {
+    return;
+  }
+  if (entry.status === "running") {
+    // The store can advance after backup starts; never synthesize a terminal
+    // event before lifecycle timestamps already present in the captured row.
+    const terminalAtMs = Math.max(
+      nowMs,
+      resolveDateTimestampMs(entry.startedAt, nowMs),
+      resolveDateTimestampMs(entry.updatedAt, nowMs),
+    );
+    entry.status = "killed";
+    entry.endedAt = terminalAtMs;
+    entry.updatedAt = terminalAtMs;
+  }
+  entry.abortedLastRun = false;
+  for (const field of [
+    "restartRecoveryRuns",
+    "restartRecoveryDeliveryContext",
+    "restartRecoveryDeliveryRunId",
+    "pendingFinalDelivery",
+    "pendingFinalDeliveryText",
+    "pendingFinalDeliveryCreatedAt",
+    "pendingFinalDeliveryLastAttemptAt",
+    "pendingFinalDeliveryAttemptCount",
+    "pendingFinalDeliveryLastError",
+    "pendingFinalDeliveryContext",
+    "pendingFinalDeliveryIntentId",
+  ]) {
+    delete entry[field];
+  }
+}
+
+async function createSessionStoreBackupPlan(params: {
+  recoveryStorePaths: string[];
+  agentStoreRootPaths: string[];
+  candidateStorePaths: string[];
+  backupAssets: readonly BackupAsset[];
+  nowMs: number;
+  tempDir: string;
+}): Promise<SessionStoreBackupPlan> {
+  const rawStorePaths = [...params.recoveryStorePaths, ...params.candidateStorePaths];
+  for (const rawStorePath of new Set(rawStorePaths.map((entry) => path.resolve(entry)))) {
+    let rawStoreStat: import("node:fs").Stats;
+    try {
+      rawStoreStat = await fs.lstat(rawStorePath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        continue;
+      }
+      throw err;
+    }
+    if (rawStoreStat.isSymbolicLink()) {
+      throw new Error(`Session store symlinks are not supported for backup: ${rawStorePath}`);
+    }
+  }
+  const canonicalPaths = new Map<string, string>();
+  const canonicalize = async (rawPath: string): Promise<string> => {
+    const resolved = path.resolve(rawPath);
+    const cached = canonicalPaths.get(resolved);
+    if (cached) {
+      return cached;
+    }
+    const canonical = await canonicalizeBackupStorePath(resolved);
+    canonicalPaths.set(resolved, canonical);
+    return canonical;
+  };
+  const recoveryStorePaths = new Set<string>();
+  for (const rawStorePath of params.recoveryStorePaths) {
+    recoveryStorePaths.add(await canonicalize(rawStorePath));
+  }
+  const guardedSourcePaths = new Set<string>();
+  const backupRootByStorePath = new Map<string, string>();
+  for (const rawStorePath of rawStorePaths) {
+    const storePath = await canonicalize(rawStorePath);
+    const coveringAsset = findCoveringBackupAsset(storePath, params.backupAssets);
+    if (!coveringAsset) {
+      throw new Error(
+        `Session store is outside the backup assets: ${storePath}. Include its containing workspace or move the store under the OpenClaw state directory before retrying.`,
+      );
+    }
+    guardedSourcePaths.add(storePath);
+    backupRootByStorePath.set(storePath, coveringAsset.sourcePath);
+  }
+
+  const rawAgentStoreRoots = new Set(params.agentStoreRootPaths);
+  for (const rawStorePath of rawStorePaths) {
+    const agentsDir = resolveAgentsDirFromSessionStorePath(rawStorePath);
+    if (agentsDir) {
+      rawAgentStoreRoots.add(agentsDir);
+    }
+  }
+  const guardedAgentStoreRoots = new Set<string>();
+  for (const rawRootPath of rawAgentStoreRoots) {
+    const rootPath = await canonicalizeBackupStorePath(rawRootPath);
+    if (!findCoveringBackupAsset(rootPath, params.backupAssets)) {
+      throw new Error(
+        `Session store root is outside the backup assets: ${rootPath}. Include its containing workspace or move the store under the OpenClaw state directory before retrying.`,
+      );
+    }
+    guardedAgentStoreRoots.add(rootPath);
+  }
+
+  const snapshots: SessionStoreBackupAsset[] = [];
+  for (const storePath of guardedSourcePaths) {
+    let parsed: unknown = {};
+    try {
+      const backupRootPath = backupRootByStorePath.get(storePath);
+      if (!backupRootPath) {
+        throw new Error(`Missing backup root for session store: ${storePath}`);
+      }
+      const backupRoot = await openFsSafeRoot(backupRootPath, {
+        hardlinks: "allow",
+        symlinks: "follow-within-root",
+      });
+      const relativeStorePath = path.relative(backupRoot.rootReal, storePath);
+      const opened = await backupRoot.open(relativeStorePath, {
+        hardlinks: "allow",
+        symlinks: "follow-within-root",
+      });
+      try {
+        if (path.resolve(opened.realPath) !== storePath) {
+          throw new Error(`Session store path changed during backup: ${storePath}`);
+        }
+        parsed = JSON.parse(await fs.readFile(opened.handle, "utf8")) as unknown;
+      } finally {
+        await opened.handle.close().catch(() => undefined);
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR" || code === "not-found") {
+        if (!recoveryStorePaths.has(storePath)) {
+          continue;
+        }
+      } else {
+        throw new Error(`Session store cannot be snapshotted for backup: ${storePath}`, {
+          cause: err,
+        });
+      }
+    }
+    if (!isJsonObject(parsed)) {
+      throw new Error(`Session store must contain a JSON object for backup: ${storePath}`);
+    }
+    // Sanitize the whole staged store: session rotation can add a new running
+    // entry after the SQLite snapshot, and restore must not replay that orphan.
+    for (const entry of Object.values(parsed)) {
+      if (!isJsonObject(entry)) {
+        continue;
+      }
+      sanitizeSessionEntryForBackup(entry, params.nowMs);
+    }
+    const sourcePath = path.join(params.tempDir, `openclaw-session-store-${snapshots.length}.json`);
+    await writeJson(sourcePath, parsed, { mode: 0o600, trailingNewline: true });
+    snapshots.push({
+      sourcePath,
+      archiveSourcePath: storePath,
+      skippedSourcePaths: new Set([storePath]),
+    });
+  }
+  return { snapshots, guardedAgentStoreRoots, guardedSourcePaths };
 }
 
 async function listStateSqlitePaths(params: {
@@ -710,6 +1080,7 @@ async function createStateSqliteBackupPlan(params: {
   });
   const sqlite = requireNodeSqlite();
   const snapshots: SqliteBackupAsset[] = [];
+  const restartRecoveryStorePaths: string[] = [];
   for (const archiveSourcePath of discovery.snapshotPaths) {
     // A discovered *.sqlite file that SQLite cannot snapshot aborts backup.
     // Raw-copying malformed or unreadable databases would restore unsafe state.
@@ -738,7 +1109,7 @@ async function createStateSqliteBackupPlan(params: {
     if (path.resolve(archiveSourcePath) === globalStateSqlitePath) {
       const snapshot = new sqlite.DatabaseSync(sourcePath);
       try {
-        sanitizeGlobalStateSqliteSnapshot(snapshot);
+        restartRecoveryStorePaths.push(...sanitizeGlobalStateSqliteSnapshot(snapshot));
       } finally {
         snapshot.close();
       }
@@ -753,7 +1124,11 @@ async function createStateSqliteBackupPlan(params: {
       ),
     });
   }
-  return { snapshots, discoveredSourcePaths: discovery.discoveredSourcePaths };
+  return {
+    snapshots,
+    discoveredSourcePaths: discovery.discoveredSourcePaths,
+    restartRecoveryStorePaths,
+  };
 }
 
 export async function createBackupArchive(
@@ -818,20 +1193,73 @@ export async function createBackupArchive(
   const manifestPath = path.join(tempDir, "manifest.json");
   const tempArchivePath = buildTempArchivePath(outputPath);
   const tempArchiveCleanupPaths = resolveBackupTarAttemptTempPaths(tempArchivePath);
-  const stateAsset = result.assets.find((asset) => asset.kind === "state");
   try {
-    const stateSqliteBackup = stateAsset
+    const stateWasPlanned =
+      result.assets.some((asset) => asset.kind === "state") ||
+      result.skipped.some((asset) => asset.kind === "state" && asset.reason === "covered");
+    const candidateStateRootPath = onlyConfig
+      ? undefined
+      : await canonicalizeBackupStorePath(plan.stateDir);
+    const stateCoverageAsset = candidateStateRootPath
+      ? findCoveringBackupAsset(candidateStateRootPath, result.assets)
+      : undefined;
+    if (stateWasPlanned && candidateStateRootPath && !stateCoverageAsset) {
+      throw new Error(
+        `Backup state root is not covered by an archive asset: ${candidateStateRootPath}`,
+      );
+    }
+    const stateRootPath = stateCoverageAsset ? candidateStateRootPath : undefined;
+    const stateSqliteBackup = stateRootPath
       ? await createStateSqliteBackupPlan({
-          stateDir: stateAsset.sourcePath,
+          stateDir: stateRootPath,
           tempDir,
         })
-      : { snapshots: [], discoveredSourcePaths: new Set<string>() };
+      : {
+          snapshots: [],
+          discoveredSourcePaths: new Set<string>(),
+          restartRecoveryStorePaths: [],
+        };
+    const sessionConfigSnapshot = stateRootPath
+      ? await readConfigFileSnapshot({ observe: false, skipPluginValidation: true })
+      : undefined;
+    const sessionConfig = sessionConfigSnapshot
+      ? sessionConfigSnapshot.valid
+        ? sessionConfigSnapshot.config
+        : projectInvalidSessionStoreDiscoveryConfig(sessionConfigSnapshot.config)
+      : undefined;
+    const sessionEnv = stateRootPath
+      ? {
+          ...process.env,
+          OPENCLAW_STATE_DIR: stateRootPath,
+        }
+      : undefined;
+    const sessionStoreTargets =
+      sessionConfig && sessionEnv
+        ? [
+            ...resolveSessionStoreTargets(sessionConfig, { allAgents: true }, { env: sessionEnv }),
+            ...resolveAllAgentSessionStoreTargetsSync(sessionConfig, { env: sessionEnv }),
+          ]
+        : [];
+    const sessionStoreCandidatePaths = stateRootPath
+      ? [
+          ...(await listStateSessionStoreCandidatePaths(stateRootPath)),
+          ...sessionStoreTargets.map((target) => target.storePath),
+        ]
+      : [];
+    const sessionStoreBackup = await createSessionStoreBackupPlan({
+      recoveryStorePaths: stateSqliteBackup.restartRecoveryStorePaths,
+      agentStoreRootPaths: stateRootPath ? [path.join(stateRootPath, "agents")] : [],
+      candidateStorePaths: sessionStoreCandidatePaths,
+      backupAssets: result.assets,
+      nowMs,
+      tempDir,
+    });
     const sourcePathRemaps = new Map<string, string>();
-    const skippedSqliteSourcePaths = new Set<string>();
-    for (const snapshot of stateSqliteBackup.snapshots) {
+    const skippedSnapshotSourcePaths = new Set<string>();
+    for (const snapshot of [...stateSqliteBackup.snapshots, ...sessionStoreBackup.snapshots]) {
       sourcePathRemaps.set(path.resolve(snapshot.sourcePath), snapshot.archiveSourcePath);
       for (const skippedSourcePath of snapshot.skippedSourcePaths) {
-        skippedSqliteSourcePaths.add(skippedSourcePath);
+        skippedSnapshotSourcePaths.add(skippedSourcePath);
       }
     }
     const manifest = buildManifest({
@@ -849,14 +1277,15 @@ export async function createBackupArchive(
     await writeJson(manifestPath, manifest, { trailingNewline: true });
 
     const tar = await loadTarRuntime();
-    const extensionsFilter = stateAsset
-      ? buildExtensionsNodeModulesFilter(stateAsset.sourcePath)
+    const extensionsFilter = stateRootPath
+      ? buildExtensionsNodeModulesFilter(stateRootPath)
       : undefined;
-    const volatilePlan = { stateDirs: [stateAsset?.sourcePath ?? plan.stateDir] };
+    const volatilePlan = { stateDirs: [stateRootPath ?? plan.stateDir] };
     let skippedVolatileCount = 0;
     // node-tar invokes filters from async stat callbacks, so throwing inside
-    // the filter is uncaught. Omit unexpected SQLite and reject after tar settles.
+    // the filter is uncaught. Omit late state stores and reject after tar settles.
     const unexpectedSqliteSourcePaths: string[] = [];
+    const unexpectedSessionStoreSourcePaths: string[] = [];
     const tarFilter = (
       entryPath: string,
       entryStat: import("node:fs").Stats | import("tar").ReadEntry,
@@ -870,13 +1299,26 @@ export async function createBackupArchive(
       if (extensionsFilter && !extensionsFilter(entryPath)) {
         return false;
       }
-      const sqliteSourceKind = stateAsset
-        ? classifyStateSqliteBackupSourcePath(resolvedEntryPath, stateAsset.sourcePath)
+      const sqliteSourceKind = stateRootPath
+        ? classifyStateSqliteBackupSourcePath(resolvedEntryPath, stateRootPath)
         : undefined;
       if (sqliteSourceKind === "excluded") {
         return false;
       }
-      if (skippedSqliteSourcePaths.has(resolvedEntryPath)) {
+      if (skippedSnapshotSourcePaths.has(resolvedEntryPath)) {
+        return false;
+      }
+      const isRawSessionStore =
+        sessionStoreBackup.guardedSourcePaths.has(resolvedEntryPath) ||
+        isAgentSessionStorePathWithinRoots(
+          resolvedEntryPath,
+          sessionStoreBackup.guardedAgentStoreRoots,
+        ) ||
+        Boolean(
+          stateRootPath && isCanonicalStateSessionStorePath(resolvedEntryPath, stateRootPath),
+        );
+      if (isRawSessionStore) {
+        unexpectedSessionStoreSourcePaths.push(entryPath);
         return false;
       }
       if (
@@ -904,6 +1346,7 @@ export async function createBackupArchive(
         // cumulative skip counts across attempts instead of the final one.
         skippedVolatileCount = 0;
         unexpectedSqliteSourcePaths.length = 0;
+        unexpectedSessionStoreSourcePaths.length = 0;
         await writeArchiveStreamToFile({
           archivePath: attemptTempArchivePath,
           archiveStream: tar.c(
@@ -926,6 +1369,7 @@ export async function createBackupArchive(
             [
               manifestPath,
               ...stateSqliteBackup.snapshots.map((snapshot) => snapshot.sourcePath),
+              ...sessionStoreBackup.snapshots.map((snapshot) => snapshot.sourcePath),
               ...result.assets.map((asset) => asset.sourcePath),
             ],
           ),
@@ -934,6 +1378,12 @@ export async function createBackupArchive(
         if (unexpectedSqliteSourcePath) {
           throw new Error(
             `SQLite state appeared after snapshot discovery: ${unexpectedSqliteSourcePath}. Retry backup so it can be snapshotted.`,
+          );
+        }
+        const unexpectedSessionStoreSourcePath = unexpectedSessionStoreSourcePaths[0];
+        if (unexpectedSessionStoreSourcePath) {
+          throw new Error(
+            `Session store appeared after snapshot discovery: ${unexpectedSessionStoreSourcePath}. Retry backup so it can be snapshotted.`,
           );
         }
       },

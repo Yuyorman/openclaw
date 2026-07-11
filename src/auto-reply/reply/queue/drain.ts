@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../../agents/harness/hook-helpers.js";
+import { isMainRunRecoveryOwnershipLostError } from "../../../agents/main-run-recovery-errors.js";
 import { normalizeChatType } from "../../../channels/chat-type.js";
 import { resolveStorePath } from "../../../config/sessions.js";
 import { loadSessionEntry } from "../../../config/sessions/session-accessor.js";
@@ -413,7 +414,11 @@ function resolveAggregateOwner(items: readonly FollowupRun[]): FollowupRun | und
 }
 
 function requiresIndividualCollectDrain(item: FollowupRun): boolean {
-  return item.disableCollectBatching === true || hasRuntimeOnlyFollowupMetadata(item);
+  return (
+    item.executionOwner !== undefined ||
+    item.disableCollectBatching === true ||
+    hasRuntimeOnlyFollowupMetadata(item)
+  );
 }
 
 type AggregateCancellation = {
@@ -853,11 +858,24 @@ async function drainProtectedPriorityFollowup(
   items: FollowupRun[],
   runFollowup: (run: FollowupRun) => Promise<void>,
 ): Promise<boolean> {
-  const priority = items.find((item) => item.protectFromQueueOverflow === true);
+  const priority = items.find(
+    (item) => item.executionOwner !== undefined || item.protectFromQueueOverflow === true,
+  );
   if (!priority) {
     return false;
   }
-  await runFollowup(priority);
+  try {
+    await runFollowup(priority);
+  } catch (error) {
+    if (priority.executionOwner === undefined || !isMainRunRecoveryOwnershipLostError(error)) {
+      throw error;
+    }
+    // This capability cannot be replayed by the generic queue. Retire only its
+    // exact item; the durable recovery worker owns any later retry generation.
+    removeQueuedItemsByRef(items, [priority]);
+    completeFollowupRunLifecycle(priority);
+    return true;
+  }
   removeQueuedItemsByRef(items, [priority]);
   return true;
 }

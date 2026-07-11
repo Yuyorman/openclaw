@@ -6,7 +6,7 @@ export {
   listActiveEmbeddedRunSessionKeys,
   waitForActiveEmbeddedRuns,
 } from "../../agents/embedded-agent-runner/runs.js";
-export { markRestartAbortedMainSessions } from "../../agents/main-session-restart-recovery.js";
+export { reserveRestartAbortedMainSessions } from "../../agents/main-session-restart-reservation.js";
 export { getRuntimeConfig } from "../../config/config.js";
 export {
   respawnGatewayProcessForUpdate,
@@ -19,6 +19,7 @@ export {
   consumeGatewayRestartIntentSync,
   consumeGatewaySigusr1RestartAuthorization,
   isGatewaySigusr1RestartExternallyAllowed,
+  isGatewayRestartPreparationError,
   markGatewaySigusr1RestartHandled,
   peekGatewaySigusr1RestartReason,
   resetGatewayRestartStateForInProcessRestart,
@@ -29,6 +30,7 @@ export { writeGatewayRestartHandoffSync } from "../../infra/restart-handoff.js";
 export { rotateAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 export { markUpdateRestartSentinelFailure } from "../../infra/restart-sentinel.js";
 export { detectRespawnSupervisor } from "../../infra/supervisor-markers.js";
+export { beginGatewayRestartSignalAdmission } from "../../process/gateway-work-admission.js";
 export { writeDiagnosticStabilityBundleForFailureSync } from "../../logging/diagnostic-stability-bundle.js";
 export {
   advanceCronActiveJobGeneration,
@@ -42,7 +44,6 @@ export {
 } from "../../tasks/cron-task-cancel.js";
 export {
   getActiveTaskCount,
-  markGatewayDraining,
   resetAllLanes,
   waitForActiveTasks,
 } from "../../process/command-queue.js";

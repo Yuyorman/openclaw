@@ -20,6 +20,7 @@ import {
   releasePinnedPluginHttpRouteRegistry,
   releasePinnedPluginSessionExtensionRegistry,
 } from "../plugins/runtime.js";
+import { ActiveRunRegistry } from "./active-run-registry.js";
 import type { AuthRateLimiter } from "./auth-rate-limit.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
 import type { ChatAbortControllerEntry } from "./chat-abort.js";
@@ -131,10 +132,10 @@ export async function createGatewayRuntimeState(params: {
   chatRunBuffers: Map<string, string>;
   chatDeltaSentAt: Map<string, number>;
   chatDeltaLastBroadcastLen: Map<string, number>;
-  addChatRun: (sessionId: string, entry: ChatRunRegistration) => void;
+  addChatRun: (executionRunId: string, entry: ChatRunRegistration) => void;
   removeChatRun: (
-    sessionId: string,
-    clientRunId: string,
+    executionRunId: string,
+    publicRunId: string,
     sessionKey?: string,
   ) => ChatRunEntry | undefined;
   chatAbortControllers: Map<string, ChatAbortControllerEntry>;
@@ -400,7 +401,7 @@ export async function createGatewayRuntimeState(params: {
     const chatDeltaLastBroadcastLen = chatRunState.deltaLastBroadcastLen;
     const addChatRun = chatRunRegistry.add;
     const removeChatRun = chatRunRegistry.remove;
-    const chatAbortControllers = new Map<string, ChatAbortControllerEntry>();
+    const chatAbortControllers = new ActiveRunRegistry<ChatAbortControllerEntry>();
     const chatQueuedTurns = new Map<string, import("./chat-queued-turns.js").QueuedChatTurnEntry>();
     const toolEventRecipients = createToolEventRecipientRegistry();
 

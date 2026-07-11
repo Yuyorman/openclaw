@@ -1,6 +1,7 @@
 // Gateway chat run state registries.
 // Tracks active runs, delta buffers, tool recipients, and session subscribers.
 import type { AgentEventPayload } from "../infra/agent-events.js";
+import { createActiveRunIdentity, type ActiveRunIdentity } from "./active-run-registry.js";
 
 export type ChatRunTiming = {
   ackedAtMs: number;
@@ -18,6 +19,7 @@ export type ChatRunRegistration = {
 };
 
 export type ChatRunEntry = ChatRunRegistration & {
+  runIdentity: ActiveRunIdentity;
   registeredAtMs: number;
   registeredSequence: number;
 };
@@ -32,9 +34,17 @@ function nextChatRunOrderingSequence(): number {
 }
 
 /** Stamp a chat run registration with the process-local ordering metadata used for abort freshness checks. */
-export function createChatRunEntry(entry: ChatRunRegistration): ChatRunEntry {
+export function createChatRunEntry(
+  entry: ChatRunRegistration,
+  executionRunId = entry.clientRunId,
+): ChatRunEntry {
+  const runIdentity = createActiveRunIdentity(executionRunId, entry.clientRunId);
   return {
-    ...entry,
+    sessionKey: entry.sessionKey,
+    ...(entry.agentId ? { agentId: entry.agentId } : {}),
+    clientRunId: runIdentity.publicRunId,
+    ...(entry.chatSendTiming ? { chatSendTiming: entry.chatSendTiming } : {}),
+    runIdentity,
     registeredAtMs: Date.now(),
     registeredSequence: nextChatRunOrderingSequence(),
   };
@@ -82,62 +92,67 @@ export type BufferedAgentEvent = {
 };
 
 export type ChatRunRegistry = {
-  add: (sessionId: string, entry: ChatRunRegistration) => void;
-  peek: (sessionId: string) => ChatRunEntry | undefined;
-  shift: (sessionId: string) => ChatRunEntry | undefined;
-  remove: (sessionId: string, clientRunId: string, sessionKey?: string) => ChatRunEntry | undefined;
+  add: (executionRunId: string, entry: ChatRunRegistration) => void;
+  peek: (executionRunId: string) => ChatRunEntry | undefined;
+  shift: (executionRunId: string) => ChatRunEntry | undefined;
+  remove: (
+    executionRunId: string,
+    publicRunId: string,
+    sessionKey?: string,
+  ) => ChatRunEntry | undefined;
   clear: () => void;
 };
 
-/** Create the FIFO registry that maps session IDs to active chat runs. */
+/** Create the FIFO registry that maps execution ids to their public chat projection. */
 export function createChatRunRegistry(): ChatRunRegistry {
-  const chatRunSessions = new Map<string, ChatRunEntry[]>();
+  const runsByExecutionId = new Map<string, ChatRunEntry[]>();
 
-  const add = (sessionId: string, entry: ChatRunRegistration) => {
-    const registeredEntry = createChatRunEntry(entry);
-    const queue = chatRunSessions.get(sessionId);
+  const add = (executionRunId: string, entry: ChatRunRegistration) => {
+    const registeredEntry = createChatRunEntry(entry, executionRunId);
+    const queue = runsByExecutionId.get(executionRunId);
     if (queue) {
       queue.push(registeredEntry);
     } else {
-      chatRunSessions.set(sessionId, [registeredEntry]);
+      runsByExecutionId.set(executionRunId, [registeredEntry]);
     }
   };
 
-  const peek = (sessionId: string) => chatRunSessions.get(sessionId)?.[0];
+  const peek = (executionRunId: string) => runsByExecutionId.get(executionRunId)?.[0];
 
-  const shift = (sessionId: string) => {
-    const queue = chatRunSessions.get(sessionId);
+  const shift = (executionRunId: string) => {
+    const queue = runsByExecutionId.get(executionRunId);
     if (!queue || queue.length === 0) {
       return undefined;
     }
     const entry = queue.shift();
     if (!queue.length) {
-      chatRunSessions.delete(sessionId);
+      runsByExecutionId.delete(executionRunId);
     }
     return entry;
   };
 
-  const remove = (sessionId: string, clientRunId: string, sessionKey?: string) => {
-    const queue = chatRunSessions.get(sessionId);
+  const remove = (executionRunId: string, publicRunId: string, sessionKey?: string) => {
+    const queue = runsByExecutionId.get(executionRunId);
     if (!queue || queue.length === 0) {
       return undefined;
     }
     const idx = queue.findIndex(
       (entry) =>
-        entry.clientRunId === clientRunId && (sessionKey ? entry.sessionKey === sessionKey : true),
+        entry.runIdentity.publicRunId === publicRunId &&
+        (sessionKey ? entry.sessionKey === sessionKey : true),
     );
     if (idx < 0) {
       return undefined;
     }
     const [entry] = queue.splice(idx, 1);
     if (!queue.length) {
-      chatRunSessions.delete(sessionId);
+      runsByExecutionId.delete(executionRunId);
     }
     return entry;
   };
 
   const clear = () => {
-    chatRunSessions.clear();
+    runsByExecutionId.clear();
   };
 
   return { add, peek, shift, remove, clear };

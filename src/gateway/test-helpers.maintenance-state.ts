@@ -1,6 +1,8 @@
 // Gateway maintenance-state test helper.
 // Builds minimal timer/health/chat state for maintenance tests.
 import type { HealthSummary } from "../commands/health.js";
+import { ActiveRunRegistry } from "./active-run-registry.js";
+import type { ChatAbortControllerEntry } from "./chat-abort.js";
 import { createChatRunState } from "./server-chat-state.js";
 
 /** Create a Gateway maintenance-state stub with configurable health/presence versions. */
@@ -19,7 +21,7 @@ export function createGatewayMaintenanceStateForTest(params?: {
       params?.healthSummary ?? ({ ok: true } as HealthSummary),
     logHealth: { error: () => {} },
     dedupe: new Map(),
-    chatAbortControllers: new Map(),
+    chatAbortControllers: new ActiveRunRegistry<ChatAbortControllerEntry>(),
     chatQueuedTurns: new Map(),
     restartRecoveryCandidates: new Map(),
     chatRunState,

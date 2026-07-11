@@ -37,7 +37,8 @@ export {
 } from "./embedded-agent-subscribe.handlers.compaction.js";
 
 export function handleAgentStart(ctx: EmbeddedAgentSubscribeContext) {
-  ctx.log.debug(`embedded run agent start: runId=${ctx.params.runId}`);
+  const publicRunId = ctx.params.publicRunId ?? ctx.params.runId;
+  ctx.log.debug(`embedded run agent start: runId=${publicRunId}`);
   emitAgentEvent({
     runId: ctx.params.runId,
     ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
@@ -68,6 +69,7 @@ export function handleAgentEnd(
   evt?: Extract<AgentSessionEvent, { type: "agent_end" }>,
 ): void | Promise<void> {
   type BeforeTerminalDeliveryDecision = void | { suppressTerminalDelivery?: boolean };
+  const publicRunId = ctx.params.publicRunId ?? ctx.params.runId;
   const lastAssistant = ctx.state.lastAssistant;
   const isError = isAssistantMessage(lastAssistant) && lastAssistant.stopReason === "error";
   let lifecycleErrorText: string | undefined;
@@ -148,7 +150,7 @@ export function handleAgentEnd(
         provider: lastAssistant.provider,
       }).textPreview ?? GENERIC_ASSISTANT_ERROR_TEXT;
     lifecycleErrorText = safeErrorText;
-    const safeRunId = sanitizeForConsole(ctx.params.runId) ?? "-";
+    const safeRunId = sanitizeForConsole(publicRunId) ?? "-";
     const safeModel = sanitizeForConsole(lastAssistant.model) ?? "unknown";
     const safeProvider = sanitizeForConsole(lastAssistant.provider) ?? "unknown";
     const safeRawErrorPreview = sanitizeForConsole(observedError.rawErrorPreview);
@@ -160,7 +162,7 @@ export function handleAgentEnd(
     ctx.log.warn("embedded run agent end", {
       event: "embedded_run_agent_end",
       tags: ["error_handling", "lifecycle", "agent_end", "assistant_error"],
-      runId: ctx.params.runId,
+      runId: publicRunId,
       isError: true,
       error: safeErrorText,
       failoverReason,
@@ -170,7 +172,7 @@ export function handleAgentEnd(
       consoleMessage: `embedded run agent end: runId=${safeRunId} isError=true model=${safeModel} provider=${safeProvider} error=${safeErrorText}${rawErrorConsoleSuffix}`,
     });
   } else {
-    ctx.log.debug(`embedded run agent end: runId=${ctx.params.runId} isError=${isError}`);
+    ctx.log.debug(`embedded run agent end: runId=${publicRunId} isError=${isError}`);
   }
 
   const emitLifecycleTerminal = () => {

@@ -38,6 +38,8 @@ type ReasoningStreamPayload = Pick<
 export type SubscribeEmbeddedAgentSessionParams = {
   session: AgentSession;
   runId: string;
+  /** Operator-visible turn identity; runId remains the private execution identity. */
+  publicRunId?: string;
   /** Immutable gateway lifecycle ownership for this execution. */
   lifecycleGeneration?: string;
   /** Originating message channel used for subsystem log attribution. */

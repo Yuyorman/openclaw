@@ -500,6 +500,40 @@ describe("runAgentHarnessAttempt", () => {
     expect(params.resolvedApiKey).toBe(sentinel);
   });
 
+  it("hands plugin harnesses only the stable public run identity", async () => {
+    const pluginRunAttempt = vi.fn<AgentHarness["runAttempt"]>(async () =>
+      createAttemptResult("codex"),
+    );
+    registerAgentHarness(
+      {
+        id: "codex",
+        label: "Codex",
+        supports: () => ({ supported: true, priority: 100 }),
+        runAttempt: pluginRunAttempt,
+      },
+      { ownerPluginId: "codex" },
+    );
+    const params = createAttemptParams();
+    params.runId = "private-recovery-attempt";
+    params.publicRunId = "public-recovery-turn";
+    params.lifecycleGeneration = "private-lifecycle-generation";
+    params.executionOwner = {
+      publicRunId: params.publicRunId,
+      start: vi.fn(async () => undefined),
+    } as never;
+    params.onExecutionStarted = vi.fn();
+
+    await runAgentHarnessAttempt(params);
+
+    const handedOff = pluginRunAttempt.mock.calls[0]?.[0];
+    expect(handedOff?.runId).toBe("public-recovery-turn");
+    expect(handedOff).not.toHaveProperty("executionOwner");
+    expect(handedOff).not.toHaveProperty("lifecycleGeneration");
+    expect(handedOff).not.toHaveProperty("onExecutionStarted");
+    expect(handedOff).not.toHaveProperty("publicRunId");
+    expect(JSON.stringify(handedOff)).not.toContain("private-recovery-attempt");
+  });
+
   it("fails when a forced plugin harness is unavailable and fallback is omitted", async () => {
     process.env.OPENCLAW_AGENT_RUNTIME = "codex";
 

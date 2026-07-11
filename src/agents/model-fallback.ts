@@ -58,6 +58,7 @@ import { MissingAgentHarnessError, isMissingAgentHarnessError } from "./harness/
 import { resolveAgentHarnessPolicy } from "./harness/policy.js";
 import { getRegisteredAgentHarness } from "./harness/registry.js";
 import { LiveSessionModelSwitchError } from "./live-model-switch-error.js";
+import { isMainRunRecoveryOwnershipLostError } from "./main-run-recovery-errors.js";
 import {
   isModelFallbackDecisionLogEnabled,
   logModelFallbackDecision,
@@ -410,6 +411,9 @@ async function runFallbackCandidate<T>(params: {
       result,
     };
   } catch (err) {
+    if (isMainRunRecoveryOwnershipLostError(err)) {
+      throw err;
+    }
     if (isCommandLaneTaskTimeoutError(err)) {
       throw err;
     }
@@ -1401,6 +1405,7 @@ function shouldDiscardDeferredSessionSuspension(params: {
   return (
     isTerminalAbort(params.abortSignal) ||
     isCallerAbortSignal(params.abortSignal) ||
+    isMainRunRecoveryOwnershipLostError(params.error) ||
     isAgentRunDirectAbortReason(params.error) ||
     isAgentRunRestartAbortReason(params.error) ||
     isTerminalAbortFromError(params.error) ||

@@ -36,6 +36,7 @@ import type {
 } from "../embedded-agent-runner/run/params.js";
 import type { ExecPolicyOverrides } from "../exec-defaults.js";
 import type { FastModeAutoProgressState } from "../fast-mode.js";
+import type { MainRunRecoveryExecutionOwner } from "../main-run-recovery-execution-owner.js";
 import type { SilentReplyPromptMode } from "../system-prompt.types.js";
 
 /** Input contract for one CLI-backed agent run. */
@@ -99,6 +100,8 @@ export type RunCliAgentParams = {
    */
   runTimeoutOverrideMs?: number;
   runId: string;
+  /** Stable operator identity for transcript metadata; defaults to the execution id. */
+  publicRunId?: string;
   /** Immutable lifecycle ownership captured when this execution was admitted. */
   lifecycleGeneration?: string;
   lane?: string;
@@ -180,7 +183,8 @@ export type RunCliAgentParams = {
   };
   disableTools?: boolean;
   abortSignal?: AbortSignal;
-  onExecutionStarted?: () => void;
+  executionOwner?: MainRunRecoveryExecutionOwner;
+  onExecutionStarted?: () => void | Promise<void>;
   onExecutionPhase?: (info: {
     phase: EmbeddedAgentExecutionPhase;
     provider?: string;

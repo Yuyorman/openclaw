@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { MainRunRecoveryOwnershipLostError } from "../../agents/main-run-recovery-errors.js";
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { TypingMode } from "../../config/types.js";
@@ -37,6 +39,7 @@ import { createMockTypingController } from "./test-helpers.js";
 type AgentRunParams = {
   sessionId?: string;
   sessionFile?: string;
+  executionOwner?: MainRunRecoveryExecutionOwner;
   onPartialReply?: (payload: { text?: string }) => Promise<void> | void;
   onAssistantMessageStart?: () => Promise<void> | void;
   onReasoningStream?: (payload: { text?: string }) => Promise<void> | void;
@@ -60,6 +63,16 @@ const state = vi.hoisted(() => ({
   queueEmbeddedAgentMessageMock: vi.fn(),
   runEmbeddedAgentMock: vi.fn(),
 }));
+
+function createExecutionOwner(
+  onStart?: (info: { lifecycleGeneration: string }) => Promise<void> | void,
+): MainRunRecoveryExecutionOwner {
+  return {
+    async start(info): Promise<void> {
+      await onStart?.(info);
+    },
+  } as MainRunRecoveryExecutionOwner;
+}
 
 function countMatching<T>(items: readonly T[], predicate: (item: T) => boolean): number {
   let count = 0;
@@ -217,6 +230,7 @@ function createMinimalRun(params?: {
   currentInboundEventKind?: FollowupRun["currentInboundEventKind"];
   sessionCtx?: Partial<TemplateContext>;
   runOverrides?: Partial<FollowupRun["run"]>;
+  replyOperation?: ReturnType<typeof createReplyOperation>;
 }) {
   const typing = createMockTypingController();
   const opts = params?.opts;
@@ -276,6 +290,7 @@ function createMinimalRun(params?: {
         isRunActive: params?.isRunActive,
         isStreaming: params?.isStreaming ?? false,
         opts,
+        replyOperation: params?.replyOperation,
         typing,
         sessionEntry: params?.sessionEntry,
         sessionStore: params?.sessionStore,
@@ -381,6 +396,26 @@ describe("runReplyAgent active steering", () => {
     expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledTimes(1);
     expect(state.runEmbeddedAgentMock).not.toHaveBeenCalled();
     expect(onTurnAdopted).not.toHaveBeenCalled();
+  });
+
+  it("never steers an execution-owned recovery turn into another run", async () => {
+    state.queueEmbeddedAgentMessageMock.mockReturnValueOnce(true);
+    const executionOwner = createExecutionOwner();
+    const { followupRun, run } = createMinimalRun({
+      isActive: true,
+      isStreaming: true,
+      shouldSteer: true,
+      shouldFollowup: false,
+      resolvedQueueMode: "steer",
+    });
+    followupRun.executionOwner = executionOwner;
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(state.queueEmbeddedAgentMessageMock).not.toHaveBeenCalled();
+    expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledOnce();
+    expect(vi.mocked(enqueueFollowupRun).mock.calls[0]?.[1]).toMatchObject({ executionOwner });
+    expect(state.runEmbeddedAgentMock).not.toHaveBeenCalled();
   });
 });
 
@@ -540,18 +575,41 @@ describe("runReplyAgent heartbeat followup guard", () => {
     expect(typing.cleanup).toHaveBeenCalledTimes(1);
   });
 
-  it("still enqueues non-heartbeat runs when another run is active", async () => {
-    const { run } = createMinimalRun({
+  it("stores restart ownership on the exact queued turn", async () => {
+    const executionOwner = createExecutionOwner();
+    const { followupRun, run } = createMinimalRun({
       opts: { isHeartbeat: false },
       isActive: true,
       shouldFollowup: true,
       resolvedQueueMode: "collect",
     });
+    followupRun.executionOwner = executionOwner;
 
     const result = await run();
 
     expect(result).toBeUndefined();
     expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(enqueueFollowupRun).mock.calls[0]?.[1]).toMatchObject({
+      executionOwner,
+    });
+    expect(state.runEmbeddedAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("never drops an execution-owned turn through the busy-heartbeat guard", async () => {
+    const executionOwner = createExecutionOwner();
+    const { followupRun, run } = createMinimalRun({
+      opts: { isHeartbeat: true },
+      isActive: true,
+      shouldFollowup: false,
+      resolvedQueueMode: "collect",
+    });
+    followupRun.executionOwner = executionOwner;
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledOnce();
+    expect(vi.mocked(enqueueFollowupRun).mock.calls[0]?.[1]).toMatchObject({ executionOwner });
+    expect(state.queueEmbeddedAgentMessageMock).not.toHaveBeenCalled();
     expect(state.runEmbeddedAgentMock).not.toHaveBeenCalled();
   });
 
@@ -755,29 +813,28 @@ describe("runReplyAgent pending final delivery capture", () => {
     expect(stored.pendingFinalDeliveryText).toBe("visible final");
   });
 
-  it("persists auto-reply delivery context for restart recovery", async () => {
+  it("transfers restart recovery ownership before the agent run", async () => {
     const sessionEntry: SessionEntry = {
       sessionId: "session",
       updatedAt: Date.now(),
     };
     const sessionStore = { main: sessionEntry };
     const storePath = await createSessionStoreFile(sessionEntry);
-    state.runEmbeddedAgentMock.mockImplementationOnce(async () => {
-      const storedDuringRun = await readStoredMainSession(storePath);
-      expect(storedDuringRun.restartRecoveryDeliveryContext).toEqual({
-        channel: "discord",
-        to: "channel:24680",
-        accountId: "work",
-        threadId: "1503645939964055592",
-      });
-      expect(typeof storedDuringRun.restartRecoveryDeliveryRunId).toBe("string");
+    const events: string[] = [];
+    const executionOwner = createExecutionOwner((info) => {
+      expect(info.lifecycleGeneration).toBe("recovery-generation");
+      events.push("execution-owner");
+    });
+    state.runEmbeddedAgentMock.mockImplementationOnce(async (params: AgentRunParams) => {
+      await params.executionOwner?.start({ lifecycleGeneration: "recovery-generation" });
+      events.push("agent-run");
       return {
         payloads: [{ text: "visible final" }],
         meta: {},
       };
     });
 
-    const { run } = createMinimalRun({
+    const { followupRun, run } = createMinimalRun({
       sessionCtx: {
         Provider: "discord",
         OriginatingChannel: "discord",
@@ -792,9 +849,11 @@ describe("runReplyAgent pending final delivery capture", () => {
       sessionKey: "main",
       storePath,
     });
+    followupRun.executionOwner = executionOwner;
 
     await run();
 
+    expect(events).toEqual(["execution-owner", "agent-run"]);
     const stored = await readStoredMainSession(storePath);
     expect(stored.pendingFinalDelivery).toBe(true);
     expect(stored.pendingFinalDeliveryText).toBe("visible final");
@@ -804,11 +863,44 @@ describe("runReplyAgent pending final delivery capture", () => {
       accountId: "work",
       threadId: "1503645939964055592",
     });
-    expect(stored.restartRecoveryDeliveryContext).toBeUndefined();
-    expect(stored.restartRecoveryDeliveryRunId).toBeUndefined();
   });
 
-  it("fires onTurnAdopted after restart recovery delivery context persist completes", async () => {
+  it("uses exact turn ownership and lets rejection escape generic failure handling", async () => {
+    const ownershipLost = new MainRunRecoveryOwnershipLostError("exact owner rejected");
+    const exactStart = vi.fn(() => {
+      throw ownershipLost;
+    });
+    const ambientStart = vi.fn();
+    const exactOwner = createExecutionOwner(exactStart);
+    const ambientOwner = createExecutionOwner(ambientStart);
+    const replyOperation = createReplyOperation({
+      sessionKey: "main",
+      sessionId: "session",
+      resetTriggered: false,
+    });
+    const fail = vi.spyOn(replyOperation, "fail");
+    state.runEmbeddedAgentMock.mockImplementationOnce(async (params: AgentRunParams) => {
+      await params.executionOwner?.start({ lifecycleGeneration: "exact-generation" });
+      throw new Error("provider must not run");
+    });
+    const { followupRun, run } = createMinimalRun({
+      // Runtime extras on a stale object must not outrank the exact FollowupRun.
+      opts: { executionOwner: ambientOwner } as unknown as GetReplyOptions,
+      replyOperation,
+    });
+    followupRun.executionOwner = exactOwner;
+
+    try {
+      await expect(run()).rejects.toBe(ownershipLost);
+      expect(exactStart).toHaveBeenCalledOnce();
+      expect(ambientStart).not.toHaveBeenCalled();
+      expect(fail).not.toHaveBeenCalled();
+    } finally {
+      replyOperation.complete();
+    }
+  });
+
+  it("adopts the transcript before transferring execution ownership", async () => {
     const sessionEntry: SessionEntry = {
       sessionId: "session",
       updatedAt: Date.now(),
@@ -817,17 +909,11 @@ describe("runReplyAgent pending final delivery capture", () => {
     const storePath = await createSessionStoreFile(sessionEntry);
     const events: string[] = [];
     const onTurnAdopted = vi.fn(async () => {
-      const storedAtAdoption = await readStoredMainSession(storePath);
-      expect(storedAtAdoption.restartRecoveryDeliveryContext).toEqual({
-        channel: "discord",
-        to: "channel:24680",
-        accountId: "work",
-        threadId: "1503645939964055592",
-      });
-      expect(typeof storedAtAdoption.restartRecoveryDeliveryRunId).toBe("string");
       events.push("adopted");
     });
-    state.runEmbeddedAgentMock.mockImplementationOnce(async () => {
+    const executionOwner = createExecutionOwner(() => events.push("execution-owner"));
+    state.runEmbeddedAgentMock.mockImplementationOnce(async (params: AgentRunParams) => {
+      await params.executionOwner?.start({ lifecycleGeneration: "current-generation" });
       events.push("agent-run");
       return {
         payloads: [{ text: "visible final" }],
@@ -835,7 +921,7 @@ describe("runReplyAgent pending final delivery capture", () => {
       };
     });
 
-    const { run } = createMinimalRun({
+    const { followupRun, run } = createMinimalRun({
       opts: { onTurnAdopted },
       sessionCtx: {
         Provider: "discord",
@@ -851,11 +937,12 @@ describe("runReplyAgent pending final delivery capture", () => {
       sessionKey: "main",
       storePath,
     });
+    followupRun.executionOwner = executionOwner;
 
     await run();
 
     expect(onTurnAdopted).toHaveBeenCalledOnce();
-    expect(events).toEqual(["adopted", "agent-run"]);
+    expect(events).toEqual(["adopted", "execution-owner", "agent-run"]);
   });
 
   it("fires onTurnAdopted for suppressed-delivery runs before the agent turn", async () => {
@@ -867,9 +954,6 @@ describe("runReplyAgent pending final delivery capture", () => {
     const storePath = await createSessionStoreFile(sessionEntry);
     const events: string[] = [];
     const onTurnAdopted = vi.fn(async () => {
-      const storedAtAdoption = await readStoredMainSession(storePath);
-      expect(storedAtAdoption.restartRecoveryDeliveryContext).toBeUndefined();
-      expect(storedAtAdoption.restartRecoveryDeliveryRunId).toBeUndefined();
       events.push("adopted");
     });
     state.runEmbeddedAgentMock.mockImplementationOnce(async () => {

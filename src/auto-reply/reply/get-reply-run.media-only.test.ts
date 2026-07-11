@@ -7,6 +7,7 @@ import {
   clearActiveEmbeddedRun,
   setActiveEmbeddedRun,
 } from "../../agents/embedded-agent-runner/runs.js";
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { HEARTBEAT_RUN_SCOPE } from "../../infra/heartbeat-run-scope.js";
 import { MESSAGE_TOOL_ONLY_DELIVERY_HINT } from "../../plugin-sdk/message-tool-delivery-hints.js";
@@ -322,6 +323,16 @@ describe("runPreparedReply media-only handling", () => {
     vi.mocked(buildInboundUserContextPrefix).mockReset().mockReturnValue("");
     vi.mocked(resolveInboundUserContextPromptJoiner).mockReturnValue(undefined);
     replyRunTesting.resetReplyRunRegistry();
+  });
+
+  it("stamps private recovery ownership onto the exact followup turn", async () => {
+    const executionOwner = {
+      start: vi.fn(async () => {}),
+    } as unknown as MainRunRecoveryExecutionOwner;
+
+    await runPreparedReply(baseParams({ opts: { executionOwner } }));
+
+    expect(requireRunReplyAgentCall().followupRun.executionOwner).toBe(executionOwner);
   });
 
   afterEach(() => {

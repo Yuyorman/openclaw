@@ -5,11 +5,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import {
   readAcpSessionMeta,
   writeAcpSessionMetaForMigration,
 } from "../acp/runtime/session-meta.js";
+import {
+  clearMainRunRecoveryRuntimeForTest,
+  prepareMainRunRecoveryDispatch,
+  upsertMainRunRecoveryBarrier,
+} from "../agents/main-run-recovery-runtime.js";
 import { getRegistryWorktree } from "../agents/worktrees/registry.js";
 import { managedWorktrees } from "../agents/worktrees/service.js";
 import { loadSessionEntry, replaceSessionEntry } from "../config/sessions/session-accessor.js";
@@ -17,7 +22,20 @@ import {
   beginSessionWorkAdmission,
   runExclusiveSessionLifecycleMutation,
 } from "../sessions/session-lifecycle-admission.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import { buildPersistedUserTurnMessage } from "../sessions/user-turn-transcript.js";
+import {
+  MAIN_RUN_RECOVERY_LEASE_MS,
+  fingerprintMainRunRecoverySource,
+  getMainRunRecovery,
+  reserveMainRunRecovery,
+  transitionMainRunRecoveryStateCas,
+  type MainRunRecovery,
+  type MainRunRecoveryCas,
+} from "../state/main-run-recovery-store.js";
+import {
+  closeOpenClawStateDatabaseForTest,
+  openOpenClawStateDatabase,
+} from "../state/openclaw-state-db.js";
 import { embeddedRunMock, rpcReq, testState, writeSessionStore } from "./test-helpers.js";
 import {
   setupGatewaySessionsTestHarness,
@@ -33,6 +51,27 @@ import {
   expectActiveRunCleanup,
   directSessionReq,
 } from "./test/server-sessions.test-helpers.js";
+
+const sessionArchiveFailureState = vi.hoisted(() => ({ error: undefined as Error | undefined }));
+
+vi.mock("./session-archive.runtime.js", async () => {
+  const actual = await vi.importActual<typeof import("./session-archive.runtime.js")>(
+    "./session-archive.runtime.js",
+  );
+  return {
+    ...actual,
+    archiveSessionTranscriptsDetailed: (
+      ...args: Parameters<typeof actual.archiveSessionTranscriptsDetailed>
+    ) => {
+      const error = sessionArchiveFailureState.error;
+      sessionArchiveFailureState.error = undefined;
+      if (error) {
+        throw error;
+      }
+      return actual.archiveSessionTranscriptsDetailed(...args);
+    },
+  };
+});
 
 const {
   createConfiguredGlobalAgentSessionStore,
@@ -65,6 +104,8 @@ async function initializeRemoteBackedGitWorkspace(root: string): Promise<string>
 }
 
 afterEach(() => {
+  sessionArchiveFailureState.error = undefined;
+  clearMainRunRecoveryRuntimeForTest();
   closeOpenClawStateDatabaseForTest();
 });
 
@@ -102,6 +143,101 @@ async function seedSubagentWorkerSession() {
     entries: {
       "agent:main:subagent:worker": sessionStoreEntry("sess-subagent"),
     },
+  });
+}
+
+function reserveSessionRecovery(params: {
+  runId: string;
+  sessionKey: string;
+  sessionId: string;
+  storePath: string;
+}): void {
+  const acceptedAtMs = Date.now();
+  const identity = {
+    agentId: "main",
+    sessionKey: params.sessionKey,
+    sessionKeyAliases: [] as string[],
+    sessionId: params.sessionId,
+    storePath: params.storePath,
+  };
+  const envelope = {
+    kind: "exact_turn" as const,
+    approvedTurn: buildPersistedUserTurnMessage({
+      text: "continue after restart",
+      timestamp: acceptedAtMs,
+      idempotencyKey: `${params.runId}:user`,
+    }),
+  };
+  const sourceKey = envelope.approvedTurn.idempotencyKey;
+  const ownerPrincipal = { kind: "system" as const };
+  const authorization = { senderIsOwner: true };
+  reserveMainRunRecovery({
+    ...identity,
+    publicRunId: params.runId,
+    sourceKey,
+    sourceFingerprint: fingerprintMainRunRecoverySource({
+      sourceKey,
+      identity,
+      envelope,
+      ownerPrincipal,
+      authorization,
+    }),
+    bootId: "test-boot",
+    ownerPrincipal,
+    authorization,
+    envelope,
+    initialLease: {
+      owner: `test-admission:${params.runId}`,
+      expiresAtMs: acceptedAtMs + MAIN_RUN_RECOVERY_LEASE_MS,
+    },
+    acceptedAtMs,
+  });
+  upsertMainRunRecoveryBarrier({
+    aliases: [params.sessionKey],
+    ledgerRunId: params.runId,
+    sessionId: params.sessionId,
+    storePath: params.storePath,
+  });
+}
+
+function requireSessionRecovery(runId: string): MainRunRecovery {
+  const recovery = getMainRunRecovery(runId);
+  if (!recovery) {
+    throw new Error(`missing main-run recovery ${runId}`);
+  }
+  return recovery;
+}
+
+function sessionRecoveryCas(recovery: MainRunRecovery): MainRunRecoveryCas {
+  if (recovery.state === "terminal") {
+    throw new Error(`main-run recovery ${recovery.publicRunId} is terminal`);
+  }
+  return {
+    publicRunId: recovery.publicRunId,
+    expectedRevision: recovery.revision,
+    expectedState: recovery.state,
+    agentId: recovery.agentId,
+    sessionKey: recovery.sessionKey,
+    sessionKeyAliases: recovery.sessionKeyAliases,
+    sessionId: recovery.sessionId,
+    storePath: recovery.storePath,
+  };
+}
+
+function prepareSessionRecoveryAdmission(runId: string) {
+  const transcriptOwned = transitionMainRunRecoveryStateCas({
+    ...sessionRecoveryCas(requireSessionRecovery(runId)),
+    nextState: "transcript_owned",
+    currentBootId: "test-boot",
+    nowMs: Date.now(),
+  });
+  if (!transcriptOwned) {
+    throw new Error(`failed to transfer ${runId} to transcript ownership`);
+  }
+  return prepareMainRunRecoveryDispatch({
+    currentBootId: "test-boot",
+    dispatchRunId: runId,
+    recovery: transcriptOwned,
   });
 }
 
@@ -234,6 +370,36 @@ test("sessions.delete rejects main and aborts active runs", async () => {
   });
 });
 
+test("ordinary sessions.delete emits session_end before an unbind failure", async () => {
+  const { storePath } = await createSessionStoreDir();
+  const sessionKey = "agent:main:dashboard:ordinary-delete-unbind-failure";
+  await writeSessionStore({
+    entries: {
+      [sessionKey]: sessionStoreEntry("sess-ordinary-delete-unbind-failure"),
+    },
+  });
+  const findWorktree = vi.spyOn(managedWorktrees, "findLiveByOwner");
+  let worktreeLookupCalls: number;
+  threadBindingMocks.unbindThreadBindingsBySessionKey.mockRejectedValueOnce(
+    new Error("injected ordinary delete unbind failure"),
+  );
+
+  try {
+    await expect(directSessionReq("sessions.delete", { key: sessionKey })).rejects.toThrow(
+      "injected ordinary delete unbind failure",
+    );
+  } finally {
+    worktreeLookupCalls = findWorktree.mock.calls.length;
+    findWorktree.mockRestore();
+  }
+
+  expect(loadSessionStore(storePath, { skipCache: true })[sessionKey]).toBeUndefined();
+  expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(1);
+  expect(subagentLifecycleHookMocks.runSubagentEnded).not.toHaveBeenCalled();
+  expect(sessionLifecycleHookMocks.runSessionEnd).toHaveBeenCalledTimes(1);
+  expect(worktreeLookupCalls).toBe(0);
+});
+
 test("sessions.delete preserves locked archived sessions and deletes ordinary archived sessions", async () => {
   const { dir, storePath } = await createSessionStoreDir();
   const lockedKey = "agent:main:harness:codex:supervision:native-thread";
@@ -299,6 +465,242 @@ test("sessions.delete interrupts work admitted before runtime registration", asy
 
   expect(deleted.payload?.deleted).toBe(true);
   expect(interrupted).toBe(true);
+});
+
+test("sessions.delete keeps direct recovery cancelling after cleanup failure, then settles retry", async () => {
+  const { dir, storePath } = await createSessionStoreDir();
+  const sessionKey = "agent:main:dashboard:durable-delete";
+  const sessionId = "sess-durable-delete";
+  const runId = "run-delete-accepted";
+  await writeSingleLineSession(dir, sessionId, "continue after restart");
+  await writeSessionStore({
+    entries: {
+      [sessionKey]: sessionStoreEntry(sessionId),
+    },
+  });
+  reserveSessionRecovery({ runId, sessionKey, sessionId, storePath });
+  const recoveryClaim = prepareSessionRecoveryAdmission(runId);
+  let stateWhenInterrupted: string | undefined;
+  let releaseRecovery = () => {};
+  const recoveryLease = await beginSessionWorkAdmission({
+    scope: storePath,
+    identities: recoveryClaim.admissionIdentities,
+    barrierGrant: recoveryClaim.admissionGrant,
+    assertAllowed: () => {},
+    onInterrupt: () => {
+      stateWhenInterrupted = getMainRunRecovery(runId)?.state;
+      releaseRecovery();
+    },
+  });
+  releaseRecovery = recoveryLease.release;
+
+  embeddedRunMock.activeIds.add(sessionId);
+  embeddedRunMock.waitResults.set(sessionId, false);
+  const firstDelete = await directSessionReq("sessions.delete", { key: sessionKey }).finally(
+    recoveryLease.release,
+  );
+
+  expect(firstDelete.ok).toBe(false);
+  expect(stateWhenInterrupted).toBe("cancelling");
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "cancelling",
+    cancellation: { kind: "delete", epoch: expect.any(String) },
+  });
+  expect(getMainRunRecovery(runId)?.envelope).toBeUndefined();
+
+  embeddedRunMock.waitResults.set(sessionId, true);
+  const retry = await expectSessionDeleteSucceeds({ key: sessionKey });
+
+  expect(retry.payload?.deleted).toBe(true);
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "terminal",
+    terminalOutcome: { status: "cancelled" },
+  });
+});
+
+test("sessions.delete retries direct-store settlement after deletion commits", async () => {
+  const { dir, storePath } = await createSessionStoreDir();
+  const sessionKey = "agent:main:dashboard:delete-settlement-retry";
+  const sessionId = "sess-delete-settlement-retry";
+  const runId = "run-delete-settlement-retry";
+  await writeSingleLineSession(dir, sessionId, "finish deletion");
+  await writeSessionStore({
+    entries: {
+      [sessionKey]: sessionStoreEntry(sessionId),
+    },
+  });
+  reserveSessionRecovery({ runId, sessionKey, sessionId, storePath });
+
+  const stateDb = openOpenClawStateDatabase().db;
+  stateDb.exec(`
+    CREATE TRIGGER fail_delete_recovery_settlement
+    BEFORE UPDATE OF state ON main_run_recoveries
+    WHEN OLD.public_run_id = '${runId}' AND NEW.state = 'terminal'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected delete settlement failure');
+    END;
+  `);
+
+  let replacementSessionId: string | undefined;
+  let replacementEntry: unknown;
+  let mcpCleanupCallsAfterCommit = 0;
+  let unbindCallsAfterCommit = 0;
+  let sessionEndCallsAfterCommit = 0;
+  const broadcastToConnIds = vi.fn();
+  const requestOptions = {
+    context: {
+      broadcastToConnIds,
+      getSessionEventSubscriberConnIds: () => new Set(["delete-settlement-subscriber"]),
+    },
+  };
+  try {
+    const firstDelete = await directSessionReq(
+      "sessions.delete",
+      { key: sessionKey },
+      requestOptions,
+    );
+    expect(firstDelete.ok).toBe(false);
+    expect(firstDelete.error).toMatchObject({ code: "UNAVAILABLE", retryable: true });
+    expect(loadSessionStore(storePath, { skipCache: true })[sessionKey]).toBeUndefined();
+    expect(getMainRunRecovery(runId)).toMatchObject({
+      state: "cancelling",
+      sessionId,
+    });
+
+    replacementSessionId = "sess-delete-settlement-replacement";
+    await writeSessionStore({
+      entries: {
+        [sessionKey]: sessionStoreEntry(replacementSessionId),
+      },
+    });
+    replacementEntry = structuredClone(
+      loadSessionStore(storePath, { skipCache: true })[sessionKey],
+    );
+    mcpCleanupCallsAfterCommit = bundleMcpRuntimeMocks.disposeSessionMcpRuntime.mock.calls.length;
+    unbindCallsAfterCommit = threadBindingMocks.unbindThreadBindingsBySessionKey.mock.calls.length;
+    sessionEndCallsAfterCommit = sessionLifecycleHookMocks.runSessionEnd.mock.calls.length;
+    expect(unbindCallsAfterCommit).toBe(1);
+    expect(sessionEndCallsAfterCommit).toBe(1);
+    expect(broadcastToConnIds).toHaveBeenCalledTimes(1);
+    expect(broadcastToConnIds.mock.calls[0]?.[0]).toBe("sessions.changed");
+    const blockedRetry = await directSessionReq(
+      "sessions.delete",
+      {
+        key: sessionKey,
+        expectedSessionId: sessionId,
+      },
+      requestOptions,
+    );
+    expect(blockedRetry.ok).toBe(false);
+    expect(blockedRetry.error).toMatchObject({
+      code: "UNAVAILABLE",
+      retryable: true,
+      retryAfterMs: 1_000,
+    });
+    expect(blockedRetry.error?.message ?? "").toMatch(/still settling/i);
+    expect(loadSessionStore(storePath, { skipCache: true })[sessionKey]).toEqual(replacementEntry);
+    expect(bundleMcpRuntimeMocks.disposeSessionMcpRuntime).toHaveBeenCalledTimes(
+      mcpCleanupCallsAfterCommit,
+    );
+    expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(
+      unbindCallsAfterCommit,
+    );
+    expect(sessionLifecycleHookMocks.runSessionEnd).toHaveBeenCalledTimes(
+      sessionEndCallsAfterCommit,
+    );
+    expect(broadcastToConnIds).toHaveBeenCalledTimes(1);
+    expect(getMainRunRecovery(runId)?.state).toBe("cancelling");
+  } finally {
+    stateDb.exec("DROP TRIGGER IF EXISTS fail_delete_recovery_settlement");
+  }
+
+  const retry = await directSessionReq<{ ok: true; deleted: boolean }>(
+    "sessions.delete",
+    {
+      key: sessionKey,
+      expectedSessionId: sessionId,
+    },
+    requestOptions,
+  );
+
+  expect(retry.ok).toBe(true);
+  expect(retry.payload?.deleted).toBe(false);
+  expect(loadSessionStore(storePath, { skipCache: true })[sessionKey]).toEqual(replacementEntry);
+  expect(bundleMcpRuntimeMocks.disposeSessionMcpRuntime).toHaveBeenCalledTimes(
+    mcpCleanupCallsAfterCommit,
+  );
+  expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(
+    unbindCallsAfterCommit,
+  );
+  expect(sessionLifecycleHookMocks.runSessionEnd).toHaveBeenCalledTimes(sessionEndCallsAfterCommit);
+  expect(broadcastToConnIds).toHaveBeenCalledTimes(1);
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "terminal",
+    sessionId,
+    terminalOutcome: { status: "cancelled" },
+  });
+  if (!replacementSessionId) {
+    throw new Error("expected replacement session");
+  }
+  const replacementAdmission = await beginSessionWorkAdmission({
+    scope: storePath,
+    identities: [sessionKey, replacementSessionId],
+    assertAllowed: () => {},
+  });
+  replacementAdmission.release();
+});
+
+test("sessions.delete reconciles a post-store transcript failure on exact retry", async () => {
+  const { storePath } = await createSessionStoreDir();
+  const sessionKey = "agent:main:dashboard:delete-post-store-failure";
+  const sessionId = "sess-delete-post-store-failure";
+  const runId = "run-delete-post-store-failure";
+  await writeSessionStore({
+    entries: {
+      [sessionKey]: sessionStoreEntry(sessionId),
+    },
+  });
+  reserveSessionRecovery({ runId, sessionKey, sessionId, storePath });
+  const broadcastToConnIds = vi.fn();
+  const requestOptions = {
+    context: {
+      broadcastToConnIds,
+      getSessionEventSubscriberConnIds: () => new Set(["post-store-delete-subscriber"]),
+    },
+  };
+  sessionArchiveFailureState.error = new Error("injected transcript archive failure");
+
+  await expect(
+    directSessionReq("sessions.delete", { key: sessionKey }, requestOptions),
+  ).rejects.toThrow("injected transcript archive failure");
+
+  expect(loadSessionStore(storePath, { skipCache: true })[sessionKey]).toBeUndefined();
+  expect(getMainRunRecovery(runId)?.state).toBe("cancelling");
+  expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(1);
+  expect(sessionLifecycleHookMocks.runSessionEnd).toHaveBeenCalledTimes(1);
+  expect(broadcastToConnIds).toHaveBeenCalledTimes(1);
+
+  const retry = await directSessionReq<{ ok: true; deleted: boolean }>(
+    "sessions.delete",
+    { key: sessionKey, expectedSessionId: sessionId },
+    requestOptions,
+  );
+
+  expect(retry.ok).toBe(true);
+  expect(retry.payload?.deleted).toBe(false);
+  expect(getMainRunRecovery(runId)).toMatchObject({
+    state: "terminal",
+    terminalOutcome: { status: "cancelled" },
+  });
+  expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(1);
+  expect(sessionLifecycleHookMocks.runSessionEnd).toHaveBeenCalledTimes(1);
+  expect(broadcastToConnIds).toHaveBeenCalledTimes(1);
+  const admission = await beginSessionWorkAdmission({
+    scope: storePath,
+    identities: [sessionKey, sessionId],
+    assertAllowed: () => {},
+  });
+  admission.release();
 });
 
 test("sessions.delete rejects a stale expected session id without interrupting its replacement", async () => {
@@ -935,7 +1337,11 @@ test("sessions.delete returns unavailable when active run does not stop", async 
     key: "discord:group:dev",
   });
   expect(deleted.ok).toBe(false);
-  expect(deleted.error?.code).toBe("UNAVAILABLE");
+  expect(deleted.error).toMatchObject({
+    code: "UNAVAILABLE",
+    retryable: true,
+    retryAfterMs: 1_000,
+  });
   expect(deleted.error?.message ?? "").toMatch(/still active/i);
   expectActiveRunCleanup(
     "agent:main:discord:group:dev",

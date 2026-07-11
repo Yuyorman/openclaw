@@ -1,5 +1,5 @@
 // Coordinates active plugin runtime registries and event hooks.
-import { onAgentEvent } from "../infra/agent-events.js";
+import { onAgentEvent, projectAgentEventForPublicBoundary } from "../infra/agent-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   clearPluginHostRuntimeState,
@@ -155,8 +155,9 @@ function syncPluginAgentEventBridge(): void {
     return;
   }
   state.agentEventBridgeUnsubscribe = onAgentEvent((event) => {
+    const publicEvent = projectAgentEventForPublicBoundary(event);
     for (const registry of collectLivePluginRegistries()) {
-      dispatchPluginAgentEventSubscriptions({ registry, event });
+      dispatchPluginAgentEventSubscriptions({ registry, event: publicEvent });
     }
   });
 }

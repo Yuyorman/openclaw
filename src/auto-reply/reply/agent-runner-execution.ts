@@ -53,6 +53,7 @@ import type { FastModeAutoProgressState } from "../../agents/fast-mode.js";
 import { resolveAgentHarnessPolicy } from "../../agents/harness/policy.js";
 import { ensureSelectedAgentHarnessPlugin } from "../../agents/harness/runtime-plugin.js";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
+import { isMainRunRecoveryOwnershipLostError } from "../../agents/main-run-recovery-errors.js";
 import { isMissingProviderAuthError } from "../../agents/model-auth.js";
 import { runWithModelFallback, isFallbackSummaryError } from "../../agents/model-fallback.js";
 import { resolveCliRuntimeExecutionProvider } from "../../agents/model-runtime-aliases.js";
@@ -2081,6 +2082,7 @@ async function runAgentTurnWithFallbackInternal(
                   onAgentRunStart: notifyAgentRunStart,
                   suppressAssistantBridge: params.followupRun.run.silentExpected,
                   onActivity: () => params.replyOperation?.recordActivity(),
+                  executionOwner: params.followupRun.executionOwner,
                   preserveProgressCallbackStartOrder,
                   onAssistantText: async (text) => {
                     if (!preserveProgressCallbackStartOrder) {
@@ -2433,6 +2435,7 @@ async function runAgentTurnWithFallbackInternal(
                     abortSignal: runAbortSignal,
                     replyOperation: params.replyOperation,
                     deferTerminalLifecycle: true,
+                    executionOwner: params.followupRun.executionOwner,
                     onExecutionStarted: (info) => {
                       if (info?.lifecycleGeneration) {
                         lifecycleGeneration = info.lifecycleGeneration;
@@ -3003,6 +3006,10 @@ async function runAgentTurnWithFallbackInternal(
       }
       break;
     } catch (err) {
+      if (isMainRunRecoveryOwnershipLostError(err)) {
+        clearAgentRunContext(runId, lifecycleGeneration);
+        throw err;
+      }
       if (err instanceof LiveSessionModelSwitchError) {
         liveModelSwitchRetries += 1;
         if (liveModelSwitchRetries > MAX_LIVE_SWITCH_RETRIES) {

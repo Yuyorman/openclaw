@@ -11,10 +11,13 @@ import type { HealthSummary } from "../commands/health.js";
 import { sweepStaleRunContexts } from "../infra/agent-events.js";
 import { cleanOldMedia } from "../media/store.js";
 import { startSkillCuratorMaintenance } from "../skills/workshop/curator.js";
+import { resolveActiveRunByIdentity } from "./active-run-registry.js";
 import {
   abortTrackedChatRunById,
   type ChatAbortControllerEntry,
+  notifyChatAbortControllerSessionTerminalPersisted,
   removeChatAbortControllerEntry,
+  retryChatAbortControllerMainRunRecoveryTerminalEvidence,
   type RestartRecoveryCandidate,
 } from "./chat-abort.js";
 import type { QueuedChatTurnMap } from "./chat-queued-turns.js";
@@ -83,8 +86,8 @@ export function startGatewayMaintenanceTimers(params: {
   chatDeltaSentAt: Map<string, number>;
   chatDeltaLastBroadcastLen: Map<string, number>;
   removeChatRun: (
-    sessionId: string,
-    clientRunId: string,
+    executionRunId: string,
+    publicRunId: string,
     sessionKey?: string,
   ) => ChatRunEntry | undefined;
   agentRunSeq: Map<string, number>;
@@ -160,13 +163,15 @@ export function startGatewayMaintenanceTimers(params: {
   const dedupeCleanup = setInterval(() => {
     const AGENT_RUN_SEQ_MAX = 10_000;
     const now = Date.now();
+    const resolveActiveRun = (runId: string) =>
+      resolveActiveRunByIdentity(params.chatAbortControllers, runId);
     const resolveDedupeRunId = (key: string, entry: DedupeEntry) => {
       if (!key.startsWith("agent:") && !key.startsWith("chat:")) {
         return undefined;
       }
       const keyRunId = key.slice(key.indexOf(":") + 1);
       if (keyRunId) {
-        if (params.chatAbortControllers.has(keyRunId) || params.chatQueuedTurns.has(keyRunId)) {
+        if (resolveActiveRun(keyRunId) || params.chatQueuedTurns.has(keyRunId)) {
           return keyRunId;
         }
       }
@@ -200,7 +205,7 @@ export function startGatewayMaintenanceTimers(params: {
         return false;
       }
       const runId = resolveDedupeRunId(key, dedupeEntry);
-      const entry = runId ? params.chatAbortControllers.get(runId) : undefined;
+      const entry = runId ? resolveActiveRun(runId)?.entry : undefined;
       if (entry) {
         return isAgentKey ? entry.kind === "agent" : entry.kind !== "agent";
       }
@@ -252,6 +257,24 @@ export function startGatewayMaintenanceTimers(params: {
     };
 
     for (const [runId, entry] of params.chatAbortControllers) {
+      if (
+        entry.mainRunRecoveryTerminalEvidence &&
+        entry.mainRunRecoveryTerminalEvidenceResolved !== true
+      ) {
+        try {
+          const resolved = retryChatAbortControllerMainRunRecoveryTerminalEvidence(entry, {
+            nowMs: now,
+          });
+          if (resolved && entry.projectSessionTerminalPersisted === true) {
+            notifyChatAbortControllerSessionTerminalPersisted(entry);
+          }
+        } catch (err) {
+          params.logHealth.error(`terminal recovery evidence retry failed: ${formatError(err)}`);
+        }
+        if (entry.mainRunRecoveryTerminalEvidenceResolved !== true) {
+          continue;
+        }
+      }
       if (entry.projectSessionTerminalPending === true) {
         continue;
       }
@@ -305,7 +328,7 @@ export function startGatewayMaintenanceTimers(params: {
       if (params.chatRunState.abortedRuns.has(runId)) {
         continue; // already handled above
       }
-      if (params.chatAbortControllers.has(runId)) {
+      if (resolveActiveRun(runId)) {
         continue;
       }
       if (now - lastSentAt <= ABORTED_RUN_TTL_MS) {
@@ -317,7 +340,7 @@ export function startGatewayMaintenanceTimers(params: {
       if (params.chatRunState.abortedRuns.has(runId)) {
         continue;
       }
-      if (params.chatAbortControllers.has(runId)) {
+      if (resolveActiveRun(runId)) {
         continue;
       }
       if (now - lastUpdatedAt <= ABORTED_RUN_TTL_MS) {
@@ -330,7 +353,7 @@ export function startGatewayMaintenanceTimers(params: {
       if (params.chatRunState.abortedRuns.has(runId)) {
         continue;
       }
-      if (params.chatAbortControllers.has(runId)) {
+      if (resolveActiveRun(runId)) {
         continue;
       }
       if (now - lastSentAt <= ABORTED_RUN_TTL_MS) {

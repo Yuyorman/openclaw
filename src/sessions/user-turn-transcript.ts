@@ -59,6 +59,7 @@ type PersistUserTurnTranscriptParams = {
   sessionEntry: UserTurnSessionEntry | undefined;
   sessionStore?: Record<string, UserTurnSessionEntry>;
   storePath?: string;
+  expectedSessionId?: string;
   agentId: string;
   threadId?: string | number;
   cwd?: string;

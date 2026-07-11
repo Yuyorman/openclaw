@@ -490,6 +490,8 @@ export const SessionsResetParamsSchema = Type.Object(
     key: NonEmptyString,
     agentId: Type.Optional(NonEmptyString),
     reason: Type.Optional(Type.Union([Type.Literal("new"), Type.Literal("reset")])),
+    // Internal compare-and-reset guard for lifecycle-owned retries.
+    expectedSessionId: Type.Optional(NonEmptyString),
   },
   { additionalProperties: false },
 );

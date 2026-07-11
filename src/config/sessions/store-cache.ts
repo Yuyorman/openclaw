@@ -1,6 +1,7 @@
 // Session store caches share parsed stores, immutable snapshots, and serialized JSON.
 import { parseStrictNonNegativeInteger } from "../../infra/parse-finite-number.js";
 import { createExpiringMapCache, isCacheEnabled, resolveCacheTtlMs } from "../cache-utils.js";
+import { clearCanonicalSessionStorePathCache } from "./paths.js";
 import { clearSessionSkillPromptRefCache } from "./skill-prompt-blobs.js";
 import type { SessionEntry, SessionSkillPromptRef } from "./types.js";
 
@@ -272,6 +273,7 @@ export function getSessionStoreCacheVersion(storePath: string): number {
 }
 
 export function clearSessionStoreCaches(): void {
+  clearCanonicalSessionStorePathCache();
   SESSION_STORE_CACHE.clear();
   SESSION_STORE_SNAPSHOT_CACHE.clear();
   SESSION_STORE_CACHE_VERSION.clear();

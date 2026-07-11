@@ -146,7 +146,9 @@ export async function runGatewayLoop(params: {
   let activeRestartRequest: GatewayRunSignalRequest | null = null;
   let forceActiveRestartExit: (() => void) | null = null;
   let pendingStartupForceExitTimer: ReturnType<typeof setTimeout> | null = null;
-  let restartDrainingMarked = false;
+  let restartPreparationAdmission: ReturnType<
+    GatewayLifecycleRuntimeModule["beginGatewayRestartSignalAdmission"]
+  > | null = null;
   let startupFailedWithoutServerHandle = false;
   const processInstanceId = randomUUID();
   const waitForHealthyChild = params.waitForHealthyChild ?? waitForHealthyGatewayChild;
@@ -408,15 +410,13 @@ export async function runGatewayLoop(params: {
       return DEFAULT_RESTART_DRAIN_TIMEOUT_MS;
     }
   };
-  const markRestartDraining = () => {
-    if (restartDrainingMarked) {
-      return;
-    }
-    // The lifecycle module is primed before listeners are installed. Keep this
-    // transition synchronous so an accepted signal cannot yield between token
-    // handling and closing process-wide root admission.
-    eagerLifecycleRuntime.markGatewayDraining();
-    restartDrainingMarked = true;
+  const beginRestartPreparation = () => {
+    restartPreparationAdmission ??= eagerLifecycleRuntime.beginGatewayRestartSignalAdmission();
+  };
+  const rollbackRestartPreparation = () => {
+    restartPreparationAdmission?.rollback();
+    restartPreparationAdmission = null;
+    eagerLifecycleRuntime.rollbackGatewayRestartSignalAdmission();
   };
 
   const runAcceptedRequest = (acceptedRequest: GatewayRunSignalRequest) => {
@@ -464,6 +464,7 @@ export async function runGatewayLoop(params: {
     }
 
     void (async () => {
+      let restartRecoveryReservationFailed = false;
       const restartDrainTimeoutMs = isRestart
         ? await resolveRestartDrainTimeoutMs(restartIntent)
         : 0;
@@ -515,7 +516,7 @@ export async function runGatewayLoop(params: {
                 getActiveTaskCount,
                 listActiveEmbeddedRunSessionIds,
                 listActiveEmbeddedRunSessionKeys,
-                markRestartAbortedMainSessions,
+                reserveRestartAbortedMainSessions,
                 waitForActiveEmbeddedRuns,
                 waitForActiveTasks,
               } = await loadGatewayLifecycleRuntimeModule();
@@ -540,15 +541,17 @@ export async function runGatewayLoop(params: {
                   return;
                 }
                 try {
-                  await markRestartAbortedMainSessions({
+                  await reserveRestartAbortedMainSessions({
                     cfg: getRuntimeConfig(),
                     sessionKeys,
                     sessionIds,
                     reason,
                   });
                 } catch (err) {
-                  gatewayLog.warn(
-                    `failed to mark interrupted main sessions for restart recovery: ${String(err)}`,
+                  restartRecoveryReservationFailed = true;
+                  throw new Error(
+                    "restart cancelled because active main-session recovery was not durable",
+                    { cause: err },
                   );
                 }
               };
@@ -570,7 +573,6 @@ export async function runGatewayLoop(params: {
 
               // Reject new enqueues immediately during the drain window so
               // sessions get an explicit restart error instead of silent task loss.
-              markRestartDraining();
               const activeTasks = getActiveTaskCount();
               const activeRuns = getActiveEmbeddedRunCount();
               activeTasksAtDrainStart = activeTasks;
@@ -597,9 +599,6 @@ export async function runGatewayLoop(params: {
                 }
                 if (restartIntent?.force) {
                   gatewayLog.warn("forced restart requested; skipping active work drain");
-                  await markActiveMainSessionsForRestart(
-                    restartIntent.reason ?? "forced gateway restart",
-                  );
                   abortEmbeddedAgentRun(undefined, { mode: "all", reason: "restart" });
                 } else {
                   const stillPendingDrainLogger = createStillPendingDrainLogger();
@@ -631,7 +630,6 @@ export async function runGatewayLoop(params: {
                   } else {
                     drainTimedOut = true;
                     gatewayLog.warn("drain timeout reached; proceeding with restart");
-                    await markActiveMainSessionsForRestart("gateway restart drain timeout");
                     // Final best-effort abort to avoid carrying active runs into the
                     // next lifecycle when drain time budget is exhausted.
                     if (!abortedAfterRunTimeout) {
@@ -658,19 +656,32 @@ export async function runGatewayLoop(params: {
           ...(closeDrainTimeoutMs !== null ? { drainTimeoutMs: closeDrainTimeoutMs } : {}),
         });
       } catch (err) {
+        if (isRestart && eagerLifecycleRuntime.isGatewayRestartPreparationError(err)) {
+          restartRecoveryReservationFailed = true;
+        }
         gatewayLog.error(`shutdown error: ${String(err)}`);
       } finally {
-        server = null;
-        if (isRestart) {
-          try {
-            await handleRestartAfterServerClose();
-          } finally {
-            clearForceExitTimer();
-            forceActiveRestartExit = null;
-          }
-        } else {
+        if (isRestart && restartRecoveryReservationFailed) {
           clearForceExitTimer();
-          await handleStopAfterServerClose();
+          forceActiveRestartExit = null;
+          activeRestartRequest = null;
+          shuttingDown = false;
+          rollbackRestartPreparation();
+          gatewayLog.error("restart cancelled; gateway remains online");
+        } else {
+          restartPreparationAdmission = null;
+          server = null;
+          if (isRestart) {
+            try {
+              await handleRestartAfterServerClose();
+            } finally {
+              clearForceExitTimer();
+              forceActiveRestartExit = null;
+            }
+          } else {
+            clearForceExitTimer();
+            await handleStopAfterServerClose();
+          }
         }
       }
     })();
@@ -736,7 +747,7 @@ export async function runGatewayLoop(params: {
     }
     const isRestart = action === "restart";
     if (isRestart) {
-      markRestartDraining();
+      beginRestartPreparation();
     }
     shuttingDown = true;
     gatewayLog.info(`received ${signal}; ${isRestart ? "restarting" : "shutting down"}`);
@@ -804,7 +815,6 @@ export async function runGatewayLoop(params: {
       if (restartIntent) {
         abortPendingChannelReloads();
         const authorized = consumeGatewaySigusr1RestartAuthorization();
-        markRestartDraining();
         if (authorized) {
           markGatewaySigusr1RestartHandled();
         }
@@ -838,7 +848,6 @@ export async function runGatewayLoop(params: {
       abortPendingChannelReloads();
       const sigusr1RestartIntent = consumeGatewaySigusr1RestartIntent();
       const restartReason = peekGatewaySigusr1RestartReason();
-      markRestartDraining();
       markGatewaySigusr1RestartHandled();
       request(
         "restart",
@@ -860,10 +869,7 @@ export async function runGatewayLoop(params: {
         // Best-effort: the eager reference itself is the recovery path.
       }
       try {
-        eagerLifecycleRuntime.rollbackGatewayRestartSignalAdmission();
-        // A later signal must repeat the synchronous close transition even if
-        // this handler failed after marking the one-way drain.
-        restartDrainingMarked = false;
+        rollbackRestartPreparation();
       } catch {
         // Keep admission recovery independent from restart-token recovery.
       }
@@ -919,7 +925,7 @@ export async function runGatewayLoop(params: {
     let isFirstStart = true;
     for (;;) {
       await onIteration();
-      restartDrainingMarked = false;
+      restartPreparationAdmission = null;
       startupStartedAt = Date.now();
       let startupFailedBeforeServerHandle = false;
       try {

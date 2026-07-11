@@ -835,6 +835,43 @@ describe("handleToolExecutionEnd cron mutation tracking", () => {
 });
 
 describe("handleToolExecutionEnd private result observer", () => {
+  it("projects recovery identity to after-tool hooks", async () => {
+    const { ctx } = createTestContext();
+    const runAfterToolCall = vi.fn(async () => undefined);
+    ctx.params.runId = "private-recovery-attempt";
+    ctx.params.publicRunId = "public-recovery-turn";
+    ctx.hookRunner = {
+      hasHooks: vi.fn((hookName: string) => hookName === "after_tool_call"),
+      runAfterToolCall,
+    } as never;
+
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "read",
+        toolCallId: "tool-read",
+        args: { path: "README.md" },
+      } as never,
+    );
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "read",
+        toolCallId: "tool-read",
+        isError: false,
+        result: { ok: true },
+      } as never,
+    );
+
+    expect(runAfterToolCall).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: "public-recovery-turn" }),
+      expect.objectContaining({ runId: "public-recovery-turn" }),
+    );
+    expect(JSON.stringify(runAfterToolCall.mock.calls)).not.toContain("private-recovery-attempt");
+  });
+
   it("reports the sanitized original tool result", async () => {
     const { ctx } = createTestContext();
     const onAgentToolResult = vi.fn();

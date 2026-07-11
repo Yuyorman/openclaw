@@ -361,7 +361,7 @@ async function persistCliAssistantTranscript(params: {
       agentId: runParams.agentId,
       expectedSessionId: runParams.sessionId,
       storePath: runParams.storePath,
-      idempotencyKey: `cli-assistant:${runParams.runId}`,
+      idempotencyKey: `cli-assistant:${runParams.publicRunId ?? runParams.runId}`,
       config: runParams.config,
       beforeMessageWrite: runAgentHarnessBeforeMessageWriteHook,
       message: buildAssistantMessage({
@@ -481,15 +481,17 @@ export function runCliAgent(paramsInput: RunCliAgentParams): Promise<EmbeddedAge
 
 async function runCliAgentInternal(params: RunCliAgentParams): Promise<EmbeddedAgentRunResult> {
   assertAgentRunLifecycleGenerationCurrent(params.lifecycleGeneration!);
+  const publicRunId = params.publicRunId ?? params.runId;
   // Cron gate must fire before prepareCliRunContext — that call allocates
   // backend resources released only by runPreparedCliAgent's try…finally.
-  params.onExecutionStarted?.();
+  await params.executionOwner?.start({ lifecycleGeneration: params.lifecycleGeneration! });
+  await params.onExecutionStarted?.();
   if (params.trigger === "cron") {
     const startedAt = Date.now();
     const hookRunner = getGlobalHookRunner();
     if (hookRunner?.hasHooks("before_agent_reply")) {
       const hookContext = {
-        runId: params.runId,
+        runId: publicRunId,
         jobId: params.jobId,
         agentId: params.agentId,
         sessionKey: params.sessionKey,
@@ -594,6 +596,7 @@ export async function runPreparedCliAgent(
 ): Promise<EmbeddedAgentRunResult> {
   const { executePreparedCliRun } = await import("./cli-runner/execute.runtime.js");
   const { params } = context;
+  const publicRunId = params.publicRunId ?? params.runId;
   const sessionBindingDisabled = context.preparedBackend.backend.sessionMode === "none";
   const hookRunner = getGlobalHookRunner();
   const hasLlmInputHooks = hookRunner?.hasHooks("llm_input") === true;
@@ -614,7 +617,7 @@ export async function runPreparedCliAgent(
       })
     : [];
   const llmInputEvent = {
-    runId: params.runId,
+    runId: publicRunId,
     sessionId: params.sessionId,
     provider: params.provider,
     model: context.modelId,
@@ -624,7 +627,7 @@ export async function runPreparedCliAgent(
     imagesCount: params.images?.length ?? 0,
   } as const;
   const hookContext = {
-    runId: params.runId,
+    runId: publicRunId,
     jobId: params.jobId,
     agentId: params.agentId,
     sessionKey: params.sessionKey,
@@ -744,7 +747,7 @@ export async function runPreparedCliAgent(
       messagingToolSourceReplyPayloads: evidence.messagingToolSourceReplyPayloads,
       sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
       agentId: params.agentId,
-      runId: params.runId,
+      runId: publicRunId,
     });
   };
 
@@ -842,7 +845,7 @@ export async function runPreparedCliAgent(
       role: "user" as const,
       content: [{ type: "text" as const, text: block.message }],
       timestamp: nowMs,
-      idempotencyKey: `hook-block:before_agent_run:user:${params.runId}`,
+      idempotencyKey: `hook-block:before_agent_run:user:${params.publicRunId ?? params.runId}`,
       __openclaw: {
         beforeAgentRunBlocked: {
           blockedBy: block.pluginId,
@@ -953,7 +956,7 @@ export async function runPreparedCliAgent(
     if (assistantText.length > 0 && hasLlmOutputHooks) {
       runAgentHarnessLlmOutputHook({
         event: {
-          runId: params.runId,
+          runId: publicRunId,
           sessionId: params.sessionId,
           provider: params.provider,
           model: context.modelId,

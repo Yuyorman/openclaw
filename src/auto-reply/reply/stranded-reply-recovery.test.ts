@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import { completeFollowupRunLifecycle, markFollowupRunEnqueued } from "./queue/types.js";
 import {
   buildStrandedReplyRetryFollowupRun,
@@ -10,12 +11,16 @@ describe("buildStrandedReplyRetryFollowupRun lifecycle ownership", () => {
   it("does not share the client turn's queuedLifecycle with the system retry", () => {
     const onComplete = vi.fn();
     const onEnqueued = vi.fn(() => true);
+    const executionOwner = {
+      start: vi.fn(async () => {}),
+    } as unknown as MainRunRecoveryExecutionOwner;
     const parent = createMockFollowupRun({
       prompt: "user question",
       transcriptPrompt: "user question",
       queuedLifecycle: { onComplete, onEnqueued },
       admissionSessionId: "sess-rotated",
       onFollowupAdmissionWaitChange: vi.fn(),
+      executionOwner,
     });
 
     const retry = buildStrandedReplyRetryFollowupRun(parent, {
@@ -24,6 +29,8 @@ describe("buildStrandedReplyRetryFollowupRun lifecycle ownership", () => {
     });
 
     expect(retry.queuedLifecycle).toBeUndefined();
+    expect(retry.executionOwner).toBeUndefined();
+    expect(parent.executionOwner).toBe(executionOwner);
     expect(retry.strandedReplyRetry).toBe(true);
     expect(retry.summaryLine).toBe(STRANDED_REPLY_RETRY_MARKER);
     // Session routing stays; only the client-turn lifecycle identity is detached.

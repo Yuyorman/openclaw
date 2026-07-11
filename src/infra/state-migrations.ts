@@ -6,6 +6,7 @@ import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { writeAcpSessionMetaForMigration } from "../acp/runtime/session-meta.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { cleanStaleLockFiles } from "../agents/session-write-lock.js";
 import {
   listBundledChannelLegacySessionSurfaces,
   listBundledChannelLegacyStateMigrationDetectors,
@@ -18,10 +19,17 @@ import {
   resolveOAuthDir,
   resolveStateDir,
 } from "../config/paths.js";
-import type { SessionEntry } from "../config/sessions.js";
-import { saveSessionStore } from "../config/sessions.js";
+import {
+  resolveSessionFilePath,
+  resolveSessionTranscriptPathInDir,
+  saveSessionStore,
+  type SessionEntry,
+} from "../config/sessions.js";
 import { canonicalizeMainSessionAlias } from "../config/sessions/main-session.js";
-import { resolveAgentsDirFromSessionStorePath } from "../config/sessions/paths.js";
+import {
+  resolveAgentsDirFromSessionStorePath,
+  resolveCanonicalSessionStorePath,
+} from "../config/sessions/paths.js";
 import { normalizePersistedSessionEntryShape } from "../config/sessions/store-entry-shape.js";
 import {
   listConfiguredSessionStoreAgentIds,
@@ -60,6 +68,9 @@ import {
   buildAgentMainSessionKey,
   DEFAULT_AGENT_ID,
   DEFAULT_MAIN_KEY,
+  isAcpSessionKey,
+  isCronSessionKey,
+  isSubagentSessionKey,
   isValidAgentId,
   normalizeAgentId,
   normalizeMainKey,
@@ -80,6 +91,14 @@ import {
   executeSqliteQueryTakeFirstSync,
   getNodeSqliteKysely,
 } from "./kysely-sync.js";
+import {
+  buildLegacyMainRunRecoveryPlan,
+  readLegacyMainRunRecoveryTranscriptState,
+  type LegacyMainRunRecoveryEntry,
+  type LegacyMainRunRecoveryPlan,
+  type LegacyMainRunRecoveryPlanEntry,
+} from "./main-run-recovery-migration.js";
+import { formatMainRunRecoveryDoctorHint } from "./main-run-recovery-policy.js";
 import { requireNodeSqlite } from "./node-sqlite.js";
 import { parseRegistryNpmSpec } from "./npm-registry-spec.js";
 import { normalizeConversationRef } from "./outbound/session-binding-normalization.js";
@@ -3322,6 +3341,57 @@ function normalizeSessionEntry(entry: SessionEntryLike): SessionEntry | null {
   return normalized;
 }
 
+export function normalizeLegacyMainRunRecoveryEntry(
+  rawEntry: SessionEntryLike,
+): LegacyMainRunRecoveryEntry | null {
+  const entry = normalizeSessionEntry(rawEntry);
+  if (!entry) {
+    return null;
+  }
+  const restartRecoveryRuns = Array.isArray(rawEntry.restartRecoveryRuns)
+    ? rawEntry.restartRecoveryRuns.flatMap((candidate) => {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+          return [];
+        }
+        const runId = (candidate as { runId?: unknown }).runId;
+        const lifecycleGeneration = (candidate as { lifecycleGeneration?: unknown })
+          .lifecycleGeneration;
+        return typeof runId === "string" &&
+          runId.trim() &&
+          typeof lifecycleGeneration === "string" &&
+          lifecycleGeneration.trim()
+          ? [{ runId: runId.trim(), lifecycleGeneration: lifecycleGeneration.trim() }]
+          : [];
+      })
+    : undefined;
+  const restartRecoveryDeliveryContext =
+    rawEntry.restartRecoveryDeliveryContext &&
+    typeof rawEntry.restartRecoveryDeliveryContext === "object" &&
+    !Array.isArray(rawEntry.restartRecoveryDeliveryContext)
+      ? (rawEntry.restartRecoveryDeliveryContext as NonNullable<
+          LegacyMainRunRecoveryEntry["restartRecoveryDeliveryContext"]
+        >)
+      : undefined;
+  const restartRecoveryDeliveryRunId =
+    typeof rawEntry.restartRecoveryDeliveryRunId === "string" &&
+    rawEntry.restartRecoveryDeliveryRunId.trim()
+      ? rawEntry.restartRecoveryDeliveryRunId.trim()
+      : undefined;
+  const updatedAt =
+    typeof rawEntry.updatedAt === "number" &&
+    Number.isFinite(rawEntry.updatedAt) &&
+    rawEntry.updatedAt >= 0
+      ? rawEntry.updatedAt
+      : 0;
+  return {
+    ...entry,
+    updatedAt,
+    restartRecoveryRuns,
+    restartRecoveryDeliveryContext,
+    restartRecoveryDeliveryRunId,
+  };
+}
+
 function resolveUpdatedAt(entry: SessionEntryLike): number {
   return typeof entry.updatedAt === "number" && Number.isFinite(entry.updatedAt)
     ? entry.updatedAt
@@ -5486,6 +5556,400 @@ export async function migrateOrphanedSessionKeys(params: {
   }
 
   return { changes, warnings };
+}
+
+export type LegacyMainRunRecoveryMigrationBlocker = {
+  reason:
+    | "ambiguous-session-owner"
+    | "conflicting-session-identities"
+    | "distinct-store-aliases"
+    | "final-component-symlink"
+    | "invalid-session-entry"
+    | "unreadable-store"
+    | "unresolved-store-identity";
+  storePath: string;
+  sessionKey?: string;
+  sessionId?: string;
+  detail?: string;
+};
+
+export type LegacyMainRunRecoveryMigrationDetection = {
+  plans: LegacyMainRunRecoveryPlan[];
+  blockers: LegacyMainRunRecoveryMigrationBlocker[];
+};
+
+type LegacyMainRunRecoveryCandidate = {
+  sessionKey: string;
+  rawEntry: SessionEntryLike;
+  entry?: LegacyMainRunRecoveryEntry;
+  matchingStaleTranscriptLockPaths: string[];
+};
+
+function isLegacyMainRunRecoveryCandidate(
+  entry: SessionEntry,
+  sessionKey: string,
+  hasStaleTranscriptLock: boolean,
+): boolean {
+  if (entry.status !== "running" || (entry.abortedLastRun !== true && !hasStaleTranscriptLock)) {
+    return false;
+  }
+  if ((entry.spawnDepth ?? 0) > 0 || entry.subagentRole != null) {
+    return false;
+  }
+  return !(
+    isSubagentSessionKey(sessionKey) ||
+    isCronSessionKey(sessionKey) ||
+    isAcpSessionKey(sessionKey)
+  );
+}
+
+function normalizeLegacyMainRunRecoveryTranscriptLockPath(lockPath: string): string | undefined {
+  const trimmed = lockPath.trim();
+  if (!path.basename(trimmed).endsWith(".jsonl.lock")) {
+    return undefined;
+  }
+  const resolved = path.resolve(trimmed);
+  try {
+    return path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved));
+  } catch {
+    return resolved;
+  }
+}
+
+function resolveLegacyMainRunRecoveryTranscriptLockPaths(params: {
+  entry: SessionEntry;
+  sessionsDir: string;
+}): string[] {
+  const paths = new Set<string>();
+  const remember = (resolvePath: () => string) => {
+    try {
+      const normalized = normalizeLegacyMainRunRecoveryTranscriptLockPath(`${resolvePath()}.lock`);
+      if (normalized) {
+        paths.add(normalized);
+      }
+    } catch {
+      // Stale session metadata must not make the whole store unreadable.
+    }
+  };
+  remember(() =>
+    resolveSessionFilePath(params.entry.sessionId, params.entry, {
+      sessionsDir: params.sessionsDir,
+    }),
+  );
+  remember(() => resolveSessionTranscriptPathInDir(params.entry.sessionId, params.sessionsDir));
+  return [...paths];
+}
+
+function resemblesLegacyMainRunRecoveryCandidate(entry: SessionEntryLike): boolean {
+  return entry.status === "running" && entry.abortedLastRun === true;
+}
+
+export function formatLegacyMainRunRecoveryMigrationBlocker(
+  blocker: LegacyMainRunRecoveryMigrationBlocker,
+): string {
+  const reason = `Legacy main-run restart recovery is not migrated (${blocker.reason})${
+    blocker.detail ? `: ${blocker.detail}` : ""
+  }`;
+  return formatMainRunRecoveryDoctorHint({
+    storePath: blocker.storePath,
+    sessionKey: blocker.sessionKey,
+    sessionId: blocker.sessionId,
+    reason,
+  });
+}
+
+/**
+ * Finds shipped JSON main-run recovery ownership that must enter the SQLite
+ * ledger before the runtime can accept session work.
+ */
+export async function detectLegacyMainRunRecoveryMigrations(params: {
+  cfg: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+  pluginSessionStoreAgentIds?: readonly string[];
+}): Promise<LegacyMainRunRecoveryMigrationDetection> {
+  const env = params.env ?? process.env;
+  const stateDir = resolveStateDir(env);
+  const mainKey = normalizeMainKey(params.cfg.session?.mainKey);
+  const scope = params.cfg.session?.scope as SessionScope | undefined;
+  const storeConfig = params.cfg.session?.store;
+  const pluginAgentIds =
+    params.pluginSessionStoreAgentIds ??
+    listPluginDoctorSessionStoreAgentIds({
+      config: params.cfg,
+      env,
+      pluginIds: collectRelevantDoctorPluginIds(params.cfg),
+    });
+  const pluginAgentIdSet = new Set(pluginAgentIds.map((id) => normalizeAgentId(id)));
+  const storeMap = new Map<string, Set<string>>();
+  const storeAliasCandidates = new Map<string, Set<string>>();
+  const staleTranscriptLocksBySessionsDir = new Map<
+    string,
+    Promise<{ paths: Set<string>; error?: string }>
+  >();
+  const readStaleTranscriptLocks = (
+    sessionsDir: string,
+  ): Promise<{ paths: Set<string>; error?: string }> => {
+    const resolvedSessionsDir = path.resolve(sessionsDir);
+    const cached = staleTranscriptLocksBySessionsDir.get(resolvedSessionsDir);
+    if (cached) {
+      return cached;
+    }
+    const pending = cleanStaleLockFiles({
+      sessionsDir: resolvedSessionsDir,
+      config: params.cfg,
+      env,
+      removeStale: false,
+    })
+      .then(({ locks }) => ({
+        paths: new Set(
+          locks
+            .filter((lock) => lock.stale && lock.removable)
+            .map((lock) => normalizeLegacyMainRunRecoveryTranscriptLockPath(lock.lockPath))
+            .filter((lockPath): lockPath is string => Boolean(lockPath)),
+        ),
+      }))
+      .catch((err: unknown) => ({ paths: new Set<string>(), error: String(err) }));
+    staleTranscriptLocksBySessionsDir.set(resolvedSessionsDir, pending);
+    return pending;
+  };
+  const rememberStore = (candidatePath: string, agentId: string) => {
+    const storePath =
+      [...storeMap.keys()].find((existing) => sessionStorePathsMatch(existing, candidatePath)) ??
+      candidatePath;
+    const aliases = storeAliasCandidates.get(storePath) ?? new Set([storePath]);
+    aliases.add(candidatePath);
+    storeAliasCandidates.set(storePath, aliases);
+    const owners = storeMap.get(storePath) ?? new Set<string>();
+    owners.add(agentId);
+    storeMap.set(storePath, owners);
+  };
+  const rememberAgentStore = (rawAgentId: string) => {
+    const agentId = normalizeAgentId(rawAgentId);
+    if (!isValidAgentId(agentId)) {
+      return;
+    }
+    rememberStore(
+      storeConfig
+        ? resolveStorePathFromTemplate(storeConfig, agentId, env)
+        : path.join(stateDir, "agents", agentId, "sessions", "sessions.json"),
+      agentId,
+    );
+  };
+  for (const agentId of listConfiguredSessionStoreAgentIds(params.cfg)) {
+    rememberAgentStore(agentId);
+  }
+  for (const agentId of pluginAgentIds) {
+    rememberAgentStore(agentId);
+  }
+  for (const entry of safeReadDir(path.join(stateDir, "agents"))) {
+    const agentId = normalizeAgentId(entry.name);
+    if (entry.isDirectory() && isValidAgentId(agentId)) {
+      rememberStore(
+        path.join(stateDir, "agents", entry.name, "sessions", "sessions.json"),
+        agentId,
+      );
+    }
+  }
+
+  const plans: LegacyMainRunRecoveryPlan[] = [];
+  const blockers: LegacyMainRunRecoveryMigrationBlocker[] = [];
+  for (const [mappedStorePath, agentIds] of storeMap) {
+    const aliases = storeAliasCandidates.get(mappedStorePath) ?? new Set([mappedStorePath]);
+    const storePath = [...aliases].find((candidate) => fileExists(candidate));
+    if (!storePath) {
+      continue;
+    }
+    let parsed: ReturnType<typeof readSessionStoreJson5>;
+    try {
+      parsed = readSessionStoreJson5(storePath);
+    } catch (err) {
+      blockers.push({
+        reason: "unreadable-store",
+        storePath,
+        detail: String(err),
+      });
+      continue;
+    }
+    if (!parsed.ok) {
+      blockers.push({ reason: "unreadable-store", storePath });
+      continue;
+    }
+    const sessionsDir = path.dirname(storePath);
+    const staleTranscriptLocks = await readStaleTranscriptLocks(sessionsDir);
+    if (staleTranscriptLocks.error) {
+      blockers.push({
+        reason: "unreadable-store",
+        storePath,
+        detail: `failed to inspect transcript locks: ${staleTranscriptLocks.error}`,
+      });
+      continue;
+    }
+    const candidates: LegacyMainRunRecoveryCandidate[] = Object.entries(parsed.store).flatMap(
+      ([sessionKey, rawEntry]) => {
+        const entry = normalizeLegacyMainRunRecoveryEntry(rawEntry);
+        if (!entry) {
+          return resemblesLegacyMainRunRecoveryCandidate(rawEntry)
+            ? [{ sessionKey, rawEntry, matchingStaleTranscriptLockPaths: [] }]
+            : [];
+        }
+        const matchingStaleTranscriptLockPaths = resolveLegacyMainRunRecoveryTranscriptLockPaths({
+          entry,
+          sessionsDir,
+        }).filter((lockPath) => staleTranscriptLocks.paths.has(lockPath));
+        return isLegacyMainRunRecoveryCandidate(
+          entry,
+          sessionKey,
+          matchingStaleTranscriptLockPaths.length > 0,
+        )
+          ? [{ sessionKey, rawEntry, entry, matchingStaleTranscriptLockPaths }]
+          : [];
+      },
+    );
+    if (candidates.length === 0) {
+      continue;
+    }
+    const aliasPlan = resolveSessionStoreAliasPlan(storePath, aliases);
+    const aliasBlockerReason = aliasPlan.hasUnresolvedIdentity
+      ? "unresolved-store-identity"
+      : aliasPlan.hasFinalSymlink
+        ? "final-component-symlink"
+        : aliasPlan.hasDistinctAliases
+          ? "distinct-store-aliases"
+          : undefined;
+    const pluginForeignMainAliasRisk = [...agentIds].some(
+      (agentId) => pluginAgentIdSet.has(agentId) && agentId !== DEFAULT_AGENT_ID,
+    );
+    const groupedCandidates = new Map<
+      string,
+      {
+        agentIds: Set<string>;
+        entries: LegacyMainRunRecoveryPlanEntry[];
+        staleTranscriptLockPaths: Set<string>;
+      }
+    >();
+    const blockedSessionIds = new Set<string>();
+    for (const candidate of candidates) {
+      const entry = candidate.entry;
+      if (!entry) {
+        if (typeof candidate.rawEntry.sessionId === "string") {
+          blockedSessionIds.add(candidate.rawEntry.sessionId);
+        }
+        blockers.push({
+          reason: "invalid-session-entry",
+          storePath,
+          sessionKey: candidate.sessionKey,
+        });
+        continue;
+      }
+      if (aliasBlockerReason) {
+        blockedSessionIds.add(entry.sessionId);
+        blockers.push({
+          reason: aliasBlockerReason,
+          storePath,
+          sessionKey: candidate.sessionKey,
+          sessionId: entry.sessionId,
+        });
+        continue;
+      }
+      const canonicalOwner = resolveCanonicalAgentSessionOwner(candidate.sessionKey);
+      const ambiguousSharedKey =
+        agentIds.size > 1 && isAmbiguousSharedStoreKey(candidate.sessionKey, mainKey, scope);
+      const foreignMainAlias =
+        pluginForeignMainAliasRisk && isLegacyDefaultMainAliasKey(candidate.sessionKey, mainKey);
+      const soleOwner = agentIds.size === 1 ? [...agentIds][0] : undefined;
+      const agentId = canonicalOwner ?? soleOwner;
+      if (!agentId || ambiguousSharedKey || foreignMainAlias) {
+        blockedSessionIds.add(entry.sessionId);
+        blockers.push({
+          reason: "ambiguous-session-owner",
+          storePath,
+          sessionKey: candidate.sessionKey,
+          sessionId: entry.sessionId,
+        });
+        continue;
+      }
+      const group = groupedCandidates.get(entry.sessionId) ?? {
+        agentIds: new Set<string>(),
+        entries: [],
+        staleTranscriptLockPaths: new Set<string>(),
+      };
+      group.agentIds.add(agentId);
+      group.entries.push({ entry, sessionKey: candidate.sessionKey });
+      for (const lockPath of candidate.matchingStaleTranscriptLockPaths) {
+        group.staleTranscriptLockPaths.add(lockPath);
+      }
+      groupedCandidates.set(entry.sessionId, group);
+    }
+    for (const [sessionId, group] of groupedCandidates) {
+      // Never import only one alias of a physical session: unresolved sibling
+      // ownership must be repaired before SQLite can become the sole owner.
+      if (blockedSessionIds.has(sessionId)) {
+        continue;
+      }
+      if (group.agentIds.size !== 1) {
+        for (const candidate of group.entries) {
+          blockers.push({
+            reason: "ambiguous-session-owner",
+            storePath,
+            sessionKey: candidate.sessionKey,
+            sessionId,
+          });
+        }
+        continue;
+      }
+      let canonicalStorePath: string;
+      try {
+        canonicalStorePath = resolveCanonicalSessionStorePath(storePath);
+      } catch (err) {
+        blockers.push({
+          reason: "unresolved-store-identity",
+          storePath,
+          sessionId,
+          detail: String(err),
+        });
+        continue;
+      }
+      const primary = group.entries.toSorted((left, right) => {
+        const updatedOrder = right.entry.updatedAt - left.entry.updatedAt;
+        return updatedOrder !== 0 ? updatedOrder : left.sessionKey.localeCompare(right.sessionKey);
+      })[0];
+      if (!primary) {
+        continue;
+      }
+      const transcriptState = await readLegacyMainRunRecoveryTranscriptState({
+        entry: primary.entry,
+        storePath: canonicalStorePath,
+      });
+      const planned = buildLegacyMainRunRecoveryPlan({
+        agentId: [...group.agentIds][0] as string,
+        entries: group.entries,
+        storePath: canonicalStorePath,
+        staleTranscriptLockPaths: [...group.staleTranscriptLockPaths],
+        transcriptState,
+      });
+      if (planned.status === "blocked") {
+        for (const candidate of group.entries) {
+          blockers.push({
+            reason: planned.reason,
+            storePath,
+            sessionKey: candidate.sessionKey,
+            sessionId,
+          });
+        }
+        continue;
+      }
+      plans.push(planned.plan);
+    }
+  }
+  return {
+    plans: plans.toSorted((left, right) => left.sourceKey.localeCompare(right.sourceKey)),
+    blockers: blockers.toSorted((left, right) => {
+      const storeOrder = left.storePath.localeCompare(right.storePath);
+      return storeOrder !== 0
+        ? storeOrder
+        : (left.sessionKey ?? "").localeCompare(right.sessionKey ?? "");
+    }),
+  };
 }
 
 async function migrateLegacyAcpSessionMetadata(params: {

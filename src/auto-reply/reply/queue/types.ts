@@ -4,6 +4,7 @@ import type { AutoFallbackPrimaryProbe } from "../../../agents/agent-scope.js";
 import type { ExecToolDefaults } from "../../../agents/bash-tools.js";
 import type { CliSessionBindingFacts } from "../../../agents/cli-runner/types.js";
 import type { CurrentInboundPromptContext } from "../../../agents/embedded-agent-runner/run/params.js";
+import type { MainRunRecoveryExecutionOwner } from "../../../agents/main-run-recovery-execution-owner.js";
 import type { SilentReplyPromptMode } from "../../../agents/system-prompt.types.js";
 import type { ChatType } from "../../../channels/chat-type.js";
 import type { InboundEventKind } from "../../../channels/inbound-event/kind.js";
@@ -75,6 +76,8 @@ export type FollowupRun = {
   queuedLifecycle?: QueuedReplyLifecycle;
   /** Dispatch-scoped freshness owner for a queued delivery-barrier wait. */
   onFollowupAdmissionWaitChange?: (waiting: boolean) => void;
+  /** Exact recovery capability; its presence makes this turn individual and non-droppable. */
+  executionOwner?: MainRunRecoveryExecutionOwner;
   /** Provider message ID, when available (for deduplication). */
   messageId?: string;
   summaryLine?: string;

@@ -58,6 +58,7 @@ import { runEmbeddedAgent, type EmbeddedAgentRunResult } from "../embedded-agent
 import { FailoverError } from "../failover-error.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../harness/hook-helpers.js";
 import { resolveAvailableAgentHarnessPolicy } from "../harness/selection.js";
+import type { MainRunRecoveryExecutionOwner } from "../main-run-recovery-execution-owner.js";
 import { resolveCliRuntimeExecutionProvider } from "../model-runtime-aliases.js";
 import { isCliProvider } from "../model-selection.js";
 import { resolveOpenAIRuntimeProvider } from "../openai-routing.js";
@@ -488,7 +489,8 @@ export function runAgentAttempt(params: {
   suppressPromptPersistenceOnRetry?: boolean;
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
   onUserMessagePersisted?: (message: Extract<AgentMessage, { role: "user" }>) => void;
-  onLifecycleGenerationChanged?: (lifecycleGeneration: string) => void;
+  executionOwner?: MainRunRecoveryExecutionOwner;
+  onExecutionStarted?: (info: { lifecycleGeneration: string }) => Promise<void>;
 }) {
   const sessionAuthProfileId = params.sessionEntry?.authProfileOverride?.trim();
   const sessionAuthProfileSource = params.sessionEntry?.authProfileOverrideSource;
@@ -714,7 +716,9 @@ export function runAgentAttempt(params: {
         timeoutMs: params.timeoutMs,
         runTimeoutOverrideMs: params.runTimeoutOverrideMs,
         runId: params.runId,
+        publicRunId: params.executionOwner?.publicRunId,
         lifecycleGeneration: params.lifecycleGeneration,
+        executionOwner: params.executionOwner,
         lane: params.opts.lane,
         extraSystemPrompt: params.opts.extraSystemPrompt,
         inputProvenance: params.opts.inputProvenance,
@@ -763,6 +767,9 @@ export function runAgentAttempt(params: {
         oneShotCliRun: params.opts.oneShotCliRun,
         userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
         suppressNextUserMessagePersistence: params.suppressPromptPersistenceOnRetry === true,
+        onExecutionStarted: async () => {
+          await params.onExecutionStarted?.({ lifecycleGeneration: params.lifecycleGeneration });
+        },
         ...(mutableCliSessionStore
           ? {
               onBeforeFreshCliSessionRetry: async (retry) => {
@@ -869,7 +876,9 @@ export function runAgentAttempt(params: {
     approvalReviewerDeviceId: params.opts.approvalReviewerDeviceId,
     timeoutMs: params.timeoutMs,
     runId: params.runId,
+    publicRunId: params.executionOwner?.publicRunId,
     lifecycleGeneration: params.lifecycleGeneration,
+    executionOwner: params.executionOwner,
     lane: params.opts.lane,
     // Hidden internal runs have no assistant-event consumer. Visible subagent
     // lanes can still feed Control UI, session subscribers, and ACP parent relays.
@@ -898,10 +907,10 @@ export function runAgentAttempt(params: {
     suppressNextUserMessagePersistence: params.suppressPromptPersistenceOnRetry === true,
     userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
     onUserMessagePersisted: params.onUserMessagePersisted,
-    onExecutionStarted: (info) => {
-      if (info?.lifecycleGeneration) {
-        params.onLifecycleGenerationChanged?.(info.lifecycleGeneration);
-      }
+    onExecutionStarted: async (info) => {
+      await params.onExecutionStarted?.({
+        lifecycleGeneration: info?.lifecycleGeneration ?? params.lifecycleGeneration,
+      });
     },
     onSessionIdChanged: params.opts.onSessionIdChanged,
     bootstrapPromptWarningSignaturesSeen,

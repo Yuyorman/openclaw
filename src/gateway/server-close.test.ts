@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isAgentRunRestartAbortReason } from "../agents/run-termination.js";
 import type { InternalHookEvent } from "../hooks/internal-hooks.js";
+import { createActiveRunIdentity } from "./active-run-registry.js";
 
 type TriggerInternalHookMock = (event: InternalHookEvent) => Promise<void>;
 
@@ -556,6 +557,7 @@ describe("createGatewayCloseHandler", () => {
         removeChatRun: vi.fn(() => ({
           sessionKey: "session-1",
           clientRunId: "run-1",
+          runIdentity: createActiveRunIdentity("run-1"),
           registeredAtMs: 1_000,
           registeredSequence: 1,
         })),
@@ -752,6 +754,63 @@ describe("createGatewayCloseHandler", () => {
     expect(chatAbortControllers.has("run-finalizing")).toBe(true);
   });
 
+  it("awaits recovery worker quiescence before reserving and aborting restart runs", async () => {
+    const events: string[] = [];
+    let releaseWorker!: () => void;
+    const workerQuiesced = new Promise<void>((resolve) => {
+      releaseWorker = resolve;
+    });
+    const controller = new AbortController();
+    controller.signal.addEventListener("abort", () => {
+      events.push("abort");
+    });
+    const markMainSessionsAbortedForRestart = vi.fn<MarkMainSessionsAbortedForRestart>(async () => {
+      events.push("reserve");
+    });
+    const stopMainRunRecoveryWorker = vi.fn(async () => {
+      events.push("worker-stop:start");
+      await workerQuiesced;
+      events.push("worker-stop:end");
+    });
+    const chatAbortControllers = new Map([
+      [
+        "run-1",
+        {
+          controller,
+          sessionId: "session-id-1",
+          sessionKey: "agent:main:main",
+          lifecycleGeneration: "generation-1",
+          startedAtMs: Date.now(),
+          expiresAtMs: Date.now() + 60_000,
+        },
+      ],
+    ]);
+    const close = createGatewayCloseHandler(
+      createGatewayCloseTestDeps({
+        chatAbortControllers,
+        markMainSessionsAbortedForRestart,
+        stopMainRunRecoveryWorker,
+      }),
+    );
+
+    const closePromise = close({
+      reason: "gateway restarting",
+      restartExpectedMs: 123,
+      drainTimeoutMs: 0,
+    });
+    await vi.waitFor(() => {
+      expect(events).toEqual(["worker-stop:start"]);
+    });
+    expect(markMainSessionsAbortedForRestart).not.toHaveBeenCalled();
+    expect(controller.signal.aborted).toBe(false);
+
+    releaseWorker();
+    await closePromise;
+
+    expect(events).toEqual(["worker-stop:start", "worker-stop:end", "reserve", "abort"]);
+    expect(stopMainRunRecoveryWorker).toHaveBeenCalledTimes(1);
+  });
+
   it("marks active main sessions for restart recovery before aborting restart-drained runs", async () => {
     const events: string[] = [];
     const controller = new AbortController();
@@ -833,6 +892,7 @@ describe("createGatewayCloseHandler", () => {
       return {
         sessionKey: "agent:main:main",
         clientRunId: "run-1",
+        runIdentity: createActiveRunIdentity("run-1"),
         registeredAtMs: 1_000,
         registeredSequence: 1,
       };
@@ -1188,7 +1248,7 @@ describe("createGatewayCloseHandler", () => {
     expect(restartRecoveryCandidates.size).toBe(0);
   });
 
-  it("continues restart shutdown when marking active main sessions fails", async () => {
+  it("does not abort active runs when restart recovery reservation fails", async () => {
     const controller = new AbortController();
     const chatAbortControllers = new Map([
       [
@@ -1202,24 +1262,37 @@ describe("createGatewayCloseHandler", () => {
         },
       ],
     ]);
-    const close = createGatewayCloseHandler(
-      createGatewayCloseTestDeps({
-        chatAbortControllers,
-        markMainSessionsAbortedForRestart: vi.fn(async () => {
-          throw new Error("marker unavailable");
-        }),
+    const resumeMainRunRecoveryWorker = vi.fn(() => true);
+    const quiesceMainRunRecoveryWorker = vi.fn(async () => ({
+      resume: resumeMainRunRecoveryWorker,
+    }));
+    const deps = createGatewayCloseTestDeps({
+      chatAbortControllers,
+      quiesceMainRunRecoveryWorker,
+      markMainSessionsAbortedForRestart: vi.fn(async () => {
+        throw new Error("marker unavailable");
       }),
-    );
+    });
+    const close = createGatewayCloseHandler(deps);
 
-    const result = await close({
-      reason: "gateway restarting",
-      restartExpectedMs: 123,
-      drainTimeoutMs: 0,
+    await expect(
+      close({
+        reason: "gateway restarting",
+        restartExpectedMs: 123,
+        drainTimeoutMs: 0,
+      }),
+    ).rejects.toMatchObject({
+      code: "GATEWAY_RESTART_PREPARATION_FAILED",
+      name: "GatewayRestartPreparationError",
     });
 
-    expect(result.warnings).toContain("restart-main-session-marker");
-    expect(controller.signal.aborted).toBe(true);
-    expect(chatAbortControllers.size).toBe(0);
+    expect(controller.signal.aborted).toBe(false);
+    expect(chatAbortControllers.size).toBe(1);
+    expect(deps.cron.stop).not.toHaveBeenCalled();
+    expect(deps.heartbeatRunner.stop).not.toHaveBeenCalled();
+    expect(mocks.triggerInternalHook).not.toHaveBeenCalled();
+    expect(quiesceMainRunRecoveryWorker).toHaveBeenCalledOnce();
+    expect(resumeMainRunRecoveryWorker).toHaveBeenCalledOnce();
     expect(
       mocks.logWarn.mock.calls.some(([message]) =>
         String(message).includes(

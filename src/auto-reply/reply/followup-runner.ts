@@ -24,6 +24,7 @@ import {
 import { runEmbeddedAgent } from "../../agents/embedded-agent.js";
 import type { FastModeAutoProgressState } from "../../agents/fast-mode.js";
 import { ensureSelectedAgentHarnessPlugin } from "../../agents/harness/runtime-plugin.js";
+import { isMainRunRecoveryOwnershipLostError } from "../../agents/main-run-recovery-errors.js";
 import {
   isFallbackSummaryError,
   runWithModelFallback,
@@ -1178,6 +1179,7 @@ export function createFollowupRunner(params: {
                   onAgentRunStart: () => opts?.onAgentRunStart?.(runId),
                   suppressAssistantBridge: run.silentExpected,
                   onActivity: () => replyOperation?.recordActivity(),
+                  executionOwner: effectiveQueued.executionOwner,
                   preserveProgressCallbackStartOrder,
                   onReasoningText: createCliReasoningStreamBridge(progressOpts?.onReasoningStream),
                   onReasoningProgress: async (payload) => {
@@ -1464,6 +1466,7 @@ export function createFollowupRunner(params: {
                 isFinalFallbackAttempt: runOptions?.isFinalFallbackAttempt,
                 abortSignal: runAbortSignal,
                 deferTerminalLifecycle: true,
+                executionOwner: effectiveQueued.executionOwner,
                 onExecutionStarted: (info) => {
                   if (info?.lifecycleGeneration) {
                     lifecycleGeneration = info.lifecycleGeneration;
@@ -1594,6 +1597,10 @@ export function createFollowupRunner(params: {
           });
         }
       } catch (err) {
+        if (isMainRunRecoveryOwnershipLostError(err)) {
+          clearAgentRunContext(runId, lifecycleGeneration);
+          throw err;
+        }
         if (
           replyOperation.result?.kind === "aborted" &&
           replyOperation.result.code === "aborted_by_user"

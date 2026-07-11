@@ -1092,6 +1092,7 @@ async function resolveExistingAttemptTranscriptState(params: {
 export async function runEmbeddedAttempt(
   params: EmbeddedRunAttemptParams,
 ): Promise<EmbeddedRunAttemptResult> {
+  const publicRunId = params.publicRunId ?? params.runId;
   const resolvedWorkspace = resolveUserPath(params.workspaceDir);
   const runAbortController = new AbortController();
   // Ultra is a logical orchestration mode, not a provider effort. Preserve it for
@@ -1102,7 +1103,7 @@ export async function runEmbeddedAttempt(
   configureEmbeddedAttemptHttpRuntime({ timeoutMs: params.timeoutMs });
 
   log.debug(
-    `embedded run start: runId=${params.runId} sessionId=${params.sessionId} provider=${params.provider} model=${params.modelId} thinking=${params.thinkLevel} messageChannel=${params.messageChannel ?? params.messageProvider ?? "unknown"}`,
+    `embedded run start: runId=${publicRunId} sessionId=${params.sessionId} provider=${params.provider} model=${params.modelId} thinking=${params.thinkLevel} messageChannel=${params.messageChannel ?? params.messageProvider ?? "unknown"}`,
   );
   const prepStages = createEmbeddedRunStageTracker();
   const emitPrepStageSummary = (phase: string) => {
@@ -1112,7 +1113,7 @@ export async function runEmbeddedAttempt(
       return;
     }
     const message = formatEmbeddedRunStageSummary(
-      `[trace:embedded-run] prep stages: runId=${params.runId} sessionId=${params.sessionId} phase=${phase}`,
+      `[trace:embedded-run] prep stages: runId=${publicRunId} sessionId=${params.sessionId} phase=${phase}`,
       summary,
     );
     if (shouldWarn) {
@@ -1136,7 +1137,7 @@ export async function runEmbeddedAttempt(
       return;
     }
     const message = formatEmbeddedRunStageSummary(
-      `[trace:embedded-run] core-plugin-tool stages: runId=${params.runId} sessionId=${params.sessionId} phase=${phase}`,
+      `[trace:embedded-run] core-plugin-tool stages: runId=${publicRunId} sessionId=${params.sessionId} phase=${phase}`,
       summary,
     );
     if (shouldWarn) {
@@ -1422,7 +1423,7 @@ export async function runEmbeddedAttempt(
       createChildDiagnosticTraceContext(diagnosticTrace),
     );
     const diagnosticRunBase = {
-      runId: params.runId,
+      runId: publicRunId,
       ...(params.sessionKey && { sessionKey: params.sessionKey }),
       ...(params.sessionId && { sessionId: params.sessionId }),
       provider: params.provider,
@@ -1627,6 +1628,7 @@ export async function runEmbeddedAttempt(
                 : undefined,
             sessionId: params.sessionId,
             runId: params.runId,
+            publicRunId,
             approvalReviewerDeviceId: params.approvalReviewerDeviceId,
             oneShotCliRun: params.oneShotCliRun,
             toolSearchCatalogRef,
@@ -1870,7 +1872,7 @@ export async function runEmbeddedAttempt(
         logRuntimeToolSchemaQuarantine({
           diagnostics,
           tools: sourceTools,
-          runId: params.runId,
+          runId: publicRunId,
           agentId: sessionAgentId,
           sessionKey: params.sessionKey,
           sessionId: params.sessionId,
@@ -1954,7 +1956,7 @@ export async function runEmbeddedAttempt(
               logRuntimeToolSchemaQuarantine({
                 diagnostics,
                 tools: sourceTools,
-                runId: params.runId,
+                runId: publicRunId,
                 agentId: sessionAgentId,
                 sessionKey: params.sessionKey,
                 sessionId: params.sessionId,
@@ -1982,7 +1984,7 @@ export async function runEmbeddedAttempt(
     logRuntimeToolSchemaQuarantine({
       diagnostics: uncompactedToolSchemaProjection.diagnostics,
       tools: projectedUncompactedEffectiveTools,
-      runId: params.runId,
+      runId: publicRunId,
       agentId: sessionAgentId,
       sessionKey: params.sessionKey,
       sessionId: params.sessionId,
@@ -1996,6 +1998,7 @@ export async function runEmbeddedAttempt(
       sessionKey: sandboxSessionKey,
       sessionId: params.sessionId,
       runId: params.runId,
+      publicRunId,
       approvalReviewerDeviceId: params.approvalReviewerDeviceId,
       channelId: params.currentChannelId,
       trace: runTrace,
@@ -2254,7 +2257,7 @@ export async function runEmbeddedAttempt(
           agentId: sessionAgentId,
           sessionKey: sandboxSessionKey,
           sessionId: params.sessionId,
-          runId: params.runId,
+          runId: publicRunId,
           catalogRef: toolSearchCatalogRef,
         })
       : undefined;
@@ -2797,6 +2800,7 @@ export async function runEmbeddedAttempt(
               config: toolSearchRuntimeConfig,
               sessionId: params.sessionId,
               runId: params.runId,
+              publicRunId,
               loopDetection: clientToolLoopDetection,
               onToolOutcome: params.onToolOutcome,
               allocateToolOutcomeOrdinal: params.allocateToolOutcomeOrdinal,
@@ -3155,7 +3159,7 @@ export async function runEmbeddedAttempt(
       const cacheTrace = createCacheTrace({
         cfg: params.config,
         env: process.env,
-        runId: params.runId,
+        runId: publicRunId,
         sessionId: activeSession.sessionId,
         sessionKey: params.sessionKey,
         provider: params.provider,
@@ -3165,7 +3169,7 @@ export async function runEmbeddedAttempt(
       });
       const anthropicPayloadLogger = createAnthropicPayloadLogger({
         env: process.env,
-        runId: params.runId,
+        runId: publicRunId,
         sessionId: activeSession.sessionId,
         sessionKey: params.sessionKey,
         provider: params.provider,
@@ -3184,7 +3188,7 @@ export async function runEmbeddedAttempt(
       trajectoryRecorder = createTrajectoryRuntimeRecorder({
         cfg: params.config,
         env: process.env,
-        runId: params.runId,
+        runId: publicRunId,
         sessionId: activeSession.sessionId,
         sessionKey: params.sessionKey,
         sessionFile: trajectorySessionFile,
@@ -3591,7 +3595,7 @@ export async function runEmbeddedAttempt(
           activeSession.agent.streamFn,
           idleTimeoutMs,
           (error) => idleTimeoutTrigger?.(error),
-          { runId: params.runId },
+          { runId: publicRunId },
         );
       } else if (firstEventTimeoutMs > 0) {
         // Local providers opt out of gap policing, but the transport first-event
@@ -3601,7 +3605,7 @@ export async function runEmbeddedAttempt(
           activeSession.agent.streamFn,
           firstEventTimeoutMs,
           (error) => idleTimeoutTrigger?.(error),
-          { runId: params.runId, scope: "creation-only" },
+          { runId: publicRunId, scope: "creation-only" },
         );
       }
       if (firstEventTimeoutMs > 0) {
@@ -3623,7 +3627,7 @@ export async function runEmbeddedAttempt(
       activeSession.agent.streamFn = wrapStreamFnWithDiagnosticModelCallEvents(
         activeSession.agent.streamFn,
         {
-          runId: params.runId,
+          runId: publicRunId,
           ...(params.sessionKey && { sessionKey: params.sessionKey }),
           ...(params.sessionId && { sessionId: params.sessionId }),
           provider: params.provider,
@@ -3641,7 +3645,7 @@ export async function runEmbeddedAttempt(
             : {}),
           trace: runTrace,
           contentCapture: resolveDiagnosticModelContentCapturePolicy(params.config),
-          nextCallId: () => `${params.runId}:model:${(diagnosticModelCallSeq += 1)}`,
+          nextCallId: () => `${publicRunId}:model:${(diagnosticModelCallSeq += 1)}`,
           onStarted: () => {
             params.onExecutionPhase?.({
               phase: "model_call_started",
@@ -3884,7 +3888,7 @@ export async function runEmbeddedAttempt(
         } catch (err) {
           if (!isProbeSession) {
             log.warn(
-              `embedded run abortCompaction failed: runId=${params.runId} sessionId=${params.sessionId} err=${String(err)}`,
+              `embedded run abortCompaction failed: runId=${publicRunId} sessionId=${params.sessionId} err=${String(err)}`,
             );
           }
         }
@@ -3918,7 +3922,7 @@ export async function runEmbeddedAttempt(
         releaseEmbeddedAttemptSessionLockForAbort({
           sessionLockController,
           log,
-          runId: params.runId,
+          runId: publicRunId,
           abortKind: isTimeout ? "timeout abort" : "abort",
         });
       };
@@ -4002,14 +4006,14 @@ export async function runEmbeddedAttempt(
             ) {
               log.warn(
                 `before_agent_finalize revision limit reached; finalizing ` +
-                  `runId=${params.runId} sessionId=${params.sessionId} ` +
+                  `runId=${publicRunId} sessionId=${params.sessionId} ` +
                   `attempts=${params.beforeAgentFinalizeRevisionAttempts ?? 0}/${maxRevisionAttempts}`,
               );
               return;
             }
             const outcome = await runAgentHarnessBeforeAgentFinalizeHook({
               event: {
-                runId: params.runId,
+                runId: publicRunId,
                 sessionId: params.sessionId,
                 ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
                 provider: reportedModelRef.provider,
@@ -4023,7 +4027,7 @@ export async function runEmbeddedAttempt(
                 messages: hookMessages,
               },
               ctx: {
-                runId: params.runId,
+                runId: publicRunId,
                 trace: freezeDiagnosticTraceContext(diagnosticTrace),
                 agentId: hookAgentId,
                 sessionKey: params.sessionKey,
@@ -4048,7 +4052,7 @@ export async function runEmbeddedAttempt(
             if (event.hadDeterministicSideEffect) {
               log.warn(
                 `before_agent_finalize requested revision after potential side effects; finalizing ` +
-                  `runId=${params.runId} sessionId=${params.sessionId}`,
+                  `runId=${publicRunId} sessionId=${params.sessionId}`,
               );
               return;
             }
@@ -4062,6 +4066,7 @@ export async function runEmbeddedAttempt(
         buildEmbeddedSubscriptionParams({
           session: activeSession,
           runId: params.runId,
+          publicRunId,
           lifecycleGeneration: params.lifecycleGeneration,
           messageChannel: runtimeChannel,
           initialReplayState: params.initialReplayState,
@@ -4283,7 +4288,7 @@ export async function runEmbeddedAttempt(
               if (!isProbeSession) {
                 log.warn(
                   `embedded run timeout reached during compaction; extending deadline: ` +
-                    `runId=${params.runId} sessionId=${params.sessionId} extraMs=${compactionTimeoutMs}`,
+                    `runId=${publicRunId} sessionId=${params.sessionId} extraMs=${compactionTimeoutMs}`,
                 );
               }
               scheduleAbortTimer(compactionTimeoutMs, "compaction-grace");
@@ -4293,8 +4298,8 @@ export async function runEmbeddedAttempt(
             if (!isProbeSession) {
               log.warn(
                 reason === "compaction-grace"
-                  ? `embedded run timeout after compaction grace: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs} compactionGraceMs=${compactionTimeoutMs}`
-                  : `embedded run timeout: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
+                  ? `embedded run timeout after compaction grace: runId=${publicRunId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs} compactionGraceMs=${compactionTimeoutMs}`
+                  : `embedded run timeout: runId=${publicRunId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
               );
             }
             if (
@@ -4315,7 +4320,7 @@ export async function runEmbeddedAttempt(
                 }
                 if (!isProbeSession) {
                   log.warn(
-                    `embedded run abort still streaming: runId=${params.runId} sessionId=${params.sessionId}`,
+                    `embedded run abort still streaming: runId=${publicRunId} sessionId=${params.sessionId}`,
                   );
                 }
               }, 10_000);
@@ -4458,7 +4463,7 @@ export async function runEmbeddedAttempt(
         // Legacy compatibility: before_agent_start is also checked for context fields.
         let effectivePrompt = params.prompt;
         const hookCtx = {
-          runId: params.runId,
+          runId: publicRunId,
           trace: freezeDiagnosticTraceContext(diagnosticTrace),
           agentId: hookAgentId,
           sessionKey: params.sessionKey,
@@ -4589,7 +4594,7 @@ export async function runEmbeddedAttempt(
           transport: "stream",
         });
         log.debug(
-          `embedded run prompt start: runId=${params.runId} sessionId=${params.sessionId} ` +
+          `embedded run prompt start: runId=${publicRunId} sessionId=${params.sessionId} ` +
             routingSummary,
         );
         const effectiveTranscriptPrompt =
@@ -4633,7 +4638,7 @@ export async function runEmbeddedAttempt(
             (orphanRepair.removeLeaf
               ? " to prevent consecutive user turns. "
               : " without removing the active session leaf. ") +
-            `runId=${params.runId} sessionId=${params.sessionId} trigger=${params.trigger}`;
+            `runId=${publicRunId} sessionId=${params.sessionId} trigger=${params.trigger}`;
           if (shouldWarnOnOrphanedUserRepair(params.trigger)) {
             log.warn(orphanRepairMessage);
           } else {
@@ -4673,7 +4678,7 @@ export async function runEmbeddedAttempt(
             }
             log.debug(
               `agent steering: injected ${leased.runIds.length} queued item(s) into parent turn ` +
-                `runId=${params.runId} sessionKey=${params.sessionKey}`,
+                `runId=${publicRunId} sessionKey=${params.sessionKey}`,
             );
           }
         }
@@ -4858,7 +4863,7 @@ export async function runEmbeddedAttempt(
             message: string;
             pluginId: string;
           }): Promise<boolean> => {
-            const idempotencyKey = `hook-block:before_agent_run:user:${params.runId}`;
+            const idempotencyKey = `hook-block:before_agent_run:user:${publicRunId}`;
             if (sessionMessagesContainIdempotencyKey(activeSession.messages, idempotencyKey)) {
               return true;
             }
@@ -5059,7 +5064,7 @@ export async function runEmbeddedAttempt(
           if (promptSkipReason) {
             skipPromptSubmission = true;
             const skipContext =
-              `runId=${params.runId} sessionId=${params.sessionId} trigger=${params.trigger} ` +
+              `runId=${publicRunId} sessionId=${params.sessionId} trigger=${params.trigger} ` +
               `provider=${params.provider}/${params.modelId}`;
             if (promptSkipReason === "blank_user_prompt") {
               log.warn(`embedded run prompt skipped: blank user prompt ${skipContext}`);
@@ -5081,7 +5086,7 @@ export async function runEmbeddedAttempt(
           const reserveTokens = settingsManager.getCompactionReserveTokens();
           emitTrustedDiagnosticEvent({
             type: "context.assembled",
-            runId: params.runId,
+            runId: publicRunId,
             ...(params.sessionKey && { sessionKey: params.sessionKey }),
             ...(params.sessionId && { sessionId: params.sessionId }),
             provider: params.provider,
@@ -5134,7 +5139,7 @@ export async function runEmbeddedAttempt(
             hookRunner
               .runLlmInput(
                 {
-                  runId: params.runId,
+                  runId: publicRunId,
                   sessionId: params.sessionId,
                   provider: params.provider,
                   model: params.modelId,
@@ -5145,7 +5150,7 @@ export async function runEmbeddedAttempt(
                   tools,
                 },
                 {
-                  runId: params.runId,
+                  runId: publicRunId,
                   trace: freezeDiagnosticTraceContext(diagnosticTrace),
                   agentId: hookAgentId,
                   sessionKey: params.sessionKey,
@@ -5476,7 +5481,7 @@ export async function runEmbeddedAttempt(
         } finally {
           acceptingSteerMessages = false;
           log.debug(
-            `embedded run prompt end: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - promptStartedAt}`,
+            `embedded run prompt end: runId=${publicRunId} sessionId=${params.sessionId} durationMs=${Date.now() - promptStartedAt}`,
           );
         }
 
@@ -5609,7 +5614,7 @@ export async function runEmbeddedAttempt(
             if (!isProbeSession) {
               log.warn(
                 `compaction retry aggregate timeout (${COMPACTION_RETRY_AGGREGATE_TIMEOUT_MS}ms): ` +
-                  `proceeding with pre-compaction state runId=${params.runId} sessionId=${params.sessionId}`,
+                  `proceeding with pre-compaction state runId=${publicRunId} sessionId=${params.sessionId}`,
               );
             }
           }
@@ -5621,7 +5626,7 @@ export async function runEmbeddedAttempt(
             }
             if (!isProbeSession) {
               log.debug(
-                `compaction wait aborted: runId=${params.runId} sessionId=${params.sessionId}`,
+                `compaction wait aborted: runId=${publicRunId} sessionId=${params.sessionId}`,
               );
             }
           } else {
@@ -5663,7 +5668,7 @@ export async function runEmbeddedAttempt(
             if (removedEntries > 0 && !isProbeSession) {
               log.warn(
                 `normalized compaction timeout transcript tail: ` +
-                  `removedEntries=${removedEntries} runId=${params.runId} sessionId=${params.sessionId}`,
+                  `removedEntries=${removedEntries} runId=${publicRunId} sessionId=${params.sessionId}`,
               );
             }
           }
@@ -5680,7 +5685,7 @@ export async function runEmbeddedAttempt(
           if (timedOutDuringCompaction) {
             if (!isProbeSession) {
               log.warn(
-                `using ${snapshotSelection.source} snapshot: timed out during compaction runId=${params.runId} sessionId=${params.sessionId}`,
+                `using ${snapshotSelection.source} snapshot: timed out during compaction runId=${publicRunId} sessionId=${params.sessionId}`,
               );
             }
           }
@@ -5743,7 +5748,7 @@ export async function runEmbeddedAttempt(
             try {
               activeSessionManager.appendCustomEntry("openclaw:prompt-error", {
                 timestamp: Date.now(),
-                runId: params.runId,
+                runId: publicRunId,
                 sessionId: params.sessionId,
                 provider: params.provider,
                 model: params.modelId,
@@ -5833,7 +5838,7 @@ export async function runEmbeddedAttempt(
               try {
                 activeSessionManager.appendCustomEntry(FULL_BOOTSTRAP_COMPLETED_CUSTOM_TYPE, {
                   timestamp: Date.now(),
-                  runId: params.runId,
+                  runId: publicRunId,
                   sessionId: params.sessionId,
                 });
               } catch (entryErr) {
@@ -5892,7 +5897,7 @@ export async function runEmbeddedAttempt(
               durationMs: Date.now() - promptStartedAt,
             },
             ctx: {
-              runId: params.runId,
+              runId: publicRunId,
               trace: freezeDiagnosticTraceContext(diagnosticTrace),
               agentId: hookAgentId,
               sessionKey: params.sessionKey,
@@ -5918,7 +5923,7 @@ export async function runEmbeddedAttempt(
         }
         if (!isProbeSession && (aborted || timedOut) && !timedOutDuringCompaction) {
           log.debug(
-            `run cleanup: runId=${params.runId} sessionId=${params.sessionId} aborted=${aborted} timedOut=${timedOut}`,
+            `run cleanup: runId=${publicRunId} sessionId=${params.sessionId} aborted=${aborted} timedOut=${timedOut}`,
           );
         }
         try {
@@ -5928,7 +5933,7 @@ export async function runEmbeddedAttempt(
           // Log at error level to ensure visibility, but don't rethrow in finally block
           // as it would mask any exception from the try block above.
           log.error(
-            `CRITICAL: unsubscribe failed, possible resource leak: runId=${params.runId} ${String(err)}`,
+            `CRITICAL: unsubscribe failed, possible resource leak: runId=${publicRunId} ${String(err)}`,
           );
         }
         if (params.replyOperation) {
@@ -6035,7 +6040,7 @@ export async function runEmbeddedAttempt(
         hookRunner
           .runLlmOutput(
             {
-              runId: params.runId,
+              runId: publicRunId,
               sessionId: params.sessionId,
               provider: params.provider,
               model: params.modelId,
@@ -6059,7 +6064,7 @@ export async function runEmbeddedAttempt(
               usage: attemptUsage,
             },
             {
-              runId: params.runId,
+              runId: publicRunId,
               trace: freezeDiagnosticTraceContext(diagnosticTrace),
               agentId: hookAgentId,
               sessionKey: params.sessionKey,
@@ -6361,7 +6366,7 @@ export async function runEmbeddedAttempt(
         });
       }
       await flushEmbeddedAttemptTrajectoryRecorder({
-        runId: params.runId,
+        runId: publicRunId,
         sessionId: params.sessionId,
         log,
         trajectoryRecorder,
@@ -6439,7 +6444,7 @@ export async function runEmbeddedAttempt(
         if (shouldPreservePromptError) {
           log.warn(
             `embedded attempt cleanup detected session takeover after prompt failure; preserving prompt error: ` +
-              `runId=${params.runId} sessionId=${params.sessionId} ` +
+              `runId=${publicRunId} sessionId=${params.sessionId} ` +
               `promptError=${formatErrorMessage(promptError)} cleanupError=${formatErrorMessage(cleanupFailure)}`,
           );
           await Promise.reject(
@@ -6461,7 +6466,7 @@ export async function runEmbeddedAttempt(
         await cleanupEmbeddedPrepResourcesAfterEarlyExit();
       } catch (cleanupErr) {
         log.warn(
-          `failed to clean up embedded prep resources after early attempt exit: runId=${params.runId} ${String(cleanupErr)}`,
+          `failed to clean up embedded prep resources after early attempt exit: runId=${publicRunId} ${String(cleanupErr)}`,
         );
       }
     }
@@ -6469,7 +6474,7 @@ export async function runEmbeddedAttempt(
       await releaseRetainedSessionLock?.();
     } catch (releaseErr) {
       log.error(
-        `failed to release retained session lock on attempt teardown: runId=${params.runId} ${String(releaseErr)}`,
+        `failed to release retained session lock on attempt teardown: runId=${publicRunId} ${String(releaseErr)}`,
       );
     }
     retainedSessionFileOwner?.release();

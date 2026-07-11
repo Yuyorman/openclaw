@@ -97,7 +97,10 @@ const hoisted = vi.hoisted(() => ({
   activeEmbeddedRunCount: { value: 0 },
   activeEmbeddedRunSessionIds: [] as string[],
   activeEmbeddedRunSessionKeys: [] as string[],
-  markRestartAbortedMainSessions: vi.fn(async (_params: unknown) => ({ marked: 1, skipped: 0 })),
+  reserveRestartAbortedMainSessions: vi.fn(async (_params: unknown) => ({
+    reserved: 1,
+    skipped: 0,
+  })),
   runtimeConfig: { value: { session: { store: "/tmp/active-sessions.json" } } as OpenClawConfig },
   reloadEvents: [] as string[],
   loadModelCatalog: vi.fn(async (_params: { config: OpenClawConfig }) => []),
@@ -160,8 +163,8 @@ vi.mock("../agents/embedded-agent-runner/run-state.js", () => ({
   listActiveEmbeddedRunSessionKeys: () => hoisted.activeEmbeddedRunSessionKeys,
 }));
 
-vi.mock("../agents/main-session-restart-recovery.js", () => ({
-  markRestartAbortedMainSessions: hoisted.markRestartAbortedMainSessions,
+vi.mock("../agents/main-session-restart-reservation.js", () => ({
+  reserveRestartAbortedMainSessions: hoisted.reserveRestartAbortedMainSessions,
 }));
 
 vi.mock("../config/config.js", () => ({
@@ -318,7 +321,7 @@ afterEach(() => {
   hoisted.activeEmbeddedRunCount.value = 0;
   hoisted.activeEmbeddedRunSessionIds.length = 0;
   hoisted.activeEmbeddedRunSessionKeys.length = 0;
-  hoisted.markRestartAbortedMainSessions.mockClear();
+  hoisted.reserveRestartAbortedMainSessions.mockClear();
   hoisted.runtimeConfig.value = { session: { store: "/tmp/active-sessions.json" } };
   hoisted.reloadEvents.length = 0;
   hoisted.loadModelCatalog.mockClear();
@@ -1146,7 +1149,7 @@ describe("gateway restart deferral preflight", () => {
         force: true,
         reason: "config reload forced restart",
       });
-      expect(hoisted.markRestartAbortedMainSessions).toHaveBeenCalledWith({
+      expect(hoisted.reserveRestartAbortedMainSessions).toHaveBeenCalledWith({
         cfg: {
           gateway: { reload: { deferralTimeoutMs: 1_000 } },
         },

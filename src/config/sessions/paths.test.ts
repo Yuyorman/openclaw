@@ -2,8 +2,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { resolveSessionFilePath, resolveStorePath } from "./paths.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  clearCanonicalSessionStorePathCache,
+  resolveCanonicalSessionStorePath,
+  resolveSessionFilePath,
+  resolveStorePath,
+} from "./paths.js";
 
 const tempDirs: string[] = [];
 
@@ -11,6 +16,8 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+  clearCanonicalSessionStorePathCache();
+  vi.restoreAllMocks();
 });
 
 describe("resolveSessionFilePath cross-root reroot", () => {
@@ -61,5 +68,54 @@ describe("resolveStorePath", () => {
 
     expect(resolveStorePath(undefined, { agentId: "work", env })).toBe(expected);
     expect(resolveStorePath("", { agentId: "work", env })).toBe(expected);
+  });
+
+  it("uses one physical identity for symlinked stores before the leaf exists", () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-store-path-")));
+    const physical = path.join(root, "physical");
+    const alias = path.join(root, "alias");
+    fs.mkdirSync(physical);
+    fs.symlinkSync(physical, alias, process.platform === "win32" ? "junction" : "dir");
+
+    expect(resolveCanonicalSessionStorePath(path.join(alias, "future", "sessions.json"))).toBe(
+      path.join(physical, "future", "sessions.json"),
+    );
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("resolves each configured alias once and reuses its canonical identity", () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-store-cache-")));
+    const physical = path.join(root, "physical");
+    const aliasA = path.join(root, "alias-a");
+    const aliasB = path.join(root, "alias-b");
+    fs.mkdirSync(physical);
+    const physicalStore = path.join(physical, "sessions.json");
+    fs.writeFileSync(physicalStore, "{}");
+    const symlinkType = process.platform === "win32" ? "junction" : "dir";
+    fs.symlinkSync(physical, aliasA, symlinkType);
+    fs.symlinkSync(physical, aliasB, symlinkType);
+    const realpath = vi.spyOn(fs.realpathSync, "native");
+
+    expect(resolveCanonicalSessionStorePath(path.join(aliasA, "sessions.json"))).toBe(
+      physicalStore,
+    );
+    expect(resolveCanonicalSessionStorePath(path.join(aliasA, "sessions.json"))).toBe(
+      physicalStore,
+    );
+    expect(resolveCanonicalSessionStorePath(path.join(aliasB, "sessions.json"))).toBe(
+      physicalStore,
+    );
+    expect(resolveCanonicalSessionStorePath(path.join(aliasB, "sessions.json"))).toBe(
+      physicalStore,
+    );
+    expect(realpath).toHaveBeenCalledTimes(2);
+    clearCanonicalSessionStorePathCache();
+    expect(resolveCanonicalSessionStorePath(path.join(aliasA, "sessions.json"))).toBe(
+      physicalStore,
+    );
+    expect(realpath).toHaveBeenCalledTimes(3);
+
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });

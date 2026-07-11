@@ -460,6 +460,8 @@ export async function executePreparedCliRun(
   cliSessionIdToUse?: string,
 ): Promise<CliOutput> {
   const params = context.params;
+  const publicRunId = params.publicRunId ?? params.runId;
+  const diagnosticProjection = params.publicRunId ? { publicRunId: params.publicRunId } : undefined;
   if (params.abortSignal?.aborted) {
     throw createCliAbortError();
   }
@@ -1317,17 +1319,20 @@ export async function executePreparedCliRun(
             toolName: event.name,
             kind: event.kind,
           });
-          emitTrustedDiagnosticEvent({
-            type: "tool.execution.started",
-            runId: params.runId,
-            sessionId: params.sessionId,
-            ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
-            ...(params.agentId ? { agentId: params.agentId } : {}),
-            toolName: event.name,
-            toolSource: event.name.startsWith("mcp__") ? "mcp" : "core",
-            toolOwner: "cli-runner",
-            toolCallId: event.toolCallId,
-          });
+          emitTrustedDiagnosticEvent(
+            {
+              type: "tool.execution.started",
+              runId: params.runId,
+              sessionId: params.sessionId,
+              ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+              ...(params.agentId ? { agentId: params.agentId } : {}),
+              toolName: event.name,
+              toolSource: event.name.startsWith("mcp__") ? "mcp" : "core",
+              toolOwner: "cli-runner",
+              toolCallId: event.toolCallId,
+            },
+            diagnosticProjection,
+          );
           emitCliToolUseStart(event);
         };
         const emitParsedToolTerminal = (event: {
@@ -1373,12 +1378,15 @@ export async function executePreparedCliRun(
             durationMs: Math.max(0, now - (activeTool?.startedAt ?? now)),
           };
           if (trustedOutcome?.outcome === "unknown" && !useEnclosingTerminalReason) {
-            emitTrustedDiagnosticEvent({
-              type: "tool.execution.error",
-              ...diagnosticBase,
-              errorCategory: "cli_tool_ambiguous",
-              errorCode: "tool_outcome_unknown",
-            });
+            emitTrustedDiagnosticEvent(
+              {
+                type: "tool.execution.error",
+                ...diagnosticBase,
+                errorCategory: "cli_tool_ambiguous",
+                errorCode: "tool_outcome_unknown",
+              },
+              diagnosticProjection,
+            );
             return;
           }
           if (
@@ -1386,12 +1394,15 @@ export async function executePreparedCliRun(
             activeTool?.kind === "server_tool_use" &&
             trustedOutcome === undefined
           ) {
-            emitTrustedDiagnosticEvent({
-              type: "tool.execution.error",
-              ...diagnosticBase,
-              errorCategory: "cli_tool_ambiguous",
-              errorCode: "tool_outcome_unknown",
-            });
+            emitTrustedDiagnosticEvent(
+              {
+                type: "tool.execution.error",
+                ...diagnosticBase,
+                errorCategory: "cli_tool_ambiguous",
+                errorCode: "tool_outcome_unknown",
+              },
+              diagnosticProjection,
+            );
             return;
           }
           const trustedFailure =
@@ -1420,6 +1431,7 @@ export async function executePreparedCliRun(
                     type: "tool.execution.completed",
                     ...diagnosticBase,
                   },
+            diagnosticProjection,
           );
         };
         const emitParsedToolResult = (event: {
@@ -1456,7 +1468,7 @@ export async function executePreparedCliRun(
             stream: "item",
             data: {
               kind: "preamble",
-              itemId: `commentary-${params.runId}-${commentaryCounter}`,
+              itemId: `commentary-${publicRunId}-${commentaryCounter}`,
               phase: "update",
               title: "commentary",
               status: "running",

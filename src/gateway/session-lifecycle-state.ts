@@ -15,7 +15,6 @@ type LifecyclePhase = "start" | "end" | "error";
 
 type LifecycleEventLike = Pick<AgentEventPayload, "ts" | "sessionId"> & {
   runId?: string;
-  lifecycleGeneration?: string;
   data?: {
     phase?: unknown;
     startedAt?: unknown;
@@ -36,16 +35,11 @@ type LifecycleSessionShape = Pick<
 
 type PersistedLifecycleSessionShape = Pick<
   SessionEntry,
-  | "updatedAt"
-  | "status"
-  | "startedAt"
-  | "endedAt"
-  | "runtimeMs"
-  | "abortedLastRun"
-  | "restartRecoveryRuns"
+  "updatedAt" | "status" | "startedAt" | "endedAt" | "runtimeMs" | "abortedLastRun"
 >;
 
 type GatewaySessionLifecycleSnapshot = Partial<LifecycleSessionShape>;
+type TerminalSessionRunStatus = Exclude<SessionRunStatus, "running">;
 
 function isFiniteTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -58,7 +52,7 @@ function resolveLifecyclePhase(event: Pick<LifecycleEventLike, "data">): Lifecyc
 
 function mapAgentRunTerminalOutcomeToSessionStatus(
   outcome: AgentRunTerminalOutcome,
-): SessionRunStatus {
+): TerminalSessionRunStatus {
   switch (outcome.reason) {
     case "completed":
       return "done";
@@ -77,7 +71,9 @@ function mapAgentRunTerminalOutcomeToSessionStatus(
   }
 }
 
-function resolveTerminalStatus(event: LifecycleEventLike): SessionRunStatus {
+export function resolveGatewaySessionTerminalStatus(
+  event: LifecycleEventLike,
+): TerminalSessionRunStatus {
   const phase = resolveLifecyclePhase(event);
   const terminal = buildAgentRunTerminalOutcome({
     status: phase === "error" ? "error" : event.data?.aborted === true ? "timeout" : "ok",
@@ -161,7 +157,7 @@ export function deriveGatewaySessionLifecycleSnapshot(params: {
   const updatedAt = endedAt ?? existing?.updatedAt;
   return {
     updatedAt,
-    status: resolveTerminalStatus(params.event),
+    status: resolveGatewaySessionTerminalStatus(params.event),
     startedAt,
     endedAt,
     runtimeMs: resolveRuntimeMs({
@@ -169,7 +165,7 @@ export function deriveGatewaySessionLifecycleSnapshot(params: {
       endedAt,
       existingRuntimeMs: existing?.runtimeMs,
     }),
-    abortedLastRun: resolveTerminalStatus(params.event) === "killed",
+    abortedLastRun: resolveGatewaySessionTerminalStatus(params.event) === "killed",
   };
 }
 
@@ -177,67 +173,21 @@ export function derivePersistedSessionLifecyclePatch(params: {
   entry?: Partial<PersistedLifecycleSessionShape> | null;
   event: LifecycleEventLike;
 }): Partial<PersistedLifecycleSessionShape> {
-  if (isRestartRecoveryLifecycleEvent(params)) {
-    return {};
-  }
   const snapshot = deriveGatewaySessionLifecycleSnapshot({
     session: params.entry ?? undefined,
     event: params.event,
   });
-  const patch: Partial<PersistedLifecycleSessionShape> = {
+  return {
     ...snapshot,
     updatedAt: typeof snapshot.updatedAt === "number" ? snapshot.updatedAt : undefined,
   };
-  const runId = params.event.runId?.trim();
-  const lifecycleGeneration = params.event.lifecycleGeneration?.trim();
-  const restartRecoveryRuns = params.entry?.restartRecoveryRuns;
-  if (
-    resolveLifecyclePhase(params.event) !== "start" &&
-    runId &&
-    lifecycleGeneration &&
-    restartRecoveryRuns?.some(
-      (run) => run.runId === runId && run.lifecycleGeneration === lifecycleGeneration,
-    )
-  ) {
-    const remainingRuns = restartRecoveryRuns.filter(
-      (run) => run.runId !== runId || run.lifecycleGeneration !== lifecycleGeneration,
-    );
-    if (remainingRuns.length > 0) {
-      return { restartRecoveryRuns: remainingRuns };
-    }
-    patch.restartRecoveryRuns = undefined;
-  }
-  return patch;
 }
 
 export function deriveGatewaySessionLifecycleProjectionPatch(params: {
   entry?: Partial<PersistedLifecycleSessionShape> | null;
   event: LifecycleEventLike;
 }): GatewaySessionLifecycleSnapshot {
-  const { restartRecoveryRuns: _restartRecoveryRuns, ...patch } =
-    derivePersistedSessionLifecyclePatch(params);
-  return patch;
-}
-
-export function isRestartRecoveryLifecycleEvent(params: {
-  entry?: Pick<SessionEntry, "restartRecoveryRuns"> | null;
-  event: Pick<LifecycleEventLike, "runId" | "lifecycleGeneration" | "data">;
-}): boolean {
-  const runId = params.event.runId?.trim();
-  const lifecycleGeneration = params.event.lifecycleGeneration?.trim();
-  const phase = resolveLifecyclePhase(params.event);
-  const interrupted = params.event.data?.stopReason === "restart";
-  const matchesRecoveryRun = Boolean(
-    runId &&
-    lifecycleGeneration &&
-    params.entry?.restartRecoveryRuns?.some(
-      (run) => run.runId === runId && run.lifecycleGeneration === lifecycleGeneration,
-    ),
-  );
-  return (
-    matchesRecoveryRun &&
-    (phase === "start" || ((phase === "end" || phase === "error") && interrupted))
-  );
+  return derivePersistedSessionLifecyclePatch(params);
 }
 
 /**

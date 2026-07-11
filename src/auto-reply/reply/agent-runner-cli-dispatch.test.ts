@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent-runner/types.js";
 import { FailoverError } from "../../agents/failover-error.js";
+import type { MainRunRecoveryExecutionOwner } from "../../agents/main-run-recovery-execution-owner.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
 import {
   emitAgentEvent,
@@ -34,6 +35,94 @@ afterEach(() => {
 });
 
 describe("runCliAgentWithLifecycle", () => {
+  it("rejects durable ownership before announcing or entering a CLI run", async () => {
+    const lifecycleEvents: Array<Record<string, unknown>> = [];
+    const unsubscribe = onAgentEvent((event) => {
+      if (event.runId === "run-ownership-rejected" && event.stream === "lifecycle") {
+        lifecycleEvents.push(event.data);
+      }
+    });
+    const onAgentRunStart = vi.fn();
+    const ownerStart = vi.fn(async () => {
+      throw new Error("ledger ownership rejected");
+    });
+    const executionOwner = {
+      publicRunId: "public-ownership-rejected",
+      start: ownerStart,
+    } as unknown as MainRunRecoveryExecutionOwner;
+    const onExecutionStarted = vi.fn();
+
+    try {
+      await expect(
+        runCliAgentWithLifecycle({
+          runId: "run-ownership-rejected",
+          lifecycleGeneration: "generation-ownership-rejected",
+          provider: "claude-cli",
+          onAgentRunStart,
+          onExecutionStarted,
+          executionOwner,
+          runParams: {
+            sessionId: "session-1",
+            sessionFile: "/tmp/session.jsonl",
+            workspaceDir: "/tmp/workspace",
+            prompt: "hello",
+            provider: "claude-cli",
+            model: "claude",
+            thinkLevel: "high",
+            timeoutMs: 1_000,
+            runId: "run-ownership-rejected",
+          },
+        }),
+      ).rejects.toThrow("ledger ownership rejected");
+    } finally {
+      unsubscribe();
+    }
+
+    expect(ownerStart).toHaveBeenCalledOnce();
+    expect(ownerStart).toHaveBeenCalledWith({
+      lifecycleGeneration: "generation-ownership-rejected",
+    });
+    expect(onExecutionStarted).not.toHaveBeenCalled();
+    expect(onAgentRunStart).not.toHaveBeenCalled();
+    expect(cliDispatchState.runCliAgentMock).not.toHaveBeenCalled();
+    expect(lifecycleEvents).toEqual([]);
+  });
+
+  it("keeps the private CLI execution id internal while forwarding public identity", async () => {
+    const executionOwner = {
+      publicRunId: "public-recovery-turn",
+      start: vi.fn(async () => undefined),
+    } as unknown as MainRunRecoveryExecutionOwner;
+    cliDispatchState.runCliAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "done" }],
+      meta: { durationMs: 1 },
+    } satisfies EmbeddedAgentRunResult);
+
+    await runCliAgentWithLifecycle({
+      runId: "private-recovery-attempt",
+      provider: "claude-cli",
+      executionOwner,
+      runParams: {
+        sessionId: "session-1",
+        sessionFile: "/tmp/session.jsonl",
+        workspaceDir: "/tmp/workspace",
+        prompt: "hello",
+        provider: "claude-cli",
+        model: "claude",
+        thinkLevel: "off",
+        timeoutMs: 1_000,
+        runId: "ignored-by-wrapper",
+      },
+    });
+
+    expect(cliDispatchState.runCliAgentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: "private-recovery-attempt",
+        publicRunId: "public-recovery-turn",
+      }),
+    );
+  });
+
   it("bridges thinking events to reasoning text and dedupes identical snapshots", async () => {
     cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
       emitAgentEvent({

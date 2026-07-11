@@ -451,11 +451,6 @@ describe("session store writer queue", () => {
           threadId: {},
         },
         pendingFinalDeliveryIntentId: 123,
-        restartRecoveryDeliveryContext: {
-          channel: "discord",
-          to: [],
-        },
-        restartRecoveryDeliveryRunId: 123,
       },
       "agent:main:good-pending": {
         sessionId: "s-good-pending",
@@ -473,13 +468,6 @@ describe("session store writer queue", () => {
           threadId: 42.5,
         },
         pendingFinalDeliveryIntentId: "intent-1",
-        restartRecoveryDeliveryContext: {
-          channel: "Discord",
-          to: " discord:dm:123 ",
-          accountId: "Main",
-          threadId: "reply-1",
-        },
-        restartRecoveryDeliveryRunId: "run-1",
       },
     } as unknown as Record<string, SessionEntry>);
 
@@ -499,9 +487,6 @@ describe("session store writer queue", () => {
     expect(bad?.pendingFinalDeliveryLastError).toBeUndefined();
     expect(bad?.pendingFinalDeliveryContext).toBeUndefined();
     expect(bad?.pendingFinalDeliveryIntentId).toBeUndefined();
-    expect(bad?.restartRecoveryDeliveryContext).toBeUndefined();
-    expect(bad?.restartRecoveryDeliveryRunId).toBeUndefined();
-
     expect(good).toMatchObject({
       pendingFinalDelivery: true,
       pendingFinalDeliveryText: "hello",
@@ -516,13 +501,6 @@ describe("session store writer queue", () => {
         threadId: 42,
       },
       pendingFinalDeliveryIntentId: "intent-1",
-      restartRecoveryDeliveryContext: {
-        channel: "discord",
-        to: "discord:dm:123",
-        accountId: "main",
-        threadId: "reply-1",
-      },
-      restartRecoveryDeliveryRunId: "run-1",
     });
   });
 

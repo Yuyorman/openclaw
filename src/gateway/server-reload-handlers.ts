@@ -302,9 +302,9 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
     if (sessionKeys.size === 0 && sessionIds.size === 0) {
       return;
     }
-    const { markRestartAbortedMainSessions } =
-      await import("../agents/main-session-restart-recovery.js");
-    await markRestartAbortedMainSessions({
+    const { reserveRestartAbortedMainSessions } =
+      await import("../agents/main-session-restart-reservation.js");
+    await reserveRestartAbortedMainSessions({
       cfg: nextConfig,
       additionalCfgs: [getRuntimeConfig()],
       sessionKeys,

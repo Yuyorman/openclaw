@@ -11,6 +11,10 @@ import {
   noteOpencodeProviderOverrides,
 } from "./doctor-config-analysis.js";
 import { runDoctorConfigPreflight } from "./doctor-config-preflight.js";
+import {
+  inspectDoctorMainRunRecovery,
+  migrateDoctorMainRunRecovery,
+} from "./doctor-main-run-recovery.js";
 import type { DoctorOptions, DoctorPrompter } from "./doctor-prompter.js";
 import { emitDoctorNotes, sanitizeDoctorNote } from "./doctor/emit-notes.js";
 import { finalizeDoctorConfigFlow } from "./doctor/finalize-config-flow.js";
@@ -145,6 +149,14 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
   });
   const snapshot = preflight.snapshot;
   const baseCfg = preflight.baseConfig;
+  const mainRunRecoveryMigration = shouldRepair
+    ? await migrateDoctorMainRunRecovery({ cfg: baseCfg, env: process.env })
+    : await inspectDoctorMainRunRecovery({ cfg: baseCfg, env: process.env });
+  emitDoctorNotes({
+    note,
+    changeNotes: mainRunRecoveryMigration.changes,
+    warningNotes: mainRunRecoveryMigration.warnings,
+  });
   let cfg: OpenClawConfig = baseCfg;
   let candidate = structuredClone(baseCfg);
   let pendingChanges = false;

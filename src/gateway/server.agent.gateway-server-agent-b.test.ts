@@ -3,11 +3,31 @@
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { WebSocket } from "ws";
+import {
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../../packages/gateway-protocol/src/client-info.js";
 import { cleanupTempDirs, makeTempDir } from "../../test/helpers/temp-dir.js";
 import { AcpRuntimeError } from "../acp/runtime/errors.js";
+import {
+  finalizeMainRunRecoveryDispatch,
+  prepareMainRunRecoveryDispatch,
+  releaseMainRunRecoveryBarrier,
+  upsertMainRunRecoveryBarrier,
+  waitForMainRunRecoveryDispatchAdoption,
+} from "../agents/main-run-recovery-runtime.js";
 import type { ChannelPlugin } from "../channels/plugins/types.js";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import { emitAgentEvent, registerAgentRunContext } from "../infra/agent-events.js";
+import { isSessionWorkAdmissionActive } from "../sessions/session-lifecycle-admission.js";
+import {
+  MAIN_RUN_RECOVERY_LEASE_MS,
+  claimMainRunRecoveryLease,
+  getMainRunRecovery,
+  reserveMainSessionResumeRecovery,
+  terminalizeMainRunRecovery,
+} from "../state/main-run-recovery-store.js";
+import { findTaskByRunId } from "../tasks/task-registry.js";
 import {
   createChannelTestPluginBase,
   createDirectOutboundTestAdapter,
@@ -196,6 +216,186 @@ describe("gateway server agent", () => {
     testState.allowFrom = undefined;
     setRegistry(emptyRegistry);
   });
+
+  test(
+    "accepts a durable restart handoff across the backend WebSocket boundary",
+    { timeout: 20_000 },
+    async () => {
+      await useTempSessionStorePath();
+      const storePath = testState.sessionStorePath;
+      if (!storePath) {
+        throw new Error("expected temporary session store path");
+      }
+      const sessionKey = "agent:main:main";
+      const sessionId = "durable-websocket-recovery-session";
+      const dispatchRunId = "durable-websocket-recovery-dispatch";
+      const message = "resume the interrupted durable turn";
+      await writeSessionStore({
+        entries: {
+          main: {
+            sessionId,
+            updatedAt: Date.now() - 10_000,
+            status: "running",
+            abortedLastRun: true,
+          },
+        },
+      });
+      const acceptedAtMs = Date.now();
+      const database = { path: path.join(path.dirname(storePath), "openclaw.sqlite") };
+      const reserved = reserveMainSessionResumeRecovery(
+        {
+          agentId: "main",
+          sessionKey,
+          sessionKeyAliases: ["main"],
+          sessionId,
+          storePath,
+          sourceKey: "durable-websocket-recovery-source",
+          bootId: "boot-before-websocket-recovery",
+          envelope: {
+            kind: "session_resume",
+            resolution: { kind: "resume" },
+            systemMessage: message,
+            transcriptTail: null,
+            lifecycleRevision: null,
+            delivery: { context: null, runId: null, intentId: null },
+            fences: [],
+          },
+          acceptedAtMs,
+        },
+        database,
+      ).recovery;
+      if (reserved.state === "terminal") {
+        throw new Error("unexpected terminal recovery reservation");
+      }
+      const recovery = claimMainRunRecoveryLease(
+        {
+          agentId: reserved.agentId,
+          publicRunId: reserved.publicRunId,
+          sessionId: reserved.sessionId,
+          sessionKey: reserved.sessionKey,
+          sessionKeyAliases: reserved.sessionKeyAliases,
+          storePath: reserved.storePath,
+          expectedRevision: reserved.revision,
+          expectedState: reserved.state,
+          leaseOwner: "websocket-recovery-worker",
+          currentBootId: "boot-after-websocket-recovery",
+          nowMs: acceptedAtMs,
+          leaseDurationMs: MAIN_RUN_RECOVERY_LEASE_MS,
+        },
+        database,
+      );
+      if (!recovery) {
+        throw new Error("failed to claim durable WebSocket recovery");
+      }
+      upsertMainRunRecoveryBarrier({
+        aliases: [recovery.sessionKey, ...recovery.sessionKeyAliases],
+        ledgerRunId: recovery.publicRunId,
+        sessionId,
+        storePath,
+      });
+      const claim = prepareMainRunRecoveryDispatch({
+        currentBootId: "boot-after-websocket-recovery",
+        database,
+        dispatchRunId,
+        recovery,
+      });
+      let finishAgentCommand: ((value: unknown) => void) | undefined;
+      vi.mocked(agentCommand).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishAgentCommand = resolve;
+          }),
+      );
+      const backend = new WebSocket(`ws://127.0.0.1:${port}`);
+      trackConnectChallengeNonce(backend);
+      let barrierReleased: boolean;
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          backend.once("open", resolve);
+          backend.once("error", reject);
+        });
+        await connectOk(backend, {
+          client: {
+            id: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+            version: "test",
+            platform: "test",
+            mode: GATEWAY_CLIENT_MODES.BACKEND,
+          },
+          scopes: ["operator.write"],
+        });
+        const response = await rpcReq(
+          backend,
+          "agent",
+          {
+            agentId: "main",
+            message,
+            sessionKey: "main",
+            idempotencyKey: dispatchRunId,
+            deliver: false,
+          },
+          20_000,
+        );
+
+        expect(response.ok).toBe(true);
+        expect(response.payload).toMatchObject({ runId: dispatchRunId, status: "accepted" });
+        await expect(waitForMainRunRecoveryDispatchAdoption(claim.dispatchToken)).resolves.toBe(
+          "admitted",
+        );
+        await readAgentCommandCall({ runId: dispatchRunId });
+        expect(findTaskByRunId(dispatchRunId)).toBeUndefined();
+        expect(getMainRunRecovery(recovery.publicRunId, database)).toMatchObject({
+          state: "running",
+          execution: {
+            runId: dispatchRunId,
+            lifecycleGeneration: expect.any(String),
+            epoch: expect.any(String),
+          },
+        });
+        expect(isSessionWorkAdmissionActive(storePath, [sessionKey, sessionId])).toBe(true);
+      } finally {
+        finishAgentCommand?.({
+          payloads: [{ text: "resumed" }],
+          meta: { durationMs: 1 },
+        });
+        const current = getMainRunRecovery(recovery.publicRunId, database);
+        if (current && current.state !== "terminal") {
+          const endedAtMs = Math.max(Date.now(), current.acceptedAtMs);
+          terminalizeMainRunRecovery(
+            {
+              agentId: current.agentId,
+              publicRunId: current.publicRunId,
+              sessionId: current.sessionId,
+              sessionKey: current.sessionKey,
+              sessionKeyAliases: current.sessionKeyAliases,
+              storePath: current.storePath,
+              expectedRevision: current.revision,
+              expectedState: current.state,
+              outcome: { status: "done", endedAtMs },
+              nowMs: endedAtMs,
+            },
+            database,
+          );
+        }
+        finalizeMainRunRecoveryDispatch(claim.dispatchToken);
+        barrierReleased = releaseMainRunRecoveryBarrier({
+          expectedLedgerRunId: recovery.publicRunId,
+          sessionId,
+          storePath,
+        });
+        backend.close();
+      }
+
+      expect(barrierReleased).toBe(true);
+      expect(getMainRunRecovery(recovery.publicRunId, database)).toMatchObject({
+        state: "terminal",
+        terminalOutcome: { status: "done" },
+      });
+      await vi.waitFor(() => {
+        expect(isSessionWorkAdmissionActive(storePath, [sessionKey, sessionId])).toBe(false);
+      });
+    },
+  );
 
   test(
     "agent reuses the last plugin delivery route when channel=last",

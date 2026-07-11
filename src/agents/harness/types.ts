@@ -30,13 +30,19 @@ export type AgentHarnessSupport =
   | { supported: true; priority?: number; reason?: string }
   | { supported: false; reason?: string };
 
-type InternalEmbeddedRunAttemptParams =
+type InternalAgentHarnessAttemptParams =
   import("../embedded-agent-runner/run/types.js").EmbeddedRunAttemptParams;
 
+/** Public plugin handoff: stable identity only, never lifecycle/ownership capabilities. */
 export type AgentHarnessAttemptParams = Omit<
-  InternalEmbeddedRunAttemptParams,
-  "trajectoryRecorder"
->;
+  InternalAgentHarnessAttemptParams,
+  | "executionOwner"
+  | "lifecycleGeneration"
+  | "onExecutionStarted"
+  | "publicRunId"
+  | "runId"
+  | "trajectoryRecorder"
+> & { runId: string };
 export type AgentHarnessAttemptResult =
   import("../embedded-agent-runner/run/types.js").EmbeddedRunAttemptResult;
 export type AgentHarnessAuthBindingFingerprintParams = {

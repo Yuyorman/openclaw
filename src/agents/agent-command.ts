@@ -139,6 +139,8 @@ import {
 } from "./internal-session-effects.js";
 import { AGENT_LANE_SUBAGENT } from "./lanes.js";
 import { LiveSessionModelSwitchError } from "./live-model-switch.js";
+import { isMainRunRecoveryOwnershipLostError } from "./main-run-recovery-errors.js";
+import type { MainRunRecoveryExecutionOwner } from "./main-run-recovery-execution-owner.js";
 import { loadManifestModelCatalog } from "./model-catalog.js";
 import { runWithModelFallback } from "./model-fallback.js";
 import { splitTrailingAuthProfile } from "./model-ref-profile.js";
@@ -548,35 +550,6 @@ function shouldPersistCurrentRunSessionCleanup(
   );
 }
 
-function shouldPersistRestartRecoveryContextClaim(
-  current: SessionEntry | undefined,
-  sessionId: string,
-  runId: string,
-  allowCreate: boolean,
-): boolean {
-  if (!current) {
-    return allowCreate;
-  }
-  if (!shouldPersistCurrentRunSessionCleanup(current, sessionId)) {
-    return false;
-  }
-  return (
-    current.restartRecoveryDeliveryRunId === undefined ||
-    current.restartRecoveryDeliveryRunId === runId
-  );
-}
-
-function shouldPersistRestartRecoveryCleanup(
-  current: SessionEntry | undefined,
-  sessionId: string,
-  runId: string,
-): boolean {
-  return (
-    shouldPersistCurrentRunSessionCleanup(current, sessionId) &&
-    current?.restartRecoveryDeliveryRunId === runId
-  );
-}
-
 function containsControlCharacters(value: string): boolean {
   for (const char of value) {
     const code = char.codePointAt(0);
@@ -963,6 +936,7 @@ async function agentCommandInternal(
   initialOpts: AgentCommandOpts,
   runtime: RuntimeEnv = defaultRuntime,
   deps?: CliDeps,
+  mainRunRecoveryExecutionOwner?: MainRunRecoveryExecutionOwner,
 ) {
   const resolvedDeps = await resolveAgentCommandDeps(deps);
   const isRawModelRun = initialOpts.modelRun === true || initialOpts.promptMode === "none";
@@ -1023,7 +997,6 @@ async function agentCommandInternal(
   // the parent a human interjected on every spawn, for embedded and ACP children alike.
   const isSubagentLaneTurn = normalizeOptionalString(opts.lane) === AGENT_LANE_SUBAGENT;
   let sessionReboundDuringRun = false;
-  let trackedRestartRecoveryDeliveryContext = false;
   let currentRunDeliveryContext: DeliveryContext | undefined;
   const preparedSessionId = sessionEntry?.sessionId;
   const sessionStoreRuntime = storePath && sessionKey ? await loadSessionStoreRuntime() : undefined;
@@ -1112,7 +1085,7 @@ async function agentCommandInternal(
       ) {
         const now = Date.now();
         const currentStoreEntry = sessionStore[sessionKey];
-        const allowCreateRestartRecoveryEntry =
+        const allowCreateSessionEntry =
           currentStoreEntry === undefined && sessionEntry === undefined;
         const initialEntry = currentStoreEntry ??
           sessionEntry ?? { sessionId, updatedAt: now, sessionStartedAt: now };
@@ -1130,8 +1103,6 @@ async function agentCommandInternal(
           updatedAt: now,
           sessionStartedAt: isSessionRollover ? now : entry.sessionStartedAt,
           lastInteractionAt: isSessionRollover ? now : entry.lastInteractionAt,
-          restartRecoveryDeliveryContext: currentRunDeliveryContext,
-          restartRecoveryDeliveryRunId: currentRunDeliveryContext ? runId : undefined,
         };
         const persisted = await persistSessionEntry({
           sessionStore,
@@ -1142,21 +1113,18 @@ async function agentCommandInternal(
           shouldPersist: (current) =>
             isSessionRollover
               ? current?.sessionId === initialEntry.sessionId
-              : shouldPersistRestartRecoveryContextClaim(
-                  current,
-                  sessionId,
-                  runId,
-                  allowCreateRestartRecoveryEntry,
-                ),
+              : current
+                ? shouldPersistCurrentRunSessionCleanup(current, sessionId)
+                : allowCreateSessionEntry,
         });
-        sessionEntry = persisted;
-        trackedRestartRecoveryDeliveryContext =
-          Boolean(persisted?.restartRecoveryDeliveryContext) &&
-          persisted?.restartRecoveryDeliveryRunId === runId;
+        sessionEntry = persisted ?? sessionEntry;
       }
 
       if (!isRawModelRun && acpResolution?.kind === "ready" && sessionKey) {
         assertAgentRunLifecycleGenerationCurrent(lifecycleGeneration);
+        // Recovery ownership must win before this run becomes observable or
+        // allocates ACP provider work. A rejected claim is not a run failure.
+        await mainRunRecoveryExecutionOwner?.start({ lifecycleGeneration });
         const attemptExecutionRuntime = await loadAttemptExecutionRuntime();
         const acpToolTracker = attemptExecutionRuntime.createAcpToolLifecycleTracker();
         const startedAt = Date.now();
@@ -2381,8 +2349,9 @@ async function agentCommandInternal(
                   (isFallbackRetry && attemptLifecycleState.currentTurnUserMessagePersisted),
                 userTurnTranscriptRecorder,
                 onUserMessagePersisted: attemptLifecycleCallbacks.onUserMessagePersisted,
-                onLifecycleGenerationChanged: (nextLifecycleGeneration) => {
-                  lifecycleGeneration = nextLifecycleGeneration;
+                executionOwner: mainRunRecoveryExecutionOwner,
+                onExecutionStarted: async (info) => {
+                  lifecycleGeneration = info.lifecycleGeneration;
                 },
                 onAgentEvent: attemptLifecycleCallbacks.onAgentEvent,
                 deferTerminalLifecycle: true,
@@ -2443,6 +2412,16 @@ async function agentCommandInternal(
           }
           break;
         } catch (err) {
+          if (isMainRunRecoveryOwnershipLostError(err)) {
+            try {
+              await fallbackTrajectoryRecorder?.flush();
+            } catch (flushError) {
+              log.warn(
+                `failed to flush trajectory after recovery ownership loss: ${formatErrorMessage(flushError)}`,
+              );
+            }
+            throw err;
+          }
           if (err instanceof LiveSessionModelSwitchError) {
             if (isModelSelectionLocked(sessionEntry)) {
               if (!attemptLifecycleState.lifecycleEnded) {
@@ -2839,40 +2818,6 @@ async function agentCommandInternal(
         }
       }
     }
-    if (
-      !sessionReboundDuringRun &&
-      trackedRestartRecoveryDeliveryContext &&
-      sessionStore &&
-      sessionKey
-    ) {
-      try {
-        const entry = sessionStore[sessionKey] ?? sessionEntry;
-        if (entry?.restartRecoveryDeliveryContext && entry.restartRecoveryDeliveryRunId === runId) {
-          const next: SessionEntry = {
-            ...entry,
-            restartRecoveryDeliveryContext: undefined,
-            restartRecoveryDeliveryRunId: undefined,
-            updatedAt: Date.now(),
-          };
-          const persisted = await persistSessionEntry({
-            sessionStore,
-            sessionKey,
-            storePath,
-            initialEntry: entry,
-            entry: next,
-            shouldPersist: (current) =>
-              shouldPersistRestartRecoveryCleanup(current, sessionId, runId),
-          });
-          sessionEntry = persisted;
-        }
-      } catch (error) {
-        log.warn(
-          `failed to clear restart recovery delivery context for ${sessionKey}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    }
     clearAgentRunContext(runId, lifecycleGeneration);
   }
 }
@@ -2988,9 +2933,9 @@ function emitIngressModelUsageDiagnostic(
   });
 }
 
-/** Runs an agent turn from an inbound channel/gateway ingress context. */
-export async function agentCommandFromIngress(
+async function runAgentCommandFromIngress(
   opts: AgentCommandIngressOpts,
+  executionOwner: MainRunRecoveryExecutionOwner | undefined,
   runtime: RuntimeEnv = defaultRuntime,
   deps?: CliDeps,
 ) {
@@ -3008,6 +2953,7 @@ export async function agentCommandFromIngress(
       },
       runtime,
       deps,
+      executionOwner,
     );
 
     if (result) {
@@ -3016,6 +2962,25 @@ export async function agentCommandFromIngress(
 
     return result;
   });
+}
+
+/** Runs an agent turn from an inbound channel/gateway ingress context. */
+export async function agentCommandFromIngress(
+  opts: AgentCommandIngressOpts,
+  runtime: RuntimeEnv = defaultRuntime,
+  deps?: CliDeps,
+) {
+  return await runAgentCommandFromIngress(opts, undefined, runtime, deps);
+}
+
+/** Dedicated internal ingress; recovery authority never enters the public option shape. */
+export async function agentCommandFromRecoveryIngress(
+  opts: AgentCommandIngressOpts,
+  executionOwner: MainRunRecoveryExecutionOwner,
+  runtime: RuntimeEnv = defaultRuntime,
+  deps?: CliDeps,
+) {
+  return await runAgentCommandFromIngress(opts, executionOwner, runtime, deps);
 }
 
 export const testing = {

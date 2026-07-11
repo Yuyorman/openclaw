@@ -3,6 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import type { CliOutput } from "./cli-output.js";
 import { cliBackendLog } from "./cli-runner/log.js";
+import type { MainRunRecoveryExecutionOwner } from "./main-run-recovery-execution-owner.js";
 
 // vi.mock factories are hoisted above imports, so any references inside them
 // must come from vi.hoisted() so they exist at hoist time (otherwise they'd
@@ -135,6 +136,29 @@ describe("runCliAgent cron before_agent_reply seam", () => {
     expect(executePreparedCliRunMock).not.toHaveBeenCalled();
   });
 
+  it("rejects execution-start ownership before CLI preparation", async () => {
+    const ownerStart = vi.fn(async () => {
+      throw new Error("ledger CAS rejected");
+    });
+    const executionOwner = { start: ownerStart } as unknown as MainRunRecoveryExecutionOwner;
+    const onExecutionStarted = vi.fn();
+
+    await expect(
+      runCliAgent({
+        ...baseRunParams,
+        executionOwner,
+        onExecutionStarted,
+      }),
+    ).rejects.toThrow("ledger CAS rejected");
+
+    expect(ownerStart).toHaveBeenCalledWith({
+      lifecycleGeneration: expect.any(String),
+    });
+    expect(onExecutionStarted).not.toHaveBeenCalled();
+    expect(prepareCliRunContextMock).not.toHaveBeenCalled();
+    expect(executePreparedCliRunMock).not.toHaveBeenCalled();
+  });
+
   it("lets before_agent_reply claim cron runs before the CLI subprocess is invoked", async () => {
     const logInfoSpy = vi.spyOn(cliBackendLog, "info").mockImplementation(() => undefined);
     hasHooksMock.mockImplementation((hookName) => hookName === "before_agent_reply");
@@ -187,6 +211,22 @@ describe("runCliAgent cron before_agent_reply seam", () => {
     } finally {
       logInfoSpy.mockRestore();
     }
+  });
+
+  it("projects recovery identity to CLI reply hooks", async () => {
+    hasHooksMock.mockImplementation((hookName) => hookName === "before_agent_reply");
+    runBeforeAgentReplyMock.mockResolvedValue({ handled: true });
+
+    await runCliAgent({
+      ...baseRunParams,
+      runId: "private-recovery-attempt",
+      publicRunId: "public-recovery-turn",
+      trigger: "cron",
+    });
+
+    const [, context] = runBeforeAgentReplyMock.mock.calls.at(0) ?? [];
+    expect(context).toMatchObject({ runId: "public-recovery-turn" });
+    expect(JSON.stringify(context)).not.toContain("private-recovery-attempt");
   });
 
   it("clears stateless CLI bindings when before_agent_reply claims a cron turn", async () => {

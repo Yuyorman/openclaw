@@ -89,6 +89,7 @@ export type GatewayRequestContext = {
   cron: GatewayCronServiceContract;
   cronStorePath: string;
   getRuntimeConfig: () => OpenClawConfig;
+  legacyMainRunRecoveryAdmissionGate?: import("../../infra/main-run-recovery-admission-gate.js").LegacyMainRunRecoveryAdmissionGate;
   resolveTerminalLaunchPolicy: (agentId?: string) => TerminalLaunchResolution;
   isTerminalEnabled: () => boolean;
   execApprovalManager?: ExecApprovalManager;
@@ -144,10 +145,10 @@ export type GatewayRequestContext = {
   agentDeltaSentAt: Map<string, number>;
   bufferedAgentEvents: Map<string, BufferedAgentEvent>;
   clearChatRunState: (runId: string) => void;
-  addChatRun: (sessionId: string, entry: ChatRunRegistration) => void;
+  addChatRun: (executionRunId: string, entry: ChatRunRegistration) => void;
   removeChatRun: (
-    sessionId: string,
-    clientRunId: string,
+    executionRunId: string,
+    publicRunId: string,
     sessionKey?: string,
   ) => ChatRunEntry | undefined;
   subscribeSessionEvents: (connId: string) => void;

@@ -1,5 +1,6 @@
 // Gateway event subscription wiring for agent, heartbeat, transcript, and lifecycle broadcasts.
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { isMainRunRecoveryLifecycleFenced } from "../agents/main-run-recovery-runtime.js";
 import { isAuditLedgerEnabled, resolveAuditMessageMode } from "../audit/audit-config.js";
 import { createAuditEventRecorder } from "../audit/audit-recorder.js";
 import { onTrustedMessageAuditEvent } from "../audit/message-audit-events.js";
@@ -13,7 +14,16 @@ import { onInternalSessionTranscriptUpdate } from "../sessions/transcript-events
 import { createLazyPromise } from "../shared/lazy-runtime.js";
 import type { TaskRegistryObserverEvent } from "../tasks/task-registry.store.js";
 import {
+  activeRunIdentityAliases,
+  type ActiveRunIdentity,
+  resolveActiveRunByIdentity,
+  resolveActiveRunIdentity,
+} from "./active-run-registry.js";
+import {
   type ChatAbortControllerEntry,
+  notifyChatAbortControllerSessionTerminalPersistenceFailed,
+  notifyChatAbortControllerSessionTerminalPersisted,
+  recordChatAbortControllerMainRunRecoveryTerminalEvidence,
   removeChatAbortControllerEntry,
   type RestartRecoveryCandidate,
 } from "./chat-abort.js";
@@ -25,6 +35,56 @@ import type {
 } from "./server-chat-state.js";
 import { resolveVisibleActiveSessionRunState } from "./server-methods/session-active-runs.js";
 import { mapTaskSummary, type TaskEventPayload } from "./server-methods/task-summary.js";
+import { resolveGatewaySessionTerminalStatus } from "./session-lifecycle-state.js";
+
+function resolveTrackedRun(
+  entries: ReadonlyMap<string, ChatAbortControllerEntry>,
+  identity: ActiveRunIdentity,
+) {
+  return (
+    resolveActiveRunByIdentity(entries, identity.executionRunId) ??
+    resolveActiveRunByIdentity(entries, identity.publicRunId)
+  );
+}
+
+function resolveOperatorRunId(params: {
+  chatAbortControllers: ReadonlyMap<string, ChatAbortControllerEntry>;
+  chatRunState: ChatRunState;
+  runId: string;
+}): string {
+  const chatLink = params.chatRunState.registry.peek(params.runId);
+  if (chatLink) {
+    return chatLink.runIdentity.publicRunId;
+  }
+  return (
+    resolveActiveRunByIdentity(params.chatAbortControllers, params.runId)?.identity.publicRunId ??
+    params.runId
+  );
+}
+
+function resolveTerminalEventTimestamp(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= fallback
+    ? value
+    : fallback;
+}
+
+function notifyTrackedRunTerminalPersisted(params: {
+  entry: ChatAbortControllerEntry;
+  log: SubsystemLogger;
+  runId: string;
+}): boolean {
+  try {
+    return notifyChatAbortControllerSessionTerminalPersisted(params.entry);
+  } catch (error) {
+    // JSON persistence succeeded. Keep the controller as the exact evidence
+    // owner; maintenance retries SQLite without reclassifying this as JSON loss.
+    params.log.warn("Main-run recovery terminal evidence retry failed", {
+      runId: params.runId,
+      error,
+    });
+    return false;
+  }
+}
 
 function dispatchEventHandler<TEvent>(params: {
   loadHandler: () => Promise<(event: TEvent) => unknown>;
@@ -69,10 +129,33 @@ export function startGatewayEventSubscriptions(params: {
     messageMode: auditEnabled ? auditMessageMode : "off",
   });
   const unsubscribePrivateAuditEvents = auditEnabled
-    ? onAgentAuditEvent(auditRecorder.record)
+    ? onAgentAuditEvent((event) =>
+        auditRecorder.record(event, {
+          runId:
+            event.publicRunId ??
+            resolveOperatorRunId({
+              chatAbortControllers: params.chatAbortControllers,
+              chatRunState: params.chatRunState,
+              runId: event.runId,
+          }),
+        }),
+      )
     : undefined;
   const unsubscribeToolAuditEvents = auditEnabled
-    ? onTrustedToolExecutionEvent(auditRecorder.recordTool)
+    ? onTrustedToolExecutionEvent((event) => {
+        const projection = event.runId
+          ? {
+              runId:
+                event.publicRunId ??
+                resolveOperatorRunId({
+                  chatAbortControllers: params.chatAbortControllers,
+                  chatRunState: params.chatRunState,
+                  runId: event.runId,
+                }),
+            }
+          : undefined;
+        auditRecorder.recordTool(event, projection);
+      })
     : undefined;
   const unsubscribeMessageAuditEvents =
     auditEnabled && auditMessageMode !== "off"
@@ -94,100 +177,119 @@ export function startGatewayEventSubscriptions(params: {
             toolEventRecipients: params.toolEventRecipients,
             sessionEventSubscribers: params.sessionEventSubscribers,
             sessionMessageSubscribers: params.sessionMessageSubscribers,
-            updateRunToolErrorSummary: ({ runId, clientRunId, summary }) => {
-              for (const candidateRunId of new Set([runId, clientRunId])) {
-                const entry = params.chatAbortControllers.get(candidateRunId);
-                if (entry) {
-                  entry.toolErrorSummary = summary;
-                }
+            updateRunToolErrorSummary: ({ identity, summary }) => {
+              const tracked = resolveTrackedRun(params.chatAbortControllers, identity);
+              if (tracked) {
+                tracked.entry.toolErrorSummary = summary;
               }
             },
-            clearTrackedActiveRun: ({ runId, clientRunId }) => {
-              const candidateRunIds = runId === clientRunId ? [runId] : [runId, clientRunId];
-              for (const candidateRunId of candidateRunIds) {
-                const entry = params.chatAbortControllers.get(candidateRunId);
-                // Chat abort entries can hold the requested key while chat run
-                // state holds the canonical key; the run ids are the scoped match.
-                if (entry) {
-                  entry.projectSessionActive = false;
-                  entry.projectSessionTerminalPending = false;
-                  entry.projectSessionTerminalPersisted = false;
-                  queueMicrotask(() => {
-                    const current = params.chatAbortControllers.get(candidateRunId);
-                    if (
-                      current === entry &&
-                      entry.registrationCleanupRequested === true &&
-                      !entry.projectSessionTerminalPersistence
-                    ) {
-                      removeChatAbortControllerEntry(
-                        params.chatAbortControllers,
-                        candidateRunId,
-                        entry,
-                      );
-                    }
-                  });
-                }
+            clearTrackedActiveRun: ({ identity }) => {
+              const tracked = resolveTrackedRun(params.chatAbortControllers, identity);
+              if (!tracked) {
+                return;
               }
+              const entry = tracked.entry;
+              entry.projectSessionActive = false;
+              entry.projectSessionTerminalPending = false;
+              entry.projectSessionTerminalPersisted = false;
+              queueMicrotask(() => {
+                const current = params.chatAbortControllers.get(tracked.identity.executionRunId);
+                if (
+                  current === entry &&
+                  entry.registrationCleanupRequested === true &&
+                  !entry.projectSessionTerminalPersistence
+                ) {
+                  removeChatAbortControllerEntry(
+                    params.chatAbortControllers,
+                    tracked.identity.executionRunId,
+                    entry,
+                  );
+                }
+              });
             },
-            markTrackedRunTerminalPersisted: ({ runId, clientRunId }) => {
-              const candidateRunIds = runId === clientRunId ? [runId] : [runId, clientRunId];
-              for (const candidateRunId of candidateRunIds) {
+            markTrackedRunTerminalPersisted: ({ identity }) => {
+              for (const candidateRunId of activeRunIdentityAliases(identity)) {
                 params.restartRecoveryCandidates.delete(candidateRunId);
-                const entry = params.chatAbortControllers.get(candidateRunId);
-                if (entry) {
-                  entry.projectSessionTerminalPending = false;
-                  entry.projectSessionTerminalPersisted = true;
-                  entry.projectSessionTerminalPersistence = undefined;
-                }
+              }
+              const tracked = resolveTrackedRun(params.chatAbortControllers, identity);
+              if (tracked) {
+                notifyTrackedRunTerminalPersisted({
+                  entry: tracked.entry,
+                  log: params.log,
+                  runId: tracked.identity.publicRunId,
+                });
               }
             },
             trackTrackedRunTerminalPersistence: ({
-              runId,
-              clientRunId,
+              identity,
               sessionId: terminalSessionId,
               observedAt,
               persistence,
             }) => {
-              const candidateRunIds = runId === clientRunId ? [runId] : [runId, clientRunId];
-              for (const candidateRunId of candidateRunIds) {
-                const entry = params.chatAbortControllers.get(candidateRunId);
-                if (entry) {
-                  entry.projectSessionTerminalPending = false;
-                  entry.projectSessionTerminalPersistence = persistence;
-                  if (entry.registrationCleanupRequested === true) {
-                    void persistence
-                      .catch(() => undefined)
-                      .then(() => {
-                        if (params.chatAbortControllers.get(candidateRunId) === entry) {
-                          removeChatAbortControllerEntry(
-                            params.chatAbortControllers,
-                            candidateRunId,
-                            entry,
-                          );
-                        }
-                      });
-                  }
-                  const lifecycleGeneration = entry.lifecycleGeneration?.trim();
-                  const sessionKey = entry.sessionKey.trim();
-                  const sessionId = terminalSessionId?.trim() || entry.sessionId.trim();
-                  if (
-                    entry.controlUiVisible !== false &&
-                    lifecycleGeneration &&
-                    sessionKey &&
-                    sessionId
-                  ) {
-                    void persistence.catch(() => {
-                      params.restartRecoveryCandidates.set(candidateRunId, {
-                        runId: candidateRunId,
-                        lifecycleGeneration,
-                        sessionKey,
-                        sessionId,
-                        observedAt,
-                      });
-                    });
-                  }
-                }
+              const tracked = resolveTrackedRun(params.chatAbortControllers, identity);
+              if (!tracked) {
+                return;
               }
+              const entry = tracked.entry;
+              const executionRunId = tracked.identity.executionRunId;
+              entry.projectSessionTerminalPending = false;
+              entry.projectSessionTerminalPersistence = persistence;
+              if (entry.registrationCleanupRequested === true) {
+                void persistence.then(
+                  () => {
+                    if (params.chatAbortControllers.get(executionRunId) !== entry) {
+                      return;
+                    }
+                    if (
+                      !notifyTrackedRunTerminalPersisted({
+                        entry,
+                        log: params.log,
+                        runId: tracked.identity.publicRunId,
+                      })
+                    ) {
+                      return;
+                    }
+                    removeChatAbortControllerEntry(
+                      params.chatAbortControllers,
+                      executionRunId,
+                      entry,
+                    );
+                  },
+                  () => {
+                    if (params.chatAbortControllers.get(executionRunId) !== entry) {
+                      return;
+                    }
+                    notifyChatAbortControllerSessionTerminalPersistenceFailed(entry);
+                    removeChatAbortControllerEntry(
+                      params.chatAbortControllers,
+                      executionRunId,
+                      entry,
+                    );
+                  },
+                );
+              }
+              const lifecycleGeneration = entry.lifecycleGeneration?.trim();
+              const sessionKey = entry.sessionKey.trim();
+              const sessionId = terminalSessionId?.trim() || entry.sessionId.trim();
+              void persistence.catch(() => {
+                const failureHandled =
+                  notifyChatAbortControllerSessionTerminalPersistenceFailed(entry);
+                if (
+                  !failureHandled &&
+                  entry.controlUiVisible !== false &&
+                  lifecycleGeneration &&
+                  sessionKey &&
+                  sessionId
+                ) {
+                  params.restartRecoveryCandidates.set(executionRunId, {
+                    runId: executionRunId,
+                    lifecycleGeneration,
+                    sessionKey,
+                    sessionId,
+                    observedAt,
+                  });
+                }
+              });
             },
             isChatSendRunActive: (runId) => {
               const entry = params.chatAbortControllers.get(runId);
@@ -243,57 +345,92 @@ export function startGatewayEventSubscriptions(params: {
   };
 
   const unsubscribeAgentEvents = onAgentEvent((evt) => {
+    // Capture projection before synchronous abort cleanup removes the run link;
+    // lazy handler loading must never turn an internal recovery id into a wire id.
+    const chatLink = params.chatRunState.registry.peek(evt.runId);
+    const operatorRunId = resolveOperatorRunId({
+      chatAbortControllers: params.chatAbortControllers,
+      chatRunState: params.chatRunState,
+      runId: evt.runId,
+    });
     if (auditEnabled) {
-      auditRecorder.record(evt);
+      auditRecorder.record(evt, { runId: operatorRunId });
+    }
+    const eventLifecycleGeneration = evt.lifecycleGeneration?.trim();
+    if (
+      !chatLink &&
+      eventLifecycleGeneration &&
+      isMainRunRecoveryLifecycleFenced({
+        runId: evt.runId,
+        lifecycleGeneration: eventLifecycleGeneration,
+      })
+    ) {
+      return;
     }
     const lifecyclePhase =
       evt.stream === "lifecycle" && typeof evt.data?.phase === "string"
         ? evt.data.phase
         : undefined;
     if (lifecyclePhase === "end" || lifecyclePhase === "error") {
-      const chatLink = params.chatRunState.registry.peek(evt.runId);
-      const clientRunId = chatLink?.clientRunId ?? evt.runId;
-      const candidateRunIds = evt.runId === clientRunId ? [evt.runId] : [evt.runId, clientRunId];
-      for (const candidateRunId of candidateRunIds) {
-        const entry = params.chatAbortControllers.get(candidateRunId);
-        const eventLifecycleGeneration = evt.lifecycleGeneration?.trim();
-        if (
-          entry &&
-          (!eventLifecycleGeneration ||
-            !entry.lifecycleGeneration ||
-            entry.lifecycleGeneration === eventLifecycleGeneration)
-        ) {
-          entry.projectSessionTerminalPending = true;
-          entry.projectSessionTerminalObservedAt =
-            typeof evt.data.endedAt === "number" && Number.isFinite(evt.data.endedAt)
-              ? evt.data.endedAt
-              : evt.ts;
+      const identity = resolveActiveRunIdentity(evt.runId, chatLink);
+      const entry = resolveTrackedRun(params.chatAbortControllers, identity)?.entry;
+      if (
+        entry &&
+        (!eventLifecycleGeneration ||
+          !entry.lifecycleGeneration ||
+          entry.lifecycleGeneration === eventLifecycleGeneration)
+      ) {
+        const observedAtMs = evt.ts;
+        const terminalStatus = resolveGatewaySessionTerminalStatus(evt);
+        try {
+          recordChatAbortControllerMainRunRecoveryTerminalEvidence(entry, {
+            runId: evt.runId,
+            lifecycleGeneration: eventLifecycleGeneration,
+            outcome: {
+              status: terminalStatus,
+              endedAtMs: resolveTerminalEventTimestamp(evt.data.endedAt, observedAtMs),
+            },
+            // Event-bus delivery is the durable race boundary. JSON session
+            // persistence happens asynchronously after this listener returns.
+            observedAtMs,
+          });
+        } catch (error) {
+          params.log.warn("Main-run recovery terminal evidence write failed", {
+            runId: operatorRunId,
+            lifecycleGeneration: eventLifecycleGeneration,
+            error,
+          });
         }
+        entry.projectSessionTerminalPending = true;
+        entry.projectSessionTerminalObservedAt =
+          typeof evt.data.endedAt === "number" && Number.isFinite(evt.data.endedAt)
+            ? evt.data.endedAt
+            : evt.ts;
+        entry.projectSessionTerminalStatus = terminalStatus;
       }
     } else if (lifecyclePhase === "start") {
-      const chatLink = params.chatRunState.registry.peek(evt.runId);
-      const clientRunId = chatLink?.clientRunId ?? evt.runId;
-      const candidateRunIds = evt.runId === clientRunId ? [evt.runId] : [evt.runId, clientRunId];
-      const eventLifecycleGeneration = evt.lifecycleGeneration?.trim();
-      for (const candidateRunId of candidateRunIds) {
-        const entry = params.chatAbortControllers.get(candidateRunId);
-        if (
-          entry &&
-          (!eventLifecycleGeneration ||
-            !entry.lifecycleGeneration ||
-            entry.lifecycleGeneration === eventLifecycleGeneration)
-        ) {
-          entry.projectSessionTerminalPending = false;
-          entry.projectSessionTerminalObservedAt = undefined;
-        }
+      const identity = resolveActiveRunIdentity(evt.runId, chatLink);
+      const entry = resolveTrackedRun(params.chatAbortControllers, identity)?.entry;
+      if (
+        entry &&
+        (!eventLifecycleGeneration ||
+          !entry.lifecycleGeneration ||
+          entry.lifecycleGeneration === eventLifecycleGeneration)
+      ) {
+        entry.projectSessionTerminalPending = false;
+        entry.projectSessionTerminalObservedAt = undefined;
+        entry.projectSessionTerminalStatus = undefined;
       }
     }
     dispatchEventHandler({
-      loadHandler: getAgentEventHandler,
+      loadHandler: () =>
+        getAgentEventHandler().then(
+          (handler) => (event: typeof evt) => handler(event, { chatLink }),
+        ),
       event: evt,
       log: params.log,
       failureMessage: "Agent event dispatch failed",
-      context: { runId: evt.runId, stream: evt.stream },
+      context: { runId: operatorRunId, stream: evt.stream },
     });
   });
   const agentUnsub = async () => {

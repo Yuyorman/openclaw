@@ -11,6 +11,7 @@ import {
   resetExecApprovalFollowupRuntimeHandoffsForTests,
 } from "../../agents/bash-tools.exec-approval-followup-state.js";
 import type { AgentInternalEvent } from "../../agents/internal-events.js";
+import { clearMainRunRecoveryRuntimeForTest } from "../../agents/main-run-recovery-runtime.js";
 import {
   createAgentRunRestartAbortError,
   isAgentRunRestartAbortReason,
@@ -35,9 +36,15 @@ import {
 import { resetGatewayWorkAdmission } from "../../process/gateway-work-admission.js";
 import {
   interruptSessionWorkAdmissions,
+  registerSessionWorkAdmissionBarrier,
   runExclusiveSessionLifecycleMutation,
 } from "../../sessions/session-lifecycle-admission.js";
 import { AVATAR_MAX_BYTES } from "../../shared/avatar-policy.js";
+import {
+  fingerprintMainRunRecoverySource,
+  insertOrVerifyImportedMainRunRecovery,
+} from "../../state/main-run-recovery-store.js";
+import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import {
   getDetachedTaskLifecycleRuntime,
   resetDetachedTaskLifecycleRuntimeForTests,
@@ -97,6 +104,7 @@ const mocks = vi.hoisted(() => ({
       lastInteractionAt: entry?.lastInteractionAt,
     }),
   ),
+  takeMainRunRecoveryDispatch: vi.fn(),
   lifecycleGeneration: "test-generation",
 }));
 
@@ -154,9 +162,10 @@ vi.mock("../../config/sessions/session-accessor.js", async () => {
     readTranscriptStatsSync: mocks.readTranscriptStatsSync,
   };
 });
-vi.mock("../../commands/agent.js", () => ({
+vi.mock("../../agents/agent-command.js", () => ({
   agentCommand: mocks.agentCommand,
   agentCommandFromIngress: mocks.agentCommand,
+  agentCommandFromRecoveryIngress: mocks.agentCommand,
 }));
 
 vi.mock("../../acp/runtime/session-meta.js", async () => {
@@ -265,6 +274,23 @@ vi.mock("../session-reset-service.js", () => ({
   performGatewaySessionReset: (...args: unknown[]) =>
     (mocks.performGatewaySessionReset as (...args: unknown[]) => unknown)(...args),
 }));
+
+vi.mock("../../agents/main-run-recovery-runtime.js", async () => {
+  const actual = await vi.importActual<typeof import("../../agents/main-run-recovery-runtime.js")>(
+    "../../agents/main-run-recovery-runtime.js",
+  );
+  return {
+    ...actual,
+    takeMainRunRecoveryDispatch: (
+      ...args: Parameters<typeof actual.takeMainRunRecoveryDispatch>
+    ) => {
+      const override = mocks.takeMainRunRecoveryDispatch.getMockImplementation();
+      return override
+        ? mocks.takeMainRunRecoveryDispatch(...args)
+        : actual.takeMainRunRecoveryDispatch(...args);
+    },
+  };
+});
 
 vi.mock("../../infra/voicewake-routing.js", () => ({
   loadVoiceWakeRoutingConfig: mocks.loadVoiceWakeRoutingConfig,
@@ -658,6 +684,45 @@ function primeMainAgentRun(params?: { sessionId?: string; cfg?: Record<string, u
   });
 }
 
+function insertPendingSessionResumeRecovery(params: {
+  runId: string;
+  sessionId?: string;
+  sessionKey?: string;
+  storePath?: string;
+}) {
+  const identity = {
+    agentId: "main",
+    sessionKey: params.sessionKey ?? "agent:main:main",
+    sessionKeyAliases: [],
+    sessionId: params.sessionId ?? "existing-session-id",
+    storePath: params.storePath ?? "/tmp/sessions.json",
+  };
+  const envelope = {
+    kind: "session_resume" as const,
+    resolution: { kind: "resume" as const },
+    systemMessage: "resume the interrupted turn",
+    transcriptTail: null,
+    lifecycleRevision: null,
+    delivery: { context: null, runId: null, intentId: null },
+    fences: [],
+  };
+  const authorization = { senderIsOwner: false as const };
+  const sourceKey = `legacy-json:v1:${params.runId}`;
+  return insertOrVerifyImportedMainRunRecovery({
+    ...identity,
+    publicRunId: params.runId,
+    sourceKey,
+    sourceFingerprint: fingerprintMainRunRecoverySource({
+      sourceKey,
+      identity,
+      envelope,
+      authorization,
+    }),
+    envelope,
+    acceptedAtMs: Date.now(),
+  }).recovery;
+}
+
 async function runMainAgent(message: string, idempotencyKey: string) {
   const respond = vi.fn();
   await invokeAgent(
@@ -923,6 +988,7 @@ describe("gateway agent handler", () => {
     resetDiagnosticEventsForTest();
     resetTaskRegistryForTests();
     resetSubagentRegistryForTests({ persist: false });
+    clearMainRunRecoveryRuntimeForTest();
     subagentRegistryTesting.setDepsForTest();
     mocks.loadConfigReturn = {};
     mocks.emitGatewaySessionEndPluginHook.mockReset();
@@ -943,6 +1009,8 @@ describe("gateway agent handler", () => {
           lastInteractionAt: entry?.lastInteractionAt,
         }),
       );
+    mocks.emitAgentEvent.mockReset();
+    mocks.takeMainRunRecoveryDispatch.mockReset();
     mocks.lifecycleGeneration = "test-generation";
     dateOnlyFakeClockActive = false;
     vi.useRealTimers();
@@ -1473,6 +1541,93 @@ describe("gateway agent handler", () => {
 
     const call = await waitForAgentCommandCall<{ sessionId?: string }>();
     expect(call.sessionId).toBe(admittedSessionId);
+  });
+
+  it("maps durable session admission contention to unavailable", async () => {
+    primeMainAgentRun();
+    mocks.agentCommand.mockClear();
+    const sessionKey = "agent:main:main";
+    const barrier = registerSessionWorkAdmissionBarrier({
+      scope: "/tmp/sessions.json",
+      identities: [sessionKey],
+    });
+
+    try {
+      const respond = await invokeAgent(
+        {
+          message: "wait for unfinished durable work",
+          agentId: "main",
+          sessionKey,
+          idempotencyKey: "durable-admission-contention",
+        },
+        { reqId: "durable-admission-contention", flushDispatch: false },
+      );
+
+      expectRespondError(respond, {
+        code: ErrorCodes.UNAVAILABLE,
+        message: "session has unfinished durable work",
+        retryable: true,
+        retryAfterMs: 1_000,
+      });
+      expect(mocks.agentCommand).not.toHaveBeenCalled();
+    } finally {
+      barrier.release();
+    }
+  });
+
+  it("rejects ordinary admission when SQLite gains a recovery without a runtime barrier", async () => {
+    await withTempDir({ prefix: "openclaw-agent-live-recovery-" }, async (root) => {
+      useTestStateDir(root);
+      primeMainAgentRun();
+      mocks.agentCommand.mockClear();
+      insertPendingSessionResumeRecovery({
+        runId: "00000000-0000-5000-8000-000000000201",
+      });
+
+      try {
+        const respond = await invokeAgent(
+          {
+            message: "ordinary work after doctor imported a recovery",
+            agentId: "main",
+            sessionKey: "agent:main:main",
+            idempotencyKey: "live-recovery-admission",
+          },
+          {
+            client: operatorWriteGatewayClient(),
+            reqId: "live-recovery-admission",
+            flushDispatch: false,
+          },
+        );
+
+        expectRespondError(respond, {
+          code: ErrorCodes.UNAVAILABLE,
+          message: "session has unfinished durable work",
+          retryable: true,
+          retryAfterMs: 1_000,
+        });
+        expect(mocks.agentCommand).not.toHaveBeenCalled();
+      } finally {
+        closeOpenClawStateDatabaseForTest();
+      }
+    });
+  });
+
+  it("leaves restart recovery dispatch claims private to backend callers", async () => {
+    const runId = "restart-recovery-operator";
+    primeMainAgentRun();
+    mocks.takeMainRunRecoveryDispatch.mockReturnValue(undefined);
+
+    await invokeAgent(
+      {
+        message: "ordinary operator turn",
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        idempotencyKey: runId,
+      },
+      { client: operatorWriteGatewayClient(), reqId: runId },
+    );
+
+    expect(mocks.takeMainRunRecoveryDispatch).not.toHaveBeenCalled();
   });
 
   it("does not recreate a session deleted before lifecycle admission", async () => {

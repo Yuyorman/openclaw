@@ -28,6 +28,10 @@ import {
 } from "../../../packages/gateway-protocol/src/index.js";
 import { readAcpSessionMeta } from "../../acp/runtime/session-meta.js";
 import {
+  agentCommandFromIngress,
+  agentCommandFromRecoveryIngress,
+} from "../../agents/agent-command.js";
+import {
   buildAgentRunTerminalOutcome,
   type AgentRunTerminalOutcome,
 } from "../../agents/agent-run-terminal-outcome.js";
@@ -53,6 +57,20 @@ import {
   hasGeneratedMediaCompletionEvent,
 } from "../../agents/internal-event-contract.js";
 import type { AgentInternalEvent } from "../../agents/internal-events.js";
+import {
+  createMainRunRecoveryCancellationSettlementToken,
+  createMainRunRecoveryExecutionOwner,
+  createMainRunRecoveryExecutionSettlementToken,
+  finalizeMainRunRecoveryDispatch,
+  markMainRunRecoveryDispatchAdmitted,
+  onMainRunRecoveryDispatchStarted,
+  releaseMainRunRecoveryDispatchForRetry,
+  settleMainRunRecoveryCancellation,
+  settleMainRunRecoveryExecution,
+  takeMainRunRecoveryDispatch,
+  type MainRunRecoveryDispatchClaim,
+  type MainRunRecoveryExecutionSettlementToken,
+} from "../../agents/main-run-recovery-runtime.js";
 import { resolveCliRuntimeExecutionProvider } from "../../agents/model-runtime-aliases.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
@@ -70,7 +88,6 @@ import {
   resolveIngressWorkspaceOverrideForSessionRun,
 } from "../../agents/spawned-context.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
-import { agentCommandFromIngress } from "../../commands/agent.js";
 import {
   evaluateSessionFreshness,
   hasTerminalMainSessionTranscriptNewerThanRegistrySync,
@@ -95,6 +112,7 @@ import {
   patchSessionEntryTarget,
   readTranscriptStatsSync,
 } from "../../config/sessions/session-accessor.js";
+import { resolveCanonicalSessionStorePath } from "../../config/sessions/paths.js";
 import { mergeSessionSnapshotChanges } from "../../config/sessions/session-snapshot-merge.js";
 import {
   formatSqliteSessionFileMarker,
@@ -108,10 +126,12 @@ import {
   assertAgentRunLifecycleGenerationCurrent,
   claimAgentRunContext,
   clearAgentRunContext,
+  emitAgentEvent,
   getAgentEventLifecycleGeneration,
 } from "../../infra/agent-events.js";
 import { emitDiagnosticEvent } from "../../infra/diagnostic-events.js";
-import { formatUncaughtError, readErrorName } from "../../infra/errors.js";
+import { formatErrorMessage, formatUncaughtError, readErrorName } from "../../infra/errors.js";
+import { findLegacyMainRunRecoveryAdmissionBlocker } from "../../infra/main-run-recovery-admission-gate.js";
 import {
   resolveAgentDeliveryPlanWithSessionRoute,
   resolveAgentExplicitRecipientSession,
@@ -155,9 +175,17 @@ import {
 } from "../../sessions/session-key-utils.js";
 import {
   beginSessionWorkAdmission,
+  SessionWorkAdmissionBlockedError,
   type SessionWorkAdmissionLease,
 } from "../../sessions/session-lifecycle-admission.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
+import {
+  findActiveMainRunRecoveryBySession,
+  getMainRunRecovery,
+  requestMainRunRecoveryCancellation,
+  type MainRunRecovery,
+  type MainRunRecoveryIdentity,
+} from "../../state/main-run-recovery-store.js";
 import { createRunningTaskRun, finalizeTaskRunByRunId } from "../../tasks/detached-task-runtime.js";
 import type { TaskStatus } from "../../tasks/task-registry.types.js";
 import {
@@ -178,10 +206,13 @@ import {
   normalizeMessageChannel,
 } from "../../utils/message-channel.js";
 import { setSafeTimeout } from "../../utils/timer-delay.js";
+import { createActiveRunIdentity } from "../active-run-registry.js";
 import { resolveGatewayAssistantAvatar } from "../assistant-avatar.js";
 import { resolveAssistantIdentity } from "../assistant-identity.js";
 import {
+  bindChatAbortControllerMainRunRecoveryExecution,
   type ChatAbortControllerEntry,
+  hasObservedChatAbortControllerTerminal,
   registerChatAbortController,
   resolveAgentRunExpiresAtMs,
   updateChatRunProvider,
@@ -192,6 +223,7 @@ import {
   resolveChatAttachmentMaxBytes,
 } from "../chat-attachments.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
+import { persistGatewaySessionLifecycleEvent } from "../session-lifecycle-state.js";
 import {
   emitGatewaySessionEndPluginHook,
   emitGatewaySessionStartPluginHook,
@@ -218,6 +250,14 @@ import type {
 
 const RESET_COMMAND_RE = /^\/(new|reset)(?:\s+([\s\S]*))?$/i;
 const CRON_CONTINUATION_RELEASE_RECOVERY_DELAYS_MS = [250, 1_000, 4_000, 15_000] as const;
+const DURABLE_SESSION_RETRY_AFTER_MS = 1_000;
+
+function retryableDurableSessionError(message: string) {
+  return errorShape(ErrorCodes.UNAVAILABLE, message, {
+    retryable: true,
+    retryAfterMs: DURABLE_SESSION_RETRY_AFTER_MS,
+  });
+}
 
 type AgentSendSessionLifecycleTransition = {
   cfg: OpenClawConfig;
@@ -294,9 +334,10 @@ function respondUnavailableAgentSessionForKey(params: {
   requestedSessionId?: string;
   isRawModelRun: boolean;
   agentId?: string;
+  legacyMainRunRecoveryAdmissionGate?: GatewayRequestContext["legacyMainRunRecoveryAdmissionGate"];
   respond: GatewayRequestHandlerOptions["respond"];
 }): boolean {
-  const { cfg, entry, canonicalKey, legacyKey } = loadSessionEntry(params.sessionKey, {
+  const { cfg, storePath, entry, canonicalKey, legacyKey } = loadSessionEntry(params.sessionKey, {
     ...(params.agentId ? { agentId: params.agentId } : {}),
     clone: false,
   });
@@ -322,6 +363,29 @@ function respondUnavailableAgentSessionForKey(params: {
   );
   if (harnessSessionIdError) {
     params.respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, harnessSessionIdError));
+    return true;
+  }
+  const legacyRecoveryBlocker = params.legacyMainRunRecoveryAdmissionGate
+    ? findLegacyMainRunRecoveryAdmissionBlocker(params.legacyMainRunRecoveryAdmissionGate, {
+        storePath,
+        sessionId: entry?.sessionId ?? params.requestedSessionId,
+        sessionKey: canonicalKey,
+        ...(entry ? { entry } : {}),
+      })
+    : undefined;
+  if (legacyRecoveryBlocker) {
+    params.respond(
+      false,
+      undefined,
+      errorShape(ErrorCodes.UNAVAILABLE, legacyRecoveryBlocker.doctorHint, {
+        retryable: true,
+        retryAfterMs: DURABLE_SESSION_RETRY_AFTER_MS,
+        details: {
+          reason: legacyRecoveryBlocker.reason,
+          doctorHint: legacyRecoveryBlocker.doctorHint,
+        },
+      }),
+    );
     return true;
   }
   if (params.isRawModelRun && entry?.modelSelectionLocked === true) {
@@ -918,6 +982,16 @@ function isAcceptedAgentDedupePayload(payload: unknown): payload is {
   );
 }
 
+type LedgerMainRunRecoveryDispatchClaim = MainRunRecoveryDispatchClaim & {
+  ledgerRunId: string;
+};
+
+function hasMainRunRecoveryLedger(
+  claim: MainRunRecoveryDispatchClaim | undefined,
+): claim is LedgerMainRunRecoveryDispatchClaim {
+  return Boolean(claim?.ledgerRunId);
+}
+
 function isPreRegistrationAbortedAgentDedupePayload(payload: unknown): payload is {
   agentId?: unknown;
   runId?: unknown;
@@ -1071,11 +1145,13 @@ function dispatchAgentRunFromGateway(params: {
   respond: GatewayRequestHandlerOptions["respond"];
   context: GatewayRequestHandlerOptions["context"];
   taskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent">;
+  recoveryDispatch?: MainRunRecoveryDispatchClaim;
+  onDispatchError?: (error: unknown) => Promise<void> | void;
   onSettled?: (outcome: {
     terminalOutcome: AgentRunTerminalOutcome;
     onRecovered?: () => void;
   }) => Promise<boolean> | boolean;
-}) {
+}): Promise<void> {
   const shouldTrackTask = params.taskTrackingMode === "cli";
   let taskTracked = false;
   if (shouldTrackTask) {
@@ -1120,7 +1196,15 @@ function dispatchAgentRunFromGateway(params: {
       return false;
     }
   };
-  void agentCommandFromIngress(params.ingressOpts, defaultRuntime, params.context.deps)
+  const command = params.recoveryDispatch
+    ? agentCommandFromRecoveryIngress(
+        params.ingressOpts,
+        createMainRunRecoveryExecutionOwner(params.recoveryDispatch.dispatchToken),
+        defaultRuntime,
+        params.context.deps,
+      )
+    : agentCommandFromIngress(params.ingressOpts, defaultRuntime, params.context.deps);
+  return command
     .then(async (result) => {
       const aborted = result?.meta?.aborted === true;
       const timeoutAttribution = readAgentRunTimeoutAttribution(result?.meta);
@@ -1188,6 +1272,13 @@ function dispatchAgentRunFromGateway(params: {
       params.respond(true, payload, undefined, { runId: params.runId });
     })
     .catch(async (err: unknown) => {
+      try {
+        await params.onDispatchError?.(err);
+      } catch (dispatchError) {
+        params.context.logGateway.warn(
+          `failed to project agent dispatch error ${params.runId}: ${formatForLog(dispatchError)}`,
+        );
+      }
       const aborted = isGatewayAgentAbortRejection(err, params.abortController.signal);
       const renderedErr = formatForLog(err);
       if (taskTracked) {
@@ -1790,6 +1881,7 @@ export const agentHandlers: GatewayRequestHandlers = {
         requestedSessionId,
         isRawModelRun,
         agentId,
+        legacyMainRunRecoveryAdmissionGate: context.legacyMainRunRecoveryAdmissionGate,
         respond,
       })
     ) {
@@ -1865,6 +1957,11 @@ export const agentHandlers: GatewayRequestHandlers = {
         })()
       : undefined;
     let gatewayWorkAdmission: SessionWorkAdmissionLease | undefined;
+    let restartRecoveryDispatchClaim: MainRunRecoveryDispatchClaim | undefined;
+    let restartRecoveryExecutionSettlementToken:
+      | MainRunRecoveryExecutionSettlementToken
+      | undefined;
+    let mainRunRecoveryAdmissionIdentity: MainRunRecoveryIdentity | undefined;
     let gatewayAdmissionTransferred = false;
     let cronContinuationClaim:
       | {
@@ -2236,6 +2333,34 @@ export const agentHandlers: GatewayRequestHandlers = {
         (resolvedSessionKey === "global"
           ? (agentId ?? resolveDefaultAgentId(cfgForAgent ?? cfg))
           : undefined);
+      const assertMainRunRecoveryLedgerAdmissionAllowed = () => {
+        const identity = mainRunRecoveryAdmissionIdentity;
+        if (!identity) {
+          return;
+        }
+        let activeRecovery: MainRunRecovery | undefined;
+        try {
+          activeRecovery = findActiveMainRunRecoveryBySession(identity);
+        } catch (err) {
+          context.logGateway.warn(
+            `failed to inspect main-run recovery admission: ${formatForLog(err)}`,
+          );
+          throw new SessionWorkAdmissionBlockedError();
+        }
+        if (!activeRecovery) {
+          return;
+        }
+        const claim = restartRecoveryDispatchClaim;
+        if (
+          !claim?.ledgerRunId ||
+          claim.ledgerRunId !== activeRecovery.publicRunId ||
+          claim.agentId !== identity.agentId ||
+          claim.sessionId !== identity.sessionId ||
+          resolveCanonicalSessionStorePath(claim.storePath) !== identity.storePath
+        ) {
+          throw new SessionWorkAdmissionBlockedError();
+        }
+      };
       const assertGatewayWorkAdmissionAllowed = (commitOutcome = true) => {
         const latestPreRegistrationAbort = readGatewayDedupeEntry({
           dedupe: context.dedupe,
@@ -2359,6 +2484,7 @@ export const agentHandlers: GatewayRequestHandlers = {
         ) {
           admittedSessionId = latestEntry.sessionId;
         }
+        assertMainRunRecoveryLedgerAdmissionAllowed();
       };
       const interruptGatewayWorkAdmission = () => {
         if (admittedRunAbort?.entry) {
@@ -2387,17 +2513,106 @@ export const agentHandlers: GatewayRequestHandlers = {
           });
         }
       };
+      const assertRestartRecoveryDispatchClaimActive = (
+        claim: MainRunRecoveryDispatchClaim,
+        scope: string,
+        nowMs = Date.now(),
+      ): MainRunRecovery => {
+        const current = getMainRunRecovery(claim.ledgerRunId, claim.database);
+        const aliasesMatch =
+          current?.sessionKeyAliases.length === claim.sessionKeyAliases.length &&
+          current.sessionKeyAliases.every(
+            (alias, index) => alias === claim.sessionKeyAliases[index],
+          );
+        if (
+          !current ||
+          current.publicRunId !== claim.publicRunId ||
+          current.kind !== claim.kind ||
+          current.state !== claim.recoveryState ||
+          current.agentId !== claim.agentId ||
+          current.sessionKey !== claim.sessionKey ||
+          !aliasesMatch ||
+          current.sessionId !== claim.sessionId ||
+          resolveCanonicalSessionStorePath(current.storePath) !==
+            resolveCanonicalSessionStorePath(scope) ||
+          current.execution !== undefined ||
+          current.lease?.owner !== claim.leaseOwner ||
+          current.lease.expiresAtMs <= nowMs
+        ) {
+          throw new SessionWorkAdmissionBlockedError();
+        }
+        return current;
+      };
       const acquireGatewayWorkAdmission = async (scope: string) => {
         if (gatewayWorkAdmission) {
           return;
         }
-        gatewayWorkAdmission = await beginSessionWorkAdmission({
-          scope,
-          identities: [resolvedSessionKey, resolvedSessionId],
-          assertAllowed: () => assertGatewayWorkAdmissionAllowed(false),
-          revalidateAllowed: assertGatewayWorkAdmissionAllowed,
-          onInterrupt: interruptGatewayWorkAdmission,
-        });
+        const recoverySessionKey = resolvedSessionKey;
+        const recoveryAgentId = recoverySessionKey
+          ? normalizeAgentId(
+              resolvedSessionAgentId ?? agentId ?? resolveAgentIdFromSessionKey(recoverySessionKey),
+            )
+          : undefined;
+        if (recoverySessionKey && recoveryAgentId) {
+          mainRunRecoveryAdmissionIdentity ??= {
+            agentId: recoveryAgentId,
+            sessionKey: recoverySessionKey,
+            sessionKeyAliases:
+              requestedSessionKey && requestedSessionKey !== recoverySessionKey
+                ? [requestedSessionKey]
+                : [],
+            sessionId: admittedSessionId,
+            storePath: resolveCanonicalSessionStorePath(scope),
+          };
+        }
+        restartRecoveryDispatchClaim =
+          canUseInternalRuntimeHandoff && recoverySessionKey && recoveryAgentId
+            ? takeMainRunRecoveryDispatch({
+                agentId: recoveryAgentId,
+                dispatchRunId: runId,
+                message,
+                sessionKey: recoverySessionKey,
+              })
+            : undefined;
+        const recoveryDispatchClaim = restartRecoveryDispatchClaim;
+        try {
+          if (
+            recoveryDispatchClaim &&
+            resolveCanonicalSessionStorePath(recoveryDispatchClaim.storePath) !==
+              resolveCanonicalSessionStorePath(scope)
+          ) {
+            throw new Error("restart recovery dispatch store changed before admission");
+          }
+          gatewayWorkAdmission = await beginSessionWorkAdmission({
+            scope,
+            identities: recoveryDispatchClaim?.admissionIdentities ?? [
+              resolvedSessionKey,
+              resolvedSessionId,
+              runId,
+            ],
+            assertAllowed: () => assertGatewayWorkAdmissionAllowed(false),
+            revalidateAllowed: () => {
+              assertGatewayWorkAdmissionAllowed(true);
+              if (recoveryDispatchClaim && admittedSessionId !== recoveryDispatchClaim.sessionId) {
+                throw new Error("restart recovery dispatch session changed before admission");
+              }
+            },
+            onInterrupt: interruptGatewayWorkAdmission,
+            barrierGrant: recoveryDispatchClaim?.admissionGrant,
+          });
+          if (recoveryDispatchClaim) {
+            markMainRunRecoveryDispatchAdmitted(recoveryDispatchClaim.dispatchToken);
+            // Cancellation can race the writer callback before this continuation.
+            // Recheck synchronously; once the controller registers, normal abort owns the race.
+            assertRestartRecoveryDispatchClaimActive(recoveryDispatchClaim, scope);
+          }
+        } catch (error) {
+          if (recoveryDispatchClaim) {
+            finalizeMainRunRecoveryDispatch(recoveryDispatchClaim.dispatchToken);
+            restartRecoveryDispatchClaim = undefined;
+          }
+          throw error;
+        }
       };
       const respondToGatewayAdmissionOutcome = (): boolean => {
         if (postAdmissionAbort) {
@@ -3043,7 +3258,11 @@ export const agentHandlers: GatewayRequestHandlers = {
         try {
           await acquireGatewayWorkAdmission(storePath ?? `agent:${sessionAgentId}`);
         } catch (err) {
-          respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
+          const error =
+            err instanceof SessionWorkAdmissionBlockedError
+              ? retryableDurableSessionError(formatErrorMessage(err))
+              : errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(err));
+          respond(false, undefined, error);
           return;
         }
         if (respondToGatewayAdmissionOutcome()) {
@@ -3248,7 +3467,11 @@ export const agentHandlers: GatewayRequestHandlers = {
           try {
             assertGatewayWorkAdmissionAllowed();
           } catch (err) {
-            respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
+            const error =
+              err instanceof SessionWorkAdmissionBlockedError
+                ? retryableDurableSessionError(formatErrorMessage(err))
+                : errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err));
+            respond(false, undefined, error);
             return;
           }
           if (respondToGatewayAdmissionOutcome()) {
@@ -3578,6 +3801,97 @@ export const agentHandlers: GatewayRequestHandlers = {
             clone: false,
           }).storePath
         : `agent:${activeSessionAgentId}`;
+      const recoveryCas = (recovery: MainRunRecovery) => ({
+        agentId: recovery.agentId,
+        publicRunId: recovery.publicRunId,
+        sessionId: recovery.sessionId,
+        sessionKey: recovery.sessionKey,
+        sessionKeyAliases: recovery.sessionKeyAliases,
+        storePath: recovery.storePath,
+        expectedRevision: recovery.revision,
+        expectedState: recovery.state as Exclude<MainRunRecovery["state"], "terminal">,
+      });
+      const settleRestartRecoveryCancellation = (
+        claim: LedgerMainRunRecoveryDispatchClaim,
+        recovery: MainRunRecovery,
+      ): boolean => {
+        if (recovery.state !== "cancelling" || !recovery.cancellation) {
+          return false;
+        }
+        const endedAtMs = Math.max(
+          Date.now(),
+          recovery.cancellation.requestedAtMs,
+          recovery.terminalEvidence?.outcome.endedAtMs ?? 0,
+        );
+        const settled = settleMainRunRecoveryCancellation(
+          createMainRunRecoveryCancellationSettlementToken(recovery, claim.database),
+          { endedAtMs, nowMs: endedAtMs },
+        );
+        if (settled) {
+          finalizeMainRunRecoveryDispatch(claim.dispatchToken);
+          if (restartRecoveryDispatchClaim === claim) {
+            restartRecoveryDispatchClaim = undefined;
+          }
+        }
+        return true;
+      };
+      const settleRestartRecoveryAfterTerminalPersistence = () => {
+        const claim = restartRecoveryDispatchClaim;
+        if (!hasMainRunRecoveryLedger(claim)) {
+          return;
+        }
+        const recovery = getMainRunRecovery(claim.ledgerRunId, claim.database);
+        if (!recovery) {
+          finalizeMainRunRecoveryDispatch(claim.dispatchToken);
+          restartRecoveryDispatchClaim = undefined;
+          return;
+        }
+        if (settleRestartRecoveryCancellation(claim, recovery)) {
+          return;
+        }
+        const terminalOutcome = recovery.terminalEvidence?.outcome ?? recovery.terminalOutcome;
+        const settlementToken = restartRecoveryExecutionSettlementToken;
+        if (!terminalOutcome || !settlementToken) {
+          context.logGateway.warn(
+            `restart recovery admission ${claim.ledgerRunId} has no execution evidence to settle`,
+          );
+          return;
+        }
+        try {
+          const nowMs = Math.max(Date.now(), terminalOutcome.endedAtMs);
+          const settled = settleMainRunRecoveryExecution(settlementToken, {
+            nowMs,
+          });
+          if (settled) {
+            finalizeMainRunRecoveryDispatch(claim.dispatchToken);
+            if (restartRecoveryDispatchClaim === claim) {
+              restartRecoveryDispatchClaim = undefined;
+            }
+          }
+        } catch (err) {
+          context.logGateway.warn(
+            `failed to settle restart recovery admission ${claim.ledgerRunId}: ${formatForLog(err)}`,
+          );
+        }
+      };
+      const settleRestartRecoveryCancellationAfterTerminalPersistenceFailure = (): boolean => {
+        const claim = restartRecoveryDispatchClaim;
+        if (!hasMainRunRecoveryLedger(claim)) {
+          return false;
+        }
+        try {
+          settleRestartRecoveryAfterTerminalPersistence();
+          return (
+            restartRecoveryDispatchClaim !== claim ||
+            getMainRunRecovery(claim.ledgerRunId, claim.database)?.state === "terminal"
+          );
+        } catch (err) {
+          context.logGateway.warn(
+            `failed to inspect restart recovery cancellation ${claim.ledgerRunId}: ${formatForLog(err)}`,
+          );
+          return false;
+        }
+      };
       try {
         await acquireGatewayWorkAdmission(lifecycleStorePath);
         assertGatewayWorkAdmissionAllowed();
@@ -3591,25 +3905,44 @@ export const agentHandlers: GatewayRequestHandlers = {
           admittedRunAbort = registerChatAbortController({
             chatAbortControllers: context.chatAbortControllers,
             runId,
+            runIdentity: createActiveRunIdentity(
+              runId,
+              restartRecoveryDispatchClaim?.publicRunId ??
+                restartRecoveryDispatchClaim?.ledgerRunId,
+            ),
             sessionId: admittedSessionId,
             sessionKey: resolvedSessionKey,
             agentId: admissionAgentId(),
             timeoutMs,
             now,
             expiresAtMs: resolveAgentRunExpiresAtMs({ now, timeoutMs }),
-            ownerConnId,
-            ownerDeviceId,
+            ownerConnId: restartRecoveryDispatchClaim ? undefined : ownerConnId,
+            ownerDeviceId:
+              restartRecoveryDispatchClaim?.owner?.kind === "device"
+                ? restartRecoveryDispatchClaim.owner.deviceId
+                : restartRecoveryDispatchClaim
+                  ? undefined
+                  : ownerDeviceId,
             providerId: activeModelProvider,
             authProviderId: activeAuthProvider,
             isAbortable: () => isEmbeddedAgentRunAbortableForRunId(runId),
-            onRemoved: () => clearEmbeddedAgentRunAbortabilityForRunId(runId),
+            onRemoved: () => {
+              clearEmbeddedAgentRunAbortabilityForRunId(runId);
+            },
+            onSessionTerminalPersisted: settleRestartRecoveryAfterTerminalPersistence,
+            onSessionTerminalPersistenceFailed:
+              settleRestartRecoveryCancellationAfterTerminalPersistenceFailure,
             controlUiVisible: !suppressVisibleSessionEffects,
             kind: "agent",
             lifecycleGeneration,
           });
         }
       } catch (err) {
-        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, formatForLog(err)));
+        const error =
+          err instanceof SessionWorkAdmissionBlockedError
+            ? retryableDurableSessionError(formatErrorMessage(err))
+            : errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(err));
+        respond(false, undefined, error);
         return;
       }
       if (respondToGatewayAdmissionOutcome()) {
@@ -3626,6 +3959,127 @@ export const agentHandlers: GatewayRequestHandlers = {
         respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, "agent run admission failed"));
         return;
       }
+      const recoveryClaimAtAdmission = restartRecoveryDispatchClaim;
+      if (recoveryClaimAtAdmission) {
+        onMainRunRecoveryDispatchStarted(recoveryClaimAtAdmission.dispatchToken, (execution) => {
+          const running = getMainRunRecovery(
+            recoveryClaimAtAdmission.ledgerRunId,
+            recoveryClaimAtAdmission.database,
+          );
+          if (
+            !running ||
+            running.execution?.runId !== execution.runId ||
+            running.execution.lifecycleGeneration !== execution.lifecycleGeneration ||
+            running.execution.epoch !== execution.epoch ||
+            !activeRunAbort.entry
+          ) {
+            throw new SessionWorkAdmissionBlockedError();
+          }
+          restartRecoveryExecutionSettlementToken = createMainRunRecoveryExecutionSettlementToken(
+            running,
+            recoveryClaimAtAdmission.database,
+          );
+          bindChatAbortControllerMainRunRecoveryExecution(activeRunAbort.entry, {
+            publicRunId: running.publicRunId,
+            agentId: running.agentId,
+            sessionKey: running.sessionKey,
+            sessionKeyAliases: running.sessionKeyAliases,
+            sessionId: running.sessionId,
+            storePath: running.storePath,
+            execution,
+            database: recoveryClaimAtAdmission.database,
+          });
+        });
+      }
+      let restartRecoveryDispatchErrorHandled = false;
+      const persistRestartRecoveryDispatchError = async (err: unknown): Promise<void> => {
+        const tracked = activeRunAbort.entry;
+        if (
+          !restartRecoveryDispatchClaim ||
+          !resolvedSessionKey ||
+          isGatewayAgentAbortRejection(err, activeRunAbort.controller.signal) ||
+          restartRecoveryDispatchErrorHandled ||
+          hasObservedChatAbortControllerTerminal(tracked)
+        ) {
+          return;
+        }
+        restartRecoveryDispatchErrorHandled = true;
+        const preExecutionClaim = restartRecoveryDispatchClaim;
+        if (preExecutionClaim && !restartRecoveryExecutionSettlementToken) {
+          const current = getMainRunRecovery(
+            preExecutionClaim.ledgerRunId,
+            preExecutionClaim.database,
+          );
+          if (current && settleRestartRecoveryCancellation(preExecutionClaim, current)) {
+            return;
+          }
+          const nowMs = Date.now();
+          try {
+            const released = releaseMainRunRecoveryDispatchForRetry(
+              preExecutionClaim.dispatchToken,
+              {
+                error: formatErrorMessage(err),
+                nowMs,
+                nextAttemptAtMs: nowMs + 250,
+              },
+            );
+            if (released) {
+              restartRecoveryDispatchClaim = undefined;
+              return;
+            }
+          } catch (releaseError) {
+            context.logGateway.warn(
+              `failed to return restart recovery ${preExecutionClaim.ledgerRunId} to its worker: ${formatForLog(releaseError)}`,
+            );
+          }
+        }
+        const endedAt = Date.now();
+        const error = formatErrorMessage(err);
+        emitAgentEvent({
+          runId,
+          sessionKey: resolvedSessionKey,
+          sessionId: tracked?.sessionId ?? admittedSessionId,
+          agentId: activeSessionAgentId,
+          lifecycleGeneration,
+          stream: "lifecycle",
+          data: {
+            phase: "error",
+            startedAt: tracked?.startedAtMs ?? now,
+            endedAt,
+            error,
+            fallbackExhaustedFailure: true,
+          },
+        });
+        // Normal Gateway subscriptions now own terminal persistence, UI
+        // projection, and durable admission settlement.
+        if (hasObservedChatAbortControllerTerminal(tracked)) {
+          return;
+        }
+        try {
+          await persistGatewaySessionLifecycleEvent({
+            sessionKey: resolvedSessionKey,
+            ...(resolvedSessionKey === "global" ? { agentId: activeSessionAgentId } : {}),
+            event: {
+              runId,
+              sessionId: tracked?.sessionId ?? admittedSessionId,
+              lifecycleGeneration,
+              ts: endedAt,
+              data: {
+                phase: "error",
+                startedAt: tracked?.startedAtMs ?? now,
+                endedAt,
+                error,
+                fallbackExhaustedFailure: true,
+              },
+            },
+          });
+          settleRestartRecoveryAfterTerminalPersistence();
+        } catch (persistErr) {
+          context.logGateway.warn(
+            `agent restart recovery lifecycle persist failed after dispatch error: ${formatForLog(persistErr)}`,
+          );
+        }
+      };
       resolvedSessionId = admittedSessionId;
       const existingRunAbort = context.chatAbortControllers.get(runId);
       if (!activeRunAbort.registered && existingRunAbort) {
@@ -3642,6 +4096,23 @@ export const agentHandlers: GatewayRequestHandlers = {
       }
       let releaseGatewayRootContinuation: (() => void) | undefined;
       const cleanupAdmittedRun: typeof activeRunAbort.cleanup = (options) => {
+        const tracked = activeRunAbort.entry;
+        if (
+          hasMainRunRecoveryLedger(restartRecoveryDispatchClaim) &&
+          !hasObservedChatAbortControllerTerminal(tracked)
+        ) {
+          const claim = restartRecoveryDispatchClaim;
+          const recovery = getMainRunRecovery(claim.ledgerRunId, claim.database);
+          if (recovery?.state === "cancelling") {
+            if (tracked) {
+              // An abort before dispatch reserves terminal ownership but emits no runner event.
+              // Release only that unobserved reservation before final controller cleanup.
+              tracked.projectSessionTerminalPending = false;
+              tracked.projectSessionTerminalObservedAt = undefined;
+            }
+            settleRestartRecoveryCancellation(claim, recovery);
+          }
+        }
         activeRunAbort.cleanup(options);
         activeGatewayWorkAdmission.release();
         releaseGatewayRootContinuation?.();
@@ -3652,17 +4123,25 @@ export const agentHandlers: GatewayRequestHandlers = {
         if (pendingChatRun) {
           context.addChatRun(runId, {
             ...pendingChatRun,
-            clientRunId: runId,
+            clientRunId:
+              restartRecoveryDispatchClaim?.publicRunId ??
+              restartRecoveryDispatchClaim?.ledgerRunId ??
+              runId,
           });
         }
         if (resolvedSessionKey) {
           claimAgentRunContext(
             runId,
             suppressVisibleSessionEffects
-              ? { isControlUiVisible: false, lifecycleGeneration }
+              ? {
+                  isControlUiVisible: false,
+                  lifecycleGeneration,
+                  publicRunId: restartRecoveryDispatchClaim?.publicRunId ?? runId,
+                }
               : {
                   sessionKey: resolvedSessionKey,
                   lifecycleGeneration,
+                  publicRunId: restartRecoveryDispatchClaim?.publicRunId ?? runId,
                 },
           );
         }
@@ -3679,13 +4158,17 @@ export const agentHandlers: GatewayRequestHandlers = {
         client,
         logGateway: context.logGateway,
       });
-      const taskTrackingMode = resolveGatewayAgentTaskTrackingMode({
-        client,
-        sessionKey: resolvedSessionKey,
-        inputProvenance,
-        confirmedAcpManualSpawn,
-        modelRun: isOneShotModelRun,
-      });
+      // Recovery continues the original durable logical turn. A second task row
+      // would expose the private attempt id and double-count one user operation.
+      const taskTrackingMode = restartRecoveryDispatchClaim
+        ? "none"
+        : resolveGatewayAgentTaskTrackingMode({
+            client,
+            sessionKey: resolvedSessionKey,
+            inputProvenance,
+            confirmedAcpManualSpawn,
+            modelRun: isOneShotModelRun,
+          });
       let dispatchTaskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent"> =
         taskTrackingMode === "cli" ? "cli" : "none";
       if (taskTrackingMode === "plugin_subagent" && resolvedSessionKey) {
@@ -3724,8 +4207,13 @@ export const agentHandlers: GatewayRequestHandlers = {
         ...accepted,
         controlUiVisible: !suppressVisibleSessionEffects,
         dedupeKeys: agentDedupeKeys,
-        ownerConnId,
-        ownerDeviceId,
+        ownerConnId: restartRecoveryDispatchClaim ? undefined : ownerConnId,
+        ownerDeviceId:
+          restartRecoveryDispatchClaim?.owner?.kind === "device"
+            ? restartRecoveryDispatchClaim.owner.deviceId
+            : restartRecoveryDispatchClaim
+              ? undefined
+              : ownerDeviceId,
       };
       agentRunAccepted = true;
       // Store an in-flight ack so retries do not spawn a second run.
@@ -3901,7 +4389,7 @@ export const agentHandlers: GatewayRequestHandlers = {
           const execApprovalFollowupElevatedDefaults =
             execApprovalFollowupRuntimeHandoff?.bashElevated;
 
-          dispatchAgentRunFromGateway({
+          await dispatchAgentRunFromGateway({
             ingressOpts: {
               message,
               images,
@@ -3951,7 +4439,10 @@ export const agentHandlers: GatewayRequestHandlers = {
               acpTurnSource: request.acpTurnSource,
               internalEvents: request.internalEvents,
               inputProvenance,
-              senderIsOwner: restoredCronContinuation ? true : clientHasAdminScope(client),
+              senderIsOwner: restoredCronContinuation
+                ? true
+                : (restartRecoveryDispatchClaim?.authorization.senderIsOwner ??
+                  clientHasAdminScope(client)),
               sessionEffects,
               skipInitialSessionTouch: skipAgentInitialSessionTouch,
               preserveUserFacingSessionModelState:
@@ -3961,6 +4452,7 @@ export const agentHandlers: GatewayRequestHandlers = {
                 : request.sourceReplyDeliveryMode,
               disableMessageTool: request.disableMessageTool,
               suppressPromptPersistence:
+                Boolean(restartRecoveryDispatchClaim) ||
                 requestedPromptPersistenceSuppression ||
                 shouldSuppressAgentPromptPersistence({
                   inputProvenance,
@@ -4037,6 +4529,38 @@ export const agentHandlers: GatewayRequestHandlers = {
                 if (activeRunAbort.entry) {
                   activeRunAbort.entry.sessionId = sessionId;
                 }
+                const claim = restartRecoveryDispatchClaim;
+                if (!hasMainRunRecoveryLedger(claim) || !resolvedSessionKey) {
+                  return;
+                }
+                let recovery = getMainRunRecovery(claim.ledgerRunId, claim.database);
+                if (!recovery || recovery.sessionId === sessionId) {
+                  return;
+                }
+                if (recovery.state === "terminal") {
+                  releaseSettledRecovery(claim, recovery);
+                  return;
+                }
+                if (recovery.state !== "cancelling") {
+                  const requestedAtMs = Date.now();
+                  const cancellation = {
+                    kind: "reset" as const,
+                    epoch: randomUUID(),
+                    requestedAtMs,
+                  };
+                  recovery =
+                    requestMainRunRecoveryCancellation(
+                      {
+                        ...recoveryCas(recovery),
+                        cancellation,
+                        nowMs: requestedAtMs,
+                      },
+                      claim.database,
+                    ) ?? getMainRunRecovery(claim.ledgerRunId, claim.database);
+                }
+                if (!recovery || !settleRestartRecoveryCancellation(claim, recovery)) {
+                  throw new Error(`main-run recovery ${claim.ledgerRunId} changed during rebound`);
+                }
               },
               // Internal-only: allow workspace override for spawned subagent runs.
               workspaceDir: resolveIngressWorkspaceOverrideForSessionRun({
@@ -4054,6 +4578,7 @@ export const agentHandlers: GatewayRequestHandlers = {
               allowModelOverride: effectiveAllowModelOverride,
             },
             runId,
+            recoveryDispatch: restartRecoveryDispatchClaim,
             dedupeKeys: agentDedupeKeys,
             abortController: activeRunAbort.controller,
             cleanupAbortController: cleanupAdmittedRun,
@@ -4061,12 +4586,14 @@ export const agentHandlers: GatewayRequestHandlers = {
               ? async ({ terminalOutcome, onRecovered }) =>
                   await releaseCronContinuationClaimWithRecovery({ terminalOutcome }, onRecovered)
               : undefined,
+            onDispatchError: persistRestartRecoveryDispatchError,
             respond,
             context,
             taskTrackingMode: dispatchTaskTrackingMode,
           });
           dispatched = true;
         } catch (err) {
+          await persistRestartRecoveryDispatchError(err);
           const error = errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err));
           const payload = {
             runId,

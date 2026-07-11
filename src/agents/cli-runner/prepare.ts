@@ -471,6 +471,7 @@ export async function prepareCliRunContext(
 ): Promise<PreparedCliRunContext> {
   const internalParams = params as RunCliAgentPrepareParams;
   const started = Date.now();
+  const publicRunId = params.publicRunId ?? params.runId;
   const executionMode = params.executionMode ?? "agent";
   const isSideQuestion = executionMode === "side-question";
   const workspaceResolution = resolveRunWorkspaceDir({
@@ -485,7 +486,7 @@ export async function prepareCliRunContext(
   const redactedWorkspace = redactRunIdentifier(resolvedWorkspace);
   if (workspaceResolution.usedFallback) {
     cliBackendLog.warn(
-      `[workspace-fallback] caller=runCliAgent reason=${workspaceResolution.fallbackReason} run=${params.runId} session=${redactedSessionId} sessionKey=${redactedSessionKey} agent=${workspaceResolution.agentId} workspace=${redactedWorkspace}`,
+      `[workspace-fallback] caller=runCliAgent reason=${workspaceResolution.fallbackReason} run=${publicRunId} session=${redactedSessionId} sessionKey=${redactedSessionKey} agent=${workspaceResolution.agentId} workspace=${redactedWorkspace}`,
     );
   }
   const workspaceDir = resolvedWorkspace;
@@ -1192,7 +1193,7 @@ export async function prepareCliRunContext(
           prompt: params.prompt,
           messages: await loadOpenClawHistoryMessages(),
           hookCtx: {
-            runId: params.runId,
+            runId: publicRunId,
             agentId: sessionAgentId,
             sessionKey: params.sessionKey,
             sessionId: params.sessionId,

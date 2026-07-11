@@ -42,6 +42,9 @@ export function buildStrandedReplyRetryFollowupRun(
     transcriptPrompt: undefined,
     userTurnTranscriptRecorder: undefined,
     currentInboundContext: undefined,
+    // The parent turn already crossed its durable execution boundary. This
+    // synthetic delivery-only retry must not claim or restart that execution.
+    executionOwner: undefined,
     // Internally generated system turn: the client turn's lifecycle (gateway cancel
     // identity) completes with the parent run. queuedLifecycle is one-shot WeakSet-tracked,
     // so a shared object would be double-owned and free cancel while the retry still runs.
