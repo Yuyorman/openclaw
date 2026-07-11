@@ -37,7 +37,6 @@ import { renderQrTerminal } from "./qr-terminal.js";
 import { getStatusCode } from "./session-errors.js";
 import {
   createBaileysSignalRepository,
-  Browsers,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   makeWASocket,
@@ -77,8 +76,9 @@ const LOGGED_OUT_STATUS = 401;
 const WHATSAPP_WEBSOCKET_PROXY_TARGET = "https://mmg.whatsapp.net/";
 const CREDS_FLUSH_TIMEOUT_MESSAGE =
   "Queued WhatsApp creds save did not finish before auth bootstrap; skipping repair and continuing with primary creds.";
-const OPENCLAW_WHATSAPP_BROWSER: WABrowserDescription = ["openclaw", "cli", VERSION];
-export const WHATSAPP_PHONE_CODE_BROWSER: WABrowserDescription = Browsers.macOS("Chrome");
+// Baileys requires the exact "Chrome" browser name for phone-code pairing.
+// WhatsApp renders this tuple as "Google Chrome (openclaw)" for linked devices.
+const OPENCLAW_WHATSAPP_BROWSER: WABrowserDescription = ["openclaw", "Chrome", VERSION];
 export const OPENCLAW_WHATSAPP_WEB_SOCKET_URL_ENV = "OPENCLAW_WHATSAPP_WEB_SOCKET_URL";
 
 async function rejectUnsafeWebCredsPath(authDir: string): Promise<void> {
@@ -224,7 +224,6 @@ export async function createWaSocket(
     getMessage?: (key: WAMessageKey) => Promise<proto.IMessage | undefined>;
     cachedGroupMetadata?: (jid: string) => Promise<GroupMetadata | undefined>;
     waWebSocketUrl?: string | URL;
-    browser?: WABrowserDescription;
   } & WhatsAppSocketTimingOptions = {},
 ): Promise<ReturnType<typeof makeWASocket>> {
   const baseLogger = getChildLogger(
@@ -336,7 +335,7 @@ export async function createWaSocket(
     version,
     logger,
     printQRInTerminal: false,
-    browser: opts.browser ?? OPENCLAW_WHATSAPP_BROWSER,
+    browser: OPENCLAW_WHATSAPP_BROWSER,
     syncFullHistory: false,
     markOnlineOnConnect: false,
     ...socketTiming,

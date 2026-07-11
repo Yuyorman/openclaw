@@ -15,7 +15,7 @@ import {
 import { closeWaSocketSoon, waitForWhatsAppLoginResult } from "./connection-controller.js";
 import { resolveComparableIdentity } from "./identity.js";
 import { renderQrTerminal } from "./qr-terminal.js";
-import { createWaSocket, waitForWaConnection, WHATSAPP_PHONE_CODE_BROWSER } from "./session.js";
+import { createWaSocket, waitForWaConnection } from "./session.js";
 import { resolveWhatsAppSocketTiming } from "./socket-timing.js";
 
 const QR_LINK_INSTRUCTION = "Open the WhatsApp app, go to Linked Devices, then scan this QR:";
@@ -334,8 +334,6 @@ export async function loginWebWithPhoneCode(
     authDir: account.authDir,
     ...socketTiming,
     onQr: readySignal.onQr,
-    // Baileys phone-code pairing validates companion metadata more strictly than QR.
-    browser: WHATSAPP_PHONE_CODE_BROWSER,
   });
   try {
     const result = await waitForWhatsAppLoginResult({
@@ -347,7 +345,6 @@ export async function loginWebWithPhoneCode(
       waitForConnection,
       socketTiming,
       onQr: readySignal.onQr,
-      browser: WHATSAPP_PHONE_CODE_BROWSER,
       beforeCreateLoginSocket: async () => {
         readySignal.reset();
         await clearStalePhoneCodePairingAuthForLogin({
