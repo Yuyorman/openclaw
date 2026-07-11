@@ -1282,6 +1282,9 @@ export async function purgeSqliteDeletedAgentSessionEntries(
         continue;
       }
       const entry = store[sessionKey];
+      if (!entry) {
+        continue;
+      }
       entryRemovals.push({ expectedEntry: cloneSessionEntry(entry), sessionKey });
       removedEntriesToArchive.push(entry);
       delete remainingStore[sessionKey];
