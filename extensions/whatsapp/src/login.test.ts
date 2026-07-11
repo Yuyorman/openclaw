@@ -1,7 +1,9 @@
 // Whatsapp tests cover login plugin behavior.
 import { EventEmitter } from "node:events";
+import { createNonExitingRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { resetLogger, setLoggerOverride, success } from "openclaw/plugin-sdk/runtime-env";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createCompletedPhoneCodeCreds } from "./phone-code.test-helpers.js";
 import { renderQrPngBase64 } from "./qr-image.js";
 
 vi.mock("./session.js", async () => {
@@ -122,13 +124,17 @@ describe("web login", () => {
   it("rejects a delayed credential write failure even when old auth is still readable", async () => {
     const persistenceError = new Error("credential write failed");
     const waiter: typeof waitForWaConnection = vi.fn(() => new Promise<void>(() => {}));
+    const beforeCredentialPersistence = vi.fn(async () => {});
     const pendingLogin = loginWeb(false, waiter, undefined, undefined, {
-      beforeCredentialPersistence: async () => {},
+      beforeCredentialPersistence,
     });
     for (let index = 0; index < 5; index += 1) {
       await Promise.resolve();
     }
     expect(vi.mocked(createWaSocket)).toHaveBeenCalled();
+    expect(clearStalePhoneCodePairingAuthIfNeeded).toHaveBeenCalledWith(
+      expect.objectContaining({ beforeCredentialPersistence }),
+    );
     const socketOptions = vi.mocked(createWaSocket).mock.calls.at(-1)?.[2] as
       | { onCredentialPersistenceError?: (error: unknown) => void }
       | undefined;
@@ -177,10 +183,25 @@ describe("web login", () => {
     await expect(pendingLogin).resolves.toBeUndefined();
   });
 
-  it("normalizes phone-code login numbers for Baileys", () => {
-    expect(normalizeWhatsAppPairingPhoneNumber("+1 (555) 123-4567")).toBe("15551234567");
-    expect(() => normalizeWhatsAppPairingPhoneNumber("+44 (0) 20 7946 0958")).toThrow(
-      "must omit optional trunk prefixes",
+  it.each([
+    ["+1 (213) 373-4253", "12133734253"],
+    ["12133734253", "12133734253"],
+    ["+39 06 6982", "39066982"],
+  ])("normalizes phone-code login number %s for Baileys", (input, expected) => {
+    expect(normalizeWhatsAppPairingPhoneNumber(input)).toBe(expected);
+  });
+
+  it.each([
+    "abc123456",
+    "+1 213 c373 4253",
+    "+1 213 373 4253 ext 89",
+    "+44 (0) 20 7946 0958",
+    "+44 0 20 7946 0958",
+    "+1 23",
+    "+1234567890123456",
+  ])("rejects non-canonical phone-code login number %s", (input) => {
+    expect(() => normalizeWhatsAppPairingPhoneNumber(input)).toThrow(
+      "requires an international phone number",
     );
   });
 
@@ -188,18 +209,9 @@ describe("web login", () => {
     const sock = createPhoneCodeSocket("12345678");
     vi.mocked(createWaSocket).mockImplementationOnce(resolveSocketAfterImmediateQr(sock));
     const waiter: typeof waitForWaConnection = vi.fn().mockResolvedValue(undefined);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    const loginPromise = loginWebWithPhoneCode(
-      false,
-      "+1 (555) 123-4567",
-      waiter,
-      runtime as never,
-    );
+    const loginPromise = loginWebWithPhoneCode(false, "+1 (555) 123-4567", waiter, runtime);
     await loginPromise;
 
     expect(sock.requestPairingCode).toHaveBeenCalledWith("15551234567");
@@ -213,14 +225,10 @@ describe("web login", () => {
   it("fails before socket creation when stale phone-code creds could not be cleared", async () => {
     vi.mocked(clearStalePhoneCodePairingAuthIfNeeded).mockResolvedValueOnce("stale-not-cleared");
     const waiter: typeof waitForWaConnection = vi.fn().mockResolvedValue(undefined);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
     await expect(
-      loginWebWithPhoneCode(false, "+1 (555) 123-4567", waiter, runtime as never),
+      loginWebWithPhoneCode(false, "+1 (555) 123-4567", waiter, runtime),
     ).rejects.toThrow("Previous WhatsApp phone-code login left partial credentials");
 
     expect(createWaSocket).not.toHaveBeenCalled();
@@ -230,18 +238,11 @@ describe("web login", () => {
   it("fails before socket creation when stale auth cleanup is unstable", async () => {
     vi.mocked(clearStalePhoneCodePairingAuthIfNeeded).mockResolvedValueOnce("unstable");
     const waiter: typeof waitForWaConnection = vi.fn().mockResolvedValue(undefined);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    const error = await loginWebWithPhoneCode(
-      false,
-      "+1 (555) 123-4567",
-      waiter,
-      runtime as never,
-    ).catch((caught: unknown) => caught);
+    const error = await loginWebWithPhoneCode(false, "+1 (555) 123-4567", waiter, runtime).catch(
+      (caught: unknown) => caught,
+    );
 
     expect(error).toMatchObject({ code: "whatsapp-auth-unstable" });
     expect(createWaSocket).not.toHaveBeenCalled();
@@ -249,22 +250,12 @@ describe("web login", () => {
   });
 
   it("connects completed phone-code creds without waiting for a fresh QR", async () => {
-    const sock = createPhoneCodeSocket("12345678", {
-      registered: false,
-      pairingCode: "12345678",
-      me: { id: "15551234567@s.whatsapp.net" },
-      account: {},
-      signalIdentities: [{ identifier: { name: "15551234567", deviceId: 0 } }],
-    });
+    const sock = createPhoneCodeSocket("12345678", createCompletedPhoneCodeCreds());
     vi.mocked(createWaSocket).mockResolvedValueOnce(sock as never);
     const waiter: typeof waitForWaConnection = vi.fn().mockResolvedValue(undefined);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    await loginWebWithPhoneCode(false, "+1 (555) 123-4567", waiter, runtime as never);
+    await loginWebWithPhoneCode(false, "+1 (555) 123-4567", waiter, runtime);
 
     expect(sock.requestPairingCode).not.toHaveBeenCalled();
     expect(waiter).toHaveBeenCalledWith(sock, { timeout: "none" });
@@ -274,23 +265,13 @@ describe("web login", () => {
   });
 
   it("rejects completed phone-code creds linked to a different requested number", async () => {
-    const sock = createPhoneCodeSocket("12345678", {
-      registered: false,
-      pairingCode: "12345678",
-      me: { id: "15551234567@s.whatsapp.net" },
-      account: {},
-      signalIdentities: [{ identifier: { name: "15551234567", deviceId: 0 } }],
-    });
+    const sock = createPhoneCodeSocket("12345678", createCompletedPhoneCodeCreds());
     vi.mocked(createWaSocket).mockResolvedValueOnce(sock as never);
     const waiter: typeof waitForWaConnection = vi.fn().mockResolvedValue(undefined);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
     await expect(
-      loginWebWithPhoneCode(false, "+1 (666) 123-4567", waiter, runtime as never),
+      loginWebWithPhoneCode(false, "+1 (666) 123-4567", waiter, runtime),
     ).rejects.toThrow("Existing WhatsApp credentials are linked to +15551234567");
 
     expect(sock.requestPairingCode).not.toHaveBeenCalled();
@@ -299,22 +280,15 @@ describe("web login", () => {
   });
 
   it("keeps LID-only completed phone-code creds when the linked phone cannot be proven different", async () => {
-    const sock = createPhoneCodeSocket("12345678", {
-      registered: false,
-      pairingCode: "12345678",
-      me: { lid: "12345@lid" },
-      account: {},
-      signalIdentities: [{ identifier: { name: "15551234567", deviceId: 0 } }],
-    });
+    const sock = createPhoneCodeSocket(
+      "12345678",
+      createCompletedPhoneCodeCreds({ me: { lid: "12345@lid" } }),
+    );
     vi.mocked(createWaSocket).mockResolvedValueOnce(sock as never);
     const waiter: typeof waitForWaConnection = vi.fn().mockResolvedValue(undefined);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    await loginWebWithPhoneCode(false, "+1 (555) 123-4567", waiter, runtime as never);
+    await loginWebWithPhoneCode(false, "+1 (555) 123-4567", waiter, runtime);
 
     expect(sock.requestPairingCode).not.toHaveBeenCalled();
     expect(waiter).toHaveBeenCalledWith(sock, { timeout: "none" });
@@ -333,13 +307,9 @@ describe("web login", () => {
       .fn()
       .mockRejectedValueOnce(timeoutError)
       .mockResolvedValueOnce(undefined);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    const loginPromise = loginWebWithPhoneCode(false, "+15551234567", waiter, runtime as never);
+    const loginPromise = loginWebWithPhoneCode(false, "+15551234567", waiter, runtime);
     await flushAsyncTurns();
     await loginPromise;
 
@@ -368,18 +338,11 @@ describe("web login", () => {
       output: { statusCode: 408 },
     });
     const waiter: typeof waitForWaConnection = vi.fn().mockRejectedValueOnce(timeoutError);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    const error = await loginWebWithPhoneCode(
-      false,
-      "+15551234567",
-      waiter,
-      runtime as never,
-    ).catch((caught: unknown) => caught);
+    const error = await loginWebWithPhoneCode(false, "+15551234567", waiter, runtime).catch(
+      (caught: unknown) => caught,
+    );
 
     expect(error).toMatchObject({ code: "whatsapp-auth-unstable" });
     expect(createWaSocket).toHaveBeenCalledOnce();
@@ -400,13 +363,9 @@ describe("web login", () => {
       .fn()
       .mockRejectedValueOnce(restartError)
       .mockResolvedValueOnce(undefined);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    await loginWebWithPhoneCode(false, "+15551234567", waiter, runtime as never);
+    await loginWebWithPhoneCode(false, "+15551234567", waiter, runtime);
 
     expect(firstSock.requestPairingCode).toHaveBeenCalledWith("15551234567");
     expect(secondSock.requestPairingCode).not.toHaveBeenCalled();

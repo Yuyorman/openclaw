@@ -2,6 +2,7 @@
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createNonExitingRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   getWebAuthAgeMs,
@@ -24,6 +25,10 @@ import {
   waitForCredsSaveQueue,
   type CredsQueueWaitResult,
 } from "./creds-persistence.js";
+import {
+  createCompletedPhoneCodeCreds,
+  createPartialPhoneCodeCreds,
+} from "./phone-code.test-helpers.js";
 
 const hoisted = vi.hoisted(() => ({
   waitForCredsSaveQueueWithTimeout: vi.fn<() => Promise<CredsQueueWaitResult>>(
@@ -208,31 +213,40 @@ describe("auth-store", () => {
     });
   });
 
-  it("does not treat partial phone-code pairing creds as linked", async () => {
-    await withOwnedOAuthAuthDir("openclaw-wa-auth-phone-code-partial", async (authDir) => {
+  it.each([
+    ["requestPairingCode", false],
+    ["companion_finish", true],
+  ] as const)("does not treat %s credentials as linked", async (stage, registered) => {
+    await withOwnedOAuthAuthDir(`openclaw-wa-auth-phone-code-${stage}`, async (authDir) => {
       fsSync.writeFileSync(
         path.join(authDir, "creds.json"),
-        JSON.stringify({
-          registered: false,
-          pairingCode: "12345678",
-          me: { id: "15551234567@s.whatsapp.net" },
-        }),
+        JSON.stringify(createPartialPhoneCodeCreds({ registered })),
         "utf-8",
       );
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-      };
+      const runtime = createNonExitingRuntimeEnv();
 
       expect(hasWebCredsSync(authDir)).toBe(true);
       await expect(webAuthExists(authDir)).resolves.toBe(false);
       await expect(readWebAuthState(authDir)).resolves.toBe("not-linked");
+      const guardError = new Error("setup authority changed");
+      const beforeCredentialPersistence = vi.fn(async () => {
+        throw guardError;
+      });
       await expect(
         clearStalePhoneCodePairingAuthIfNeeded({
           authDir,
           isLegacyAuthDir: false,
-          runtime: runtime as never,
+          runtime,
+          beforeCredentialPersistence,
+        }),
+      ).rejects.toBe(guardError);
+      expect(beforeCredentialPersistence).toHaveBeenCalledOnce();
+      expect(fsSync.existsSync(authDir)).toBe(true);
+      await expect(
+        clearStalePhoneCodePairingAuthIfNeeded({
+          authDir,
+          isLegacyAuthDir: false,
+          runtime,
         }),
       ).resolves.toBe("cleared");
       expect(fsSync.existsSync(authDir)).toBe(false);
@@ -244,11 +258,7 @@ describe("auth-store", () => {
     const credsPath = path.join(authDir, "creds.json");
     fsSync.writeFileSync(
       credsPath,
-      JSON.stringify({
-        registered: false,
-        pairingCode: "12345678",
-        me: { id: "15551234567@s.whatsapp.net" },
-      }),
+      JSON.stringify(createPartialPhoneCodeCreds({ registered: true })),
       "utf-8",
     );
 
@@ -265,13 +275,7 @@ describe("auth-store", () => {
     const authDir = createTempAuthDir("openclaw-wa-auth-phone-code-linked");
     fsSync.writeFileSync(
       path.join(authDir, "creds.json"),
-      JSON.stringify({
-        registered: false,
-        pairingCode: "12345678",
-        me: { id: "15551234567@s.whatsapp.net" },
-        account: {},
-        signalIdentities: [{ identifier: { name: "15551234567", deviceId: 0 } }],
-      }),
+      JSON.stringify(createCompletedPhoneCodeCreds({ registered: true })),
       "utf-8",
     );
 
@@ -282,25 +286,11 @@ describe("auth-store", () => {
   it("preserves completed phone-code creds saved before stale cleanup reads", async () => {
     await withOwnedOAuthAuthDir("openclaw-wa-auth-phone-code-save-race", async (authDir) => {
       const credsPath = path.join(authDir, "creds.json");
-      fsSync.writeFileSync(
-        credsPath,
-        JSON.stringify({
-          registered: false,
-          pairingCode: "12345678",
-          me: { id: "15551234567@s.whatsapp.net" },
-        }),
-        "utf-8",
-      );
+      fsSync.writeFileSync(credsPath, JSON.stringify(createPartialPhoneCodeCreds()), "utf-8");
       hoisted.waitForCredsSaveQueueWithTimeout.mockImplementationOnce(async () => {
         fsSync.writeFileSync(
           credsPath,
-          JSON.stringify({
-            registered: false,
-            pairingCode: "12345678",
-            me: { id: "15551234567@s.whatsapp.net" },
-            account: {},
-            signalIdentities: [{ identifier: { name: "15551234567", deviceId: 0 } }],
-          }),
+          JSON.stringify(createCompletedPhoneCodeCreds({ registered: true })),
           "utf-8",
         );
         return "drained";
@@ -320,22 +310,8 @@ describe("auth-store", () => {
   it("preserves completed phone-code creds queued while stale cleanup deletes", async () => {
     await withOwnedOAuthAuthDir("openclaw-wa-auth-phone-code-delete-race", async (authDir) => {
       const credsPath = path.join(authDir, "creds.json");
-      fsSync.writeFileSync(
-        credsPath,
-        JSON.stringify({
-          registered: false,
-          pairingCode: "12345678",
-          me: { id: "15551234567@s.whatsapp.net" },
-        }),
-        "utf-8",
-      );
-      const completedCreds = JSON.stringify({
-        registered: false,
-        pairingCode: "12345678",
-        me: { id: "15551234567@s.whatsapp.net" },
-        account: {},
-        signalIdentities: [{ identifier: { name: "15551234567", deviceId: 0 } }],
-      });
+      fsSync.writeFileSync(credsPath, JSON.stringify(createPartialPhoneCodeCreds()), "utf-8");
+      const completedCreds = JSON.stringify(createCompletedPhoneCodeCreds({ registered: true }));
       const { rm: originalRm } =
         await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
       const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
@@ -373,15 +349,7 @@ describe("auth-store", () => {
   it("reports unstable cleanup when the credential save queue does not settle", async () => {
     await withOwnedOAuthAuthDir("openclaw-wa-auth-phone-code-unstable", async (authDir) => {
       const credsPath = path.join(authDir, "creds.json");
-      fsSync.writeFileSync(
-        credsPath,
-        JSON.stringify({
-          registered: false,
-          pairingCode: "12345678",
-          me: { id: "15551234567@s.whatsapp.net" },
-        }),
-        "utf-8",
-      );
+      fsSync.writeFileSync(credsPath, JSON.stringify(createPartialPhoneCodeCreds()), "utf-8");
       hoisted.waitForCredsSaveQueueWithTimeout.mockResolvedValueOnce("timed_out");
 
       await expect(
@@ -480,13 +448,9 @@ describe("auth-store", () => {
         "utf-8",
       );
 
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-      };
+      const runtime = createNonExitingRuntimeEnv();
 
-      await expect(logoutWeb({ authDir, runtime: runtime as never })).resolves.toBe(true);
+      await expect(logoutWeb({ authDir, runtime })).resolves.toBe(true);
       expect(fsSync.existsSync(authDir)).toBe(false);
     });
   });
@@ -523,16 +487,12 @@ describe("auth-store", () => {
       }
       return await originalRm.call(fs, target, options as never);
     });
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
     try {
-      await expect(
-        logoutWeb({ authDir, isLegacyAuthDir: true, runtime: runtime as never }),
-      ).rejects.toThrow("EACCES");
+      await expect(logoutWeb({ authDir, isLegacyAuthDir: true, runtime })).rejects.toThrow(
+        "EACCES",
+      );
       expect(fsSync.existsSync(authDir)).toBe(true);
       expect(fsSync.existsSync(path.join(authDir, "oauth.json"))).toBe(true);
     } finally {
@@ -548,13 +508,9 @@ describe("auth-store", () => {
       const readdirSpy = vi
         .spyOn(fs, "readdir")
         .mockRejectedValueOnce(Object.assign(new Error("EACCES"), { code: "EACCES" }));
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-      };
+      const runtime = createNonExitingRuntimeEnv();
 
-      await expect(logoutWeb({ authDir, runtime: runtime as never })).resolves.toBe(true);
+      await expect(logoutWeb({ authDir, runtime })).resolves.toBe(true);
       expect(fsSync.existsSync(authDir)).toBe(false);
       readdirSpy.mockRestore();
     });
@@ -567,13 +523,9 @@ describe("auth-store", () => {
     fsSync.writeFileSync(path.join(authDir, "creds.json"), "{}", "utf-8");
     fsSync.writeFileSync(path.join(authDir, "notes.txt"), "keep me", "utf-8");
     fsSync.writeFileSync(path.join(nestedDir, "session-abc.json"), "keep me", "utf-8");
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    await expect(logoutWeb({ authDir, runtime: runtime as never })).resolves.toBe(false);
+    await expect(logoutWeb({ authDir, runtime })).resolves.toBe(false);
     expect(fsSync.existsSync(authDir)).toBe(true);
     expect(fsSync.existsSync(path.join(authDir, "creds.json"))).toBe(true);
     expect(fsSync.existsSync(path.join(authDir, "notes.txt"))).toBe(true);
@@ -591,13 +543,9 @@ describe("auth-store", () => {
       fsSync.writeFileSync(path.join(externalDir, "notes.txt"), "keep me", "utf-8");
       fsSync.symlinkSync(externalDir, authDir, "dir");
       hoisted.oauthDir = oauthDir;
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-      };
+      const runtime = createNonExitingRuntimeEnv();
 
-      await expect(logoutWeb({ authDir, runtime: runtime as never })).resolves.toBe(false);
+      await expect(logoutWeb({ authDir, runtime })).resolves.toBe(false);
       expect(fsSync.existsSync(authDir)).toBe(true);
       expect(fsSync.existsSync(path.join(externalDir, "creds.json"))).toBe(true);
       expect(fsSync.existsSync(path.join(externalDir, "notes.txt"))).toBe(true);
@@ -622,13 +570,9 @@ describe("auth-store", () => {
       fsSync.writeFileSync(path.join(externalAuthDir, "notes.txt"), "keep me", "utf-8");
       fsSync.symlinkSync(externalRoot, linkedParent, "dir");
       hoisted.oauthDir = oauthDir;
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-      };
+      const runtime = createNonExitingRuntimeEnv();
 
-      await expect(logoutWeb({ authDir, runtime: runtime as never })).resolves.toBe(false);
+      await expect(logoutWeb({ authDir, runtime })).resolves.toBe(false);
       expect(fsSync.existsSync(authDir)).toBe(true);
       expect(fsSync.existsSync(path.join(externalAuthDir, "creds.json"))).toBe(true);
       expect(fsSync.existsSync(path.join(externalAuthDir, "notes.txt"))).toBe(true);
@@ -642,13 +586,9 @@ describe("auth-store", () => {
   it("does not delete unrelated non-empty directories on logout", async () => {
     const authDir = createTempAuthDir("openclaw-wa-auth-unrelated");
     fsSync.writeFileSync(path.join(authDir, "notes.txt"), "keep me", "utf-8");
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createNonExitingRuntimeEnv();
 
-    await expect(logoutWeb({ authDir, runtime: runtime as never })).resolves.toBe(false);
+    await expect(logoutWeb({ authDir, runtime })).resolves.toBe(false);
     expect(fsSync.existsSync(authDir)).toBe(true);
     expect(fsSync.existsSync(path.join(authDir, "notes.txt"))).toBe(true);
   });
