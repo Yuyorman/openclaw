@@ -19,7 +19,6 @@ import type { RuntimeEnv } from "../../runtime.js";
 import type { ResolverContext, SecretDefaults } from "../../secrets/runtime-shared.js";
 import type { SecretTargetRegistryEntry } from "../../secrets/target-registry-types.js";
 import type { ChannelApprovalNativeAdapter } from "./approval-native.types.js";
-import type { ChannelLoginMethod } from "./channel-login-method.types.js";
 import type { ChannelRuntimeSurface } from "./channel-runtime-surface.types.js";
 import type { ConfigWriteTarget } from "./config-writes.js";
 export type {
@@ -360,14 +359,12 @@ export type ChannelGatewayAdapter<ResolvedAccount = unknown> = {
 };
 
 export type ChannelAuthAdapter = {
-  supportedLoginMethodKinds?: readonly ChannelLoginMethod["kind"][];
   login?: (params: {
     cfg: OpenClawConfig;
     accountId?: string | null;
     runtime: RuntimeEnv;
     verbose?: boolean;
     channelInput?: string | null;
-    loginMethod?: ChannelLoginMethod;
   }) => Promise<void>;
 };
 

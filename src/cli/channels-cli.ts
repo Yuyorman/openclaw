@@ -258,7 +258,6 @@ export async function registerChannelsCli(
     .description("Link a channel account (if supported)")
     .option("--channel <channel>", "Channel alias (auto when only one is configured)")
     .option("--account <id>", "Account id (accountId)")
-    .option("--phone-number <number>", "Use a phone-number pairing code when supported")
     .option("--verbose", "Verbose connection logs", false)
     .action(async (opts) => {
       await runChannelsCommandWithDanger(async () => {
@@ -266,7 +265,6 @@ export async function registerChannelsCli(
           {
             channel: opts.channel as string | undefined,
             account: opts.account as string | undefined,
-            phoneNumber: opts.phoneNumber as string | undefined,
             verbose: Boolean(opts.verbose),
           },
           defaultRuntime,
