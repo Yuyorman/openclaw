@@ -205,7 +205,7 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
     ),
     publicDeprecatedExports: readPluginSdkSurfaceBudgetEnv(
       "OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_DEPRECATED_EXPORTS",
-      3274,
+      3265,
       env,
     ),
     publicWildcardReexports: readPluginSdkSurfaceBudgetEnv(
