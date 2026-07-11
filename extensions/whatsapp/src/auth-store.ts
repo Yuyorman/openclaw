@@ -33,7 +33,8 @@ export type WhatsAppWebAuthState = "linked" | "not-linked" | "unstable";
 export type WhatsAppStalePhoneCodePairingAuthCleanupResult =
   | "not-needed"
   | "cleared"
-  | "stale-not-cleared";
+  | "stale-not-cleared"
+  | "unstable";
 
 export class WhatsAppAuthUnstableError extends Error {
   readonly code = WHATSAPP_AUTH_UNSTABLE_CODE;
@@ -331,7 +332,7 @@ export async function clearStalePhoneCodePairingAuthIfNeeded(params: {
     "clearStalePhoneCodePairingAuthIfNeeded",
   );
   if (barrierResult === "timed_out") {
-    return "not-needed";
+    return "unstable";
   }
   const raw = await readWebCredsJsonRaw(resolveWebCredsPath(resolvedAuthDir));
   if (!raw || !isPartialPhoneCodePairingCredsRaw(raw)) {

@@ -10,6 +10,7 @@ import {
   clearStalePhoneCodePairingAuthIfNeeded,
   isLinkedWebCredsPayload,
   restoreCredsFromBackupIfNeeded,
+  WhatsAppAuthUnstableError,
   type WhatsAppWebCredsPayload,
 } from "./auth-store.js";
 import { closeWaSocketSoon, waitForWhatsAppLoginResult } from "./connection-controller.js";
@@ -154,6 +155,9 @@ async function clearStalePhoneCodePairingAuthForLogin(params: {
   runtime: RuntimeEnv;
 }): Promise<void> {
   const result = await clearStalePhoneCodePairingAuthIfNeeded(params);
+  if (result === "unstable") {
+    throw new WhatsAppAuthUnstableError();
+  }
   if (result === "stale-not-cleared") {
     throw new Error(STALE_PHONE_CODE_AUTH_NOT_CLEARED_MESSAGE);
   }
@@ -410,13 +414,18 @@ export async function loginWebWithPhoneCode(
     }
 
     runtime.error(danger(`WhatsApp Web connection ended before fully opening. ${result.message}`));
+    if (result.error instanceof WhatsAppAuthUnstableError) {
+      throw result.error;
+    }
     throw new Error(result.message, { cause: result.error });
   } catch (error) {
-    await clearStalePhoneCodePairingAuthIfNeeded({
-      authDir: account.authDir,
-      isLegacyAuthDir: account.isLegacyAuthDir,
-      runtime,
-    });
+    if (!(error instanceof WhatsAppAuthUnstableError)) {
+      await clearStalePhoneCodePairingAuthIfNeeded({
+        authDir: account.authDir,
+        isLegacyAuthDir: account.isLegacyAuthDir,
+        runtime,
+      });
+    }
     throw error;
   } finally {
     closeWaSocketSoon(sock);

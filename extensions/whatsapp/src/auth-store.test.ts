@@ -313,6 +313,30 @@ describe("auth-store", () => {
     });
   });
 
+  it("reports unstable cleanup when the credential save queue does not settle", async () => {
+    await withOwnedOAuthAuthDir("openclaw-wa-auth-phone-code-unstable", async (authDir) => {
+      const credsPath = path.join(authDir, "creds.json");
+      fsSync.writeFileSync(
+        credsPath,
+        JSON.stringify({
+          registered: false,
+          pairingCode: "12345678",
+          me: { id: "15551234567@s.whatsapp.net" },
+        }),
+        "utf-8",
+      );
+      hoisted.waitForCredsSaveQueueWithTimeout.mockResolvedValueOnce("timed_out");
+
+      await expect(
+        clearStalePhoneCodePairingAuthIfNeeded({
+          authDir,
+          isLegacyAuthDir: false,
+        }),
+      ).resolves.toBe("unstable");
+      expect(fsSync.existsSync(credsPath)).toBe(true);
+    });
+  });
+
   it.runIf(process.platform !== "win32")(
     "treats symlinked creds as missing across auth readers",
     async () => {
