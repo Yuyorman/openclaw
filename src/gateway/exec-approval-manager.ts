@@ -11,7 +11,10 @@ import type {
 } from "../infra/exec-approvals.js";
 import { resolveTimerTimeoutMs } from "../shared/number-coercion.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
-import { resolveApprovalSessionAudience } from "./approval-session-audience.js";
+import {
+  resolveApprovalFallbackAudienceSessionKey,
+  resolveApprovalSessionAudience,
+} from "./approval-session-audience.js";
 import {
   consumeOperatorApprovalAllowOnce,
   forceDenyOperatorApproval,
@@ -92,11 +95,20 @@ export type ExecApprovalManagerOptions<TPayload> = {
   approvalKind?: OperatorApprovalKind;
   persistence?: OperatorApprovalPersistenceRuntime;
   resolveAllowedDecisions?: (request: TPayload) => readonly ExecApprovalDecision[];
-  resolveAudienceSessionKeys?: (sourceSessionKey: string) => string[];
+  resolveAudienceSessionKeys?: (
+    sourceSessionKey: string,
+    sourceAgentId?: string | null,
+  ) => string[];
   onError?: (
     error: Error,
     context: { approvalId: string; approvalKind: OperatorApprovalKind; operation: "expire" },
   ) => void;
+  onLifecycle?: (event: OperatorApprovalLifecycleEvent) => void;
+};
+
+export type OperatorApprovalLifecycleEvent = {
+  phase: "pending" | "terminal";
+  record: OperatorApprovalRecord;
 };
 
 type WithLiveRecord<TResult, TPayload> = TResult extends { record: OperatorApprovalRecord }
@@ -255,6 +267,7 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       throw new Error(`approval id '${record.id}' already resolved`);
     }
 
+    let insertedRecord: OperatorApprovalRecord | null = null;
     if (persistence) {
       const source = resolveApprovalSource(record.request);
       let audienceSessionKeys: string[] = [];
@@ -262,11 +275,13 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
         try {
           audienceSessionKeys = (
             this.options.resolveAudienceSessionKeys ?? resolveApprovalSessionAudience
-          )(source.sessionKey);
+          )(source.sessionKey, source.agentId);
         } catch {
           // Lineage is routing metadata, not an approval safety prerequisite.
           // Preserve at least the source audience when session stores are unavailable.
-          audienceSessionKeys = [source.sessionKey];
+          audienceSessionKeys = [
+            resolveApprovalFallbackAudienceSessionKey(source.sessionKey, source.agentId),
+          ];
         }
       }
       const inserted = insertOperatorApproval({
@@ -291,6 +306,9 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       if (inserted.outcome === "conflict") {
         throw new Error(`approval id '${record.id}' conflicts with persisted state`);
       }
+      if (inserted.outcome === "inserted") {
+        insertedRecord = inserted.record;
+      }
     }
 
     let resolvePromise: (decision: ExecApprovalDecision | null) => void;
@@ -313,7 +331,19 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
     };
     this.pending.set(record.id, entry);
     this.scheduleExpiryTimer(entry);
+    if (insertedRecord) {
+      this.emitLifecycle({ phase: "pending", record: insertedRecord });
+    }
     return promise;
+  }
+
+  private emitLifecycle(event: OperatorApprovalLifecycleEvent): void {
+    try {
+      this.options.onLifecycle?.(event);
+    } catch {
+      // Stream fanout is observational. It must never change approval truth or
+      // prevent the durable first-answer transition from releasing its waiter.
+    }
   }
 
   private projectLocalRecord(record: ExecApprovalRecord<TPayload>): OperatorApprovalRecord | null {
@@ -535,7 +565,7 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
     localDecision?: ExecApprovalDecision | null,
     localResolvedBy: string | null = null,
     localResolutionSource: ExecApprovalResolutionSource = "operator",
-  ): void {
+  ): boolean {
     const persistence = this.options.persistence;
     if (
       record.kind !== this.approvalKind ||
@@ -543,7 +573,7 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       record.status === "pending" ||
       record.resolvedAtMs === null
     ) {
-      return;
+      return false;
     }
     const decision =
       localDecision === undefined
@@ -551,7 +581,7 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
           ? record.decision
           : null
         : localDecision;
-    this.settleLocalEntry({
+    const settled = this.settleLocalEntry({
       recordId: record.id,
       decision,
       resolvedAtMs: record.resolvedAtMs,
@@ -563,6 +593,15 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       consumedBy: record.consumedBy,
       resolutionSource: localResolutionSource,
     });
+    if (settled) {
+      this.emitLifecycle({ phase: "terminal", record });
+    }
+    return settled;
+  }
+
+  /** Settle one durable terminal transition and report whether this manager published it. */
+  reconcileDurableTerminal(record: OperatorApprovalRecord): boolean {
+    return this.settleLocalFromStore(record);
   }
 
   /** Reconciles durable truth with an existing waiter without rehydrating its request. */
@@ -628,6 +667,9 @@ export class ExecApprovalManager<TPayload = ExecApprovalRequestPayload> {
       runtimeEpoch: persistence.runtimeEpoch,
       databaseOptions: persistence.databaseOptions,
     });
+    if (result.outcome === "denied" || result.outcome === "expired") {
+      this.emitLifecycle({ phase: "terminal", record: result.record });
+    }
     return attachLiveRecord(result, localEntry.record) as ExecApprovalForceDenyResult<TPayload>;
   }
 
