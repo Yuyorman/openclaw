@@ -172,6 +172,16 @@ export const ru: TranslationMap = {
       node: "Узел",
     },
   },
+  instances: {
+    title: "Подключенные экземпляры",
+    subtitle: "Сигналы присутствия от шлюза и клиентов.",
+    showHosts: "Показать хосты и IP-адреса",
+    hideHosts: "Скрыть хосты и IP-адреса",
+    toggleHostVisibility: "Переключить видимость хостов",
+    noInstances: "Экземпляры пока не передавались.",
+    lastInput: "Последний ввод {time}",
+    reason: "Причина {reason}",
+  },
   worktrees: {
     newWorktree: "Новое рабочее дерево",
     owner: "Владелец",
@@ -383,7 +393,6 @@ export const ru: TranslationMap = {
       skills: "Навыки",
       channels: "Каналы",
       cronJobs: "Cron Jobs",
-      memory: "Память",
     },
     context: {
       title: "Контекст агента",
@@ -617,6 +626,7 @@ export const ru: TranslationMap = {
     workboard: "Рабочая доска",
     worktrees: "Рабочие деревья",
     channels: "Каналы",
+    instances: "Экземпляры",
     sessions: "Сеансы",
     usage: "Использование",
     cron: "Задания Cron",
@@ -638,6 +648,7 @@ export const ru: TranslationMap = {
     modelProviders: "Model Providers",
     debug: "Отладка",
     logs: "Журналы",
+    dreams: "Сновидения",
     plugin: "Плагин",
   },
   subtitles: {
@@ -647,6 +658,7 @@ export const ru: TranslationMap = {
     workboard: "Очередь задач агента и передача сеанса.",
     worktrees: "Изолированные копии для задач агентов и снимки восстановления.",
     channels: "Каналы и настройки.",
+    instances: "Подключенные клиенты и узлы.",
     sessions: "Активные сеансы и значения по умолчанию.",
     usage: "Использование API и расходы.",
     cron: "Пробуждения и повторяющиеся запуски.",
@@ -669,10 +681,8 @@ export const ru: TranslationMap = {
     modelProviders: "Configured providers with plan, quota, and cost.",
     debug: "Снимки, события, RPC.",
     logs: "Живые журналы шлюза.",
+    dreams: "Сновидения памяти, консолидация и рефлексия.",
     plugin: "Панель, предоставленная плагином.",
-  },
-  mcpPage: {
-    manageServersLink: "Управляйте серверами на странице плагинов.",
   },
   pluginsPage: {
     searchLabel: "Поиск плагинов",
@@ -1591,6 +1601,10 @@ export const ru: TranslationMap = {
     },
   },
   dreaming: {
+    agentSelect: {
+      label: "Агент",
+      ariaLabel: "Агент Dreaming",
+    },
     tabs: {
       scene: "Сцена",
       diary: "Дневник",
@@ -2192,9 +2206,9 @@ export const ru: TranslationMap = {
       workSessions: "Работа",
     },
     welcome: {
+      ready: "Готово к чату",
       hintBeforeShortcut: "Введите сообщение ниже ·",
       hintAfterShortcut: "для команд",
-      recentSessions: "Недавние чаты",
       suggestions: {
         whatCanYouDo: "Что вы умеете?",
         summarizeRecentSessions: "Суммируйте мои недавние сеансы",
@@ -2361,8 +2375,6 @@ export const ru: TranslationMap = {
       finished: "Завершены ({count})",
       stopTask: "Остановить {title}",
       viewTranscript: "Просмотреть расшифровку",
-      toolUseOne: "1 вызов инструмента",
-      toolUseMany: "{count} вызовов инструмента",
     },
     sessionDiff: {
       title: "Изменения",
@@ -2445,123 +2457,76 @@ export const ru: TranslationMap = {
     ru: "Русский (русский)",
   },
   cron: {
-    quickCreate: {
-      schedules: {
-        everyMorning: {
-          label: "Каждое утро",
-          description: "Ежедневно в 8:00",
-        },
-        everyEvening: {
-          label: "Каждый вечер",
-          description: "Ежедневно в 18:00",
-        },
-        hourly: {
-          label: "Ежечасно",
-          description: "Каждый час",
-        },
-        weekdays: {
-          label: "По будням",
-          description: "Пн–Пт в 9:00",
-        },
-        weekly: {
-          label: "Еженедельно",
-          description: "Каждый понедельник в 9:00",
-        },
-        once: {
-          label: "Запустить один раз",
-          description: "Однократно, удалить после запуска",
-        },
-      },
-      delivery: {
-        notify: {
-          label: "Уведомлять меня",
-          description: "Отправлять результаты в чат",
-        },
-        silent: {
-          label: "Без уведомлений",
-          description: "Запускать без уведомления",
-        },
-        isolated: {
-          label: "Независимый сеанс",
-          description: "Запускать в отдельном сеансе",
-        },
-      },
-      steps: {
-        what: "Что",
-        when: "Когда",
-        how: "Как",
-      },
-      defaultName: "Автоматизация",
-      whatHeading: "Что должно быть сделано?",
-      whatHint: "Опишите задачу естественным языком. Агент будет выполнять этот запрос каждый раз.",
-      promptPlaceholder: "например, проверить мою почту на срочные письма и кратко их изложить...",
-      nameOptional: "Название (необязательно)",
-      namePlaceholder: "например, утренняя проверка почты",
-      whenHeading: "Когда запускать?",
-      whenHint: "Выберите расписание. Вы сможете настроить его позже.",
-      howHeading: "Как это должно работать?",
-      howHint: "Выберите способ доставки результатов.",
-      title: "Новая задача Cron",
-      createAndRun: "Создать и запустить сейчас",
+    tabs: {
+      all: "Все",
+      active: "Активно",
+      paused: "Paused",
+    },
+    list: {
+      searchPlaceholder: "Search scheduled tasks",
+      newTask: "New task",
+      filters: "Фильтры",
+      shownOf: "{shown} of {total}",
+      emptyTitle: "No scheduled tasks yet",
+      emptyHint: "Describe what OpenClaw should do and when — it runs on schedule.",
+      noMatching: "No tasks match the current filters.",
+      loadMore: "Загрузить ещё",
+      loading: "Загрузка...",
+      schedulerOff: "Scheduler disabled",
+      refresh: "Обновить",
+      refreshing: "Обновление...",
+      paused: "Paused",
     },
     suggestions: {
-      title: "Идеи для автоматизации",
-      hint: "Готовые автоматизации — выберите одну и настройте перед созданием.",
-      use: "Использовать идею →",
-      ideas: {
-        repoPulse: {
-          name: "Пульс репозитория",
-          tagline: "Ночные задачи, PR и сбои CI, отсортированные по срочности.",
-          prompt:
-            "Проверь ночную активность в моих репозиториях: новые задачи, pull request'ы и сбои CI. Кратко изложи три вещи, которые сегодня требуют моего внимания больше всего, каждую со ссылкой и однострочным обоснованием.",
-        },
-        standupGhostwriter: {
-          name: "Призрак стендапа",
-          tagline: "Обновление для стендапа, составленное из вчерашней работы.",
-          prompt:
-            "Составь мой стендап-отчёт на основе вчерашних коммитов, смёрженных pull request'ов и открытых веток с ревью. Не более трёх пунктов: сделано, делаю, заблокировано.",
-        },
-        hackerNewsScout: {
-          name: "Разведчик Hacker News",
-          tagline: "Три ссылки к утреннему кофе с горячими комментариями.",
-          prompt:
-            "Просмотри главную страницу Hacker News сегодня в поисках постов об AI-агентах, инструментах разработчика и TypeScript. Пришли мне три самые интересные ссылки, каждую с однострочным горячим комментарием.",
-        },
-        dependencyRadar: {
-          name: "Радар зависимостей",
-          tagline: "Устаревшие или уязвимые зависимости с заметками об обновлении.",
-          prompt:
-            "Проверь мой основной проект на наличие устаревших или уязвимых зависимостей. Перечисли важные обновления с однострочной заметкой о риске для каждого и составь команду для обновления.",
-        },
-        watchdog: {
-          name: "Ночной дозор",
-          tagline: "Ежечасная проверка состояния с кратким итогом.",
-          prompt:
-            "Проверь работоспособность моих сервисов и Gateway: просмотри последние логи на наличие новых ошибок, перезапусков или необычной нагрузки. Если всё в порядке, ответь одной короткой строкой; если что-то сломано — сообщи, что именно и с чего начать разбираться.",
-        },
-        polyglotMinute: {
-          name: "Минута полиглота",
-          tagline: "Одна полезная иностранная фраза под утренний кофе.",
-          prompt:
-            "Научи меня одной полезной фразе на японском: сама фраза, произношение, буквальный перевод и когда её использовать. Уложись в пять строк.",
-        },
+      title: "Suggestions",
+      morningBrief: {
+        title: "Утренний обзор",
+        schedule: "Weekdays at 8:00 AM",
+        description: "Start each weekday with a summary of overnight activity and priorities.",
+        prompt:
+          "Give me a morning brief: summarize overnight activity, unread messages, and the top priorities for today.",
+      },
+      weeklyReview: {
+        title: "Weekly review",
+        schedule: "Fridays at 4:00 PM",
+        description: "Turn the week's sessions into a concise status update every Friday.",
+        prompt:
+          "Write a weekly review: summarize what was worked on this week, what shipped, and open follow-ups.",
+      },
+      followUps: {
+        title: "Follow-up monitor",
+        schedule: "Weekdays at 9:00 AM",
+        description: "Review recent conversations and flag anything waiting on a reply.",
+        prompt:
+          "Review recent conversations and flag anything that is waiting on a reply or needs my attention.",
       },
     },
-    summary: {
-      enabled: "Включено",
+    stats: {
       scheduler: "Планировщик",
-      jobs: "Задачи",
+      tasks: "Tasks",
       nextWake: "Следующее пробуждение",
-      refreshing: "Обновление...",
-      refresh: "Обновить",
+    },
+    detail: {
+      newTitle: "New scheduled task",
+      newSubtitle: "Describe what OpenClaw should do, then pick when it runs.",
+      overviewTitle: "Recent activity",
+      overviewSubtitle: "Latest runs across all scheduled tasks.",
+      historyTitle: "История запусков",
+      detailsSection: "Details",
+      frequencySection: "Frequency",
+      paused: "Paused",
+    },
+    actions: {
+      runNow: "Run now",
+      runIfDue: "Run if due",
+      pause: "Pause",
+      resume: "Resume",
+      clone: "Клонировать",
+      remove: "Удалить",
+      more: "More actions",
+      history: "История",
     },
     jobs: {
-      title: "Задачи",
-      subtitle: "Все запланированные задачи, хранящиеся в шлюзе.",
-      shownOf: "Показано {shown} из {total}",
-      searchJobs: "Искать задачи",
-      searchPlaceholder: "Название, описание или агент",
-      enabled: "Включено",
       schedule: "Расписание",
       lastRun: "Последний запуск",
       all: "Все",
@@ -2573,21 +2538,8 @@ export const ru: TranslationMap = {
       ascending: "По возрастанию",
       descending: "По убыванию",
       reset: "Сбросить",
-      emptyTitle: "Запланированных заданий пока нет.",
-      emptyHint:
-        "Создайте задание с помощью запроса на обычном языке; расширенные поля можно заполнить позже.",
-      emptyFilteredHint: "Очистите или измените фильтры, чтобы увидеть запланированные задания.",
-      noMatching: "Подходящих заданий нет.",
-      loading: "Загрузка...",
-      loadMore: "Загрузить больше заданий",
     },
     runs: {
-      title: "История запусков",
-      subtitleAll: "Последние запуски по всем заданиям.",
-      subtitleJob: "Последние запуски для {title}.",
-      scope: "Область",
-      allJobs: "Все задания",
-      selectedJob: "Выбранное задание",
       searchRuns: "Поиск запусков",
       searchPlaceholder: "Сводка, ошибка или задание",
       newestFirst: "Сначала новые",
@@ -2597,7 +2549,6 @@ export const ru: TranslationMap = {
       clear: "Очистить",
       allStatuses: "Все статусы",
       allDelivery: "Все доставки",
-      selectJobHint: "Выберите задание, чтобы просмотреть историю запусков.",
       noMatching: "Нет подходящих запусков.",
       loadMore: "Загрузить ещё запуски",
       runStatusOk: "ОК",
@@ -2610,15 +2561,8 @@ export const ru: TranslationMap = {
       deliveryNotRequested: "Не запрошено",
     },
     form: {
-      editJob: "Редактировать задание",
-      newJob: "Новое задание",
-      advancedJob: "Расширенное задание",
-      updateSubtitle: "Обновите выбранное запланированное задание.",
-      createSubtitle: "Создайте запланированное пробуждение или запуск агента.",
       required: "Обязательно",
       requiredSr: "обязательно",
-      basics: "Основное",
-      basicsSub: "Назовите его, выберите ассистента и задайте состояние включения.",
       fieldName: "Название",
       description: "Описание",
       agentId: "ID агента",
@@ -2626,8 +2570,13 @@ export const ru: TranslationMap = {
       descriptionPlaceholder: "Необязательный контекст для этого задания",
       agentPlaceholder: "main или ops",
       agentHelp: "Начните вводить, чтобы выбрать известного агента, или введите свой вариант.",
-      schedule: "Расписание",
-      scheduleSub: "Укажите, когда запускать это задание.",
+      promptPlaceholder: "Describe what OpenClaw should do...",
+      repeat: "Repeat",
+      repeatInterval: "Interval",
+      repeatOnce: "Once",
+      repeatCron: "Cron expression",
+      repeatOnExit: "On exit",
+      onExitHelp: "Runs when a watched command exits. The schedule cannot be edited here.",
       every: "Каждые",
       at: "В",
       cronOption: "Cron",
@@ -2643,13 +2592,9 @@ export const ru: TranslationMap = {
       timezonePlaceholder: "America/Los_Angeles",
       timezoneHelp:
         "Выберите распространенный часовой пояс или введите любой допустимый часовой пояс IANA.",
-      jitterHelp:
-        "Нужен джиттер? Используйте Дополнительно → Окно разнесения / Единица разнесения.",
-      execution: "Выполнение",
-      executionSub: "Выберите, когда активироваться и что должно делать это задание.",
-      session: "Сеанс",
-      main: "Основной",
-      isolated: "Изолированный",
+      runsIn: "Runs in",
+      mainSession: "Main session",
+      isolatedSession: "Isolated session",
       sessionHelp:
         "Основной публикует системное событие. Изолированный запускает отдельный ход агента.",
       wakeMode: "Режим активации",
@@ -2657,7 +2602,7 @@ export const ru: TranslationMap = {
       nextHeartbeat: "Следующая пульсация",
       wakeModeHelp:
         "Сейчас — запускает немедленно. Следующая пульсация — ожидает следующего цикла.",
-      payloadKind: "Что нужно запустить?",
+      action: "Action",
       command: "Команда",
       systemEvent: "Опубликовать сообщение в основной ленте",
       agentTurn: "Запустить задачу ассистента (изолированно)",
@@ -2670,8 +2615,6 @@ export const ru: TranslationMap = {
         "Необязательно. Оставьте пустым, чтобы использовать поведение тайм-аута gateway по умолчанию для этого запуска.",
       mainTimelineMessage: "Сообщение в основной ленте",
       assistantTaskPrompt: "Запрос для задачи ассистента",
-      deliverySection: "Доставка",
-      deliverySub: "Выберите, куда отправлять сводки запусков.",
       resultDelivery: "Доставка результата",
       announceDefault: "Объявлять сводку (по умолчанию)",
       webhookPost: "Webhook POST",
@@ -2688,6 +2631,7 @@ export const ru: TranslationMap = {
       advanced: "Дополнительно",
       advancedHelp:
         "Необязательные переопределения для гарантий доставки, разброса расписания и настроек модели.",
+      startEnabled: "Start enabled",
       deleteAfterRun: "Удалить после запуска",
       deleteAfterRunHelp:
         "Лучше всего подходит для одноразовых напоминаний, которые должны автоматически очищаться.",
@@ -2714,36 +2658,11 @@ export const ru: TranslationMap = {
       fixFieldsPlural: "Исправьте {count} полей, чтобы продолжить.",
       saving: "Сохранение...",
       saveChanges: "Сохранить изменения",
-      addJob: "Добавить задание",
+      createTask: "Create task",
       cancel: "Отмена",
     },
-    jobList: {
-      allJobs: "все задания",
-      selectJob: "(выберите задание)",
-      enabled: "включено",
-      disabled: "отключено",
-      edit: "Изменить",
-      clone: "Клонировать",
-      disable: "Отключить",
-      enable: "Включить",
-      run: "Запустить",
-      runIfDue: "Запустить, если пора",
-      moreActions: "Другие действия",
-      history: "История",
-      remove: "Удалить",
-    },
-    jobDetail: {
-      system: "Система",
-      command: "Команда",
-      cwd: "CWD",
-      prompt: "Запрос",
-      delivery: "Доставка",
-      agent: "Агент",
-    },
     jobState: {
-      status: "Статус",
       next: "Следующий",
-      last: "Последний",
     },
     runEntry: {
       noSummary: "Нет сводки.",

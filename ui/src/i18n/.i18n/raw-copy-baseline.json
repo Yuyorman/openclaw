@@ -3681,20 +3681,6 @@
       "kind": "html-text",
       "name": "text",
       "path": "ui/src/pages/cron/view.ts",
-      "text": "Consecutive errors before alerting."
-    },
-    {
-      "count": 1,
-      "kind": "html-text",
-      "name": "text",
-      "path": "ui/src/pages/cron/view.ts",
-      "text": "Control when this job sends repeated-failure alerts."
-    },
-    {
-      "count": 1,
-      "kind": "html-text",
-      "name": "text",
-      "path": "ui/src/pages/cron/view.ts",
       "text": "Custom per-job settings"
     },
     {
@@ -3716,49 +3702,126 @@
       "kind": "html-text",
       "name": "text",
       "path": "ui/src/pages/cron/view.ts",
-      "text": "Light context"
+      "text": "Webhook (HTTP POST)"
     },
     {
       "count": 1,
-      "kind": "html-text",
-      "name": "text",
+      "kind": "object-property",
+      "name": "help",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Consecutive errors before alerting."
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "help",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Control when this job sends repeated-failure alerts."
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "help",
       "path": "ui/src/pages/cron/view.ts",
       "text": "Minimum seconds between alerts."
     },
     {
       "count": 1,
-      "kind": "html-text",
-      "name": "text",
+      "kind": "object-property",
+      "name": "help",
       "path": "ui/src/pages/cron/view.ts",
       "text": "Optional channel account ID for multi-account setups."
     },
     {
       "count": 1,
-      "kind": "html-text",
-      "name": "text",
+      "kind": "object-property",
+      "name": "help",
       "path": "ui/src/pages/cron/view.ts",
       "text": "Optional recipient override for failure alerts."
     },
     {
       "count": 1,
-      "kind": "html-text",
-      "name": "text",
+      "kind": "object-property",
+      "name": "help",
       "path": "ui/src/pages/cron/view.ts",
       "text": "Optional routing key for job delivery and wake routing."
     },
     {
       "count": 1,
-      "kind": "html-text",
-      "name": "text",
+      "kind": "object-property",
+      "name": "help",
       "path": "ui/src/pages/cron/view.ts",
       "text": "Use lightweight bootstrap context for this agent job."
     },
     {
       "count": 1,
-      "kind": "html-text",
-      "name": "text",
+      "kind": "object-property",
+      "name": "label",
       "path": "ui/src/pages/cron/view.ts",
-      "text": "Webhook (HTTP POST)"
+      "text": "Account ID"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Alert account ID"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Alert after"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Alert channel"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Alert mode"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Alert to"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Cooldown (seconds)"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Failure alerts"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Light context"
+    },
+    {
+      "count": 1,
+      "kind": "object-property",
+      "name": "label",
+      "path": "ui/src/pages/cron/view.ts",
+      "text": "Session key"
     },
     {
       "count": 1,

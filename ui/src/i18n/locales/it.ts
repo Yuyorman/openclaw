@@ -172,6 +172,16 @@ export const it: TranslationMap = {
       node: "Nodo",
     },
   },
+  instances: {
+    title: "Istanze connesse",
+    subtitle: "Beacon di presenza dal gateway e dai client.",
+    showHosts: "Mostra host e IP",
+    hideHosts: "Nascondi host e IP",
+    toggleHostVisibility: "Attiva/disattiva visibilità host",
+    noInstances: "Nessuna istanza segnalata ancora.",
+    lastInput: "Ultimo input {time}",
+    reason: "Motivo {reason}",
+  },
   worktrees: {
     newWorktree: "Nuovo worktree",
     owner: "Proprietario",
@@ -383,7 +393,6 @@ export const it: TranslationMap = {
       skills: "Skills",
       channels: "Canali",
       cronJobs: "Processi cron",
-      memory: "Memoria",
     },
     context: {
       title: "Contesto agente",
@@ -621,6 +630,7 @@ export const it: TranslationMap = {
     workboard: "Bacheca di lavoro",
     worktrees: "Worktree",
     channels: "Canali",
+    instances: "Istanze",
     sessions: "Sessioni",
     usage: "Utilizzo",
     cron: "Processi cron",
@@ -642,6 +652,7 @@ export const it: TranslationMap = {
     modelProviders: "Model Providers",
     debug: "Debug",
     logs: "Log",
+    dreams: "Sogni",
     plugin: "Plugin",
   },
   subtitles: {
@@ -651,6 +662,7 @@ export const it: TranslationMap = {
     workboard: "Coda di lavoro degli agenti e passaggio di sessione.",
     worktrees: "Checkout isolati delle attività degli agenti e snapshot di ripristino.",
     channels: "Canali e impostazioni.",
+    instances: "Client e nodi connessi.",
     sessions: "Sessioni attive e valori predefiniti.",
     usage: "Utilizzo API e costi.",
     cron: "Risvegli ed esecuzioni ricorrenti.",
@@ -672,10 +684,8 @@ export const it: TranslationMap = {
     modelProviders: "Configured providers with plan, quota, and cost.",
     debug: "Snapshot, eventi, RPC.",
     logs: "Log gateway live.",
+    dreams: "Sogni della memoria, consolidamento e riflessione.",
     plugin: "Pannello fornito dal plugin.",
-  },
-  mcpPage: {
-    manageServersLink: "Gestisci i server nella pagina Plugins.",
   },
   pluginsPage: {
     searchLabel: "Cerca plugin",
@@ -1594,6 +1604,10 @@ export const it: TranslationMap = {
     },
   },
   dreaming: {
+    agentSelect: {
+      label: "Agente",
+      ariaLabel: "Dreaming agent",
+    },
     tabs: {
       scene: "Scena",
       diary: "Diario",
@@ -2195,9 +2209,9 @@ export const it: TranslationMap = {
       workSessions: "Lavoro",
     },
     welcome: {
+      ready: "Ready to chat",
       hintBeforeShortcut: "Type a message below ·",
       hintAfterShortcut: "for commands",
-      recentSessions: "Chat recenti",
       suggestions: {
         whatCanYouDo: "What can you do?",
         summarizeRecentSessions: "Summarize my recent sessions",
@@ -2366,8 +2380,6 @@ export const it: TranslationMap = {
       finished: "Completate ({count})",
       stopTask: "Interrompi {title}",
       viewTranscript: "Visualizza trascrizione",
-      toolUseOne: "1 utilizzo dello strumento",
-      toolUseMany: "{count} utilizzi dello strumento",
     },
     sessionDiff: {
       title: "Modifiche",
@@ -2451,125 +2463,76 @@ export const it: TranslationMap = {
     ru: "Русский (Russian)",
   },
   cron: {
-    quickCreate: {
-      schedules: {
-        everyMorning: {
-          label: "Ogni mattina",
-          description: "Ogni giorno alle 8:00",
-        },
-        everyEvening: {
-          label: "Ogni sera",
-          description: "Ogni giorno alle 18:00",
-        },
-        hourly: {
-          label: "Ogni ora",
-          description: "Ogni ora",
-        },
-        weekdays: {
-          label: "Giorni feriali",
-          description: "Lun–Ven alle 9:00",
-        },
-        weekly: {
-          label: "Ogni settimana",
-          description: "Ogni lunedì alle 9:00",
-        },
-        once: {
-          label: "Esegui una volta",
-          description: "Una tantum, elimina dopo l'esecuzione",
-        },
-      },
-      delivery: {
-        notify: {
-          label: "Avvisami",
-          description: "Invia i risultati alla chat",
-        },
-        silent: {
-          label: "Silenzioso",
-          description: "Esegui senza notifica",
-        },
-        isolated: {
-          label: "Sessione indipendente",
-          description: "Esegui nella propria sessione",
-        },
-      },
-      steps: {
-        what: "Cosa",
-        when: "Quando",
-        how: "Come",
-      },
-      defaultName: "Automazione",
-      whatHeading: "Cosa deve fare?",
-      whatHint:
-        "Descrivi l'attività in linguaggio naturale. L'agente eseguirà questo prompt ogni volta.",
-      promptPlaceholder:
-        "ad es., Controlla la mia posta in arrivo per email urgenti e riassumile...",
-      nameOptional: "Nome (facoltativo)",
-      namePlaceholder: "ad es., Controllo posta mattutino",
-      whenHeading: "Quando deve essere eseguita?",
-      whenHint: "Scegli una pianificazione. Puoi perfezionarla in seguito.",
-      howHeading: "Come deve funzionare?",
-      howHint: "Scegli come vengono consegnati i risultati.",
-      title: "Nuova automazione",
-      createAndRun: "Crea ed esegui ora",
+    tabs: {
+      all: "All",
+      active: "Attive",
+      paused: "Paused",
+    },
+    list: {
+      searchPlaceholder: "Search scheduled tasks",
+      newTask: "New task",
+      filters: "Filters",
+      shownOf: "{shown} of {total}",
+      emptyTitle: "No scheduled tasks yet",
+      emptyHint: "Describe what OpenClaw should do and when — it runs on schedule.",
+      noMatching: "No tasks match the current filters.",
+      loadMore: "Carica altro",
+      loading: "Loading...",
+      schedulerOff: "Scheduler disabled",
+      refresh: "Aggiorna",
+      refreshing: "Refreshing...",
+      paused: "Paused",
     },
     suggestions: {
-      title: "Idee di automazione",
-      hint: "Automazioni di partenza — scegline una e modificala prima di crearla.",
-      use: "Usa l'idea →",
-      ideas: {
-        repoPulse: {
-          name: "Repo pulse",
-          tagline: "Problemi notturni, PR e fallimenti CI, ordinati per urgenza.",
-          prompt:
-            "Esamina l'attività notturna nei miei repository: nuovi problemi, pull request e fallimenti CI. Riepiloga le tre cose che richiedono maggiormente la mia attenzione oggi, ciascuna con un link e una motivazione in una riga.",
-        },
-        standupGhostwriter: {
-          name: "Ghostwriter standup",
-          tagline: "Il tuo aggiornamento standup, redatto dal lavoro di ieri.",
-          prompt:
-            "Redigi il mio aggiornamento standup dai commit di ieri, dalle pull request unite e dai thread di revisione aperti. Massimo tre punti: fatto, in corso, bloccato.",
-        },
-        hackerNewsScout: {
-          name: "Scout di Hacker News",
-          tagline: "Tre link che valgono il tuo caffè, con opinioni forti.",
-          prompt:
-            "Scansiona la prima pagina di Hacker News di oggi per post su agenti AI, strumenti per sviluppatori e TypeScript. Inviami i tre link più interessanti, ciascuno con un'opinione forte in una riga.",
-        },
-        dependencyRadar: {
-          name: "Radar dipendenze",
-          tagline: "Dipendenze obsolete o vulnerabili, con note di aggiornamento.",
-          prompt:
-            "Controlla il mio progetto principale alla ricerca di dipendenze obsolete o vulnerabili. Elenca gli aggiornamenti rilevanti con una nota di rischio in una riga ciascuno e prepara il comando di aggiornamento.",
-        },
-        watchdog: {
-          name: "Guardia notturna",
-          tagline: "Controllo di salute orario con un verdetto in una riga.",
-          prompt:
-            "Verifica che i miei servizi e il Gateway siano in buono stato: analizza i log recenti alla ricerca di nuovi errori, riavvii o carichi insoliti. Rispondi con una breve riga di tutto OK quando tutto va bene; se qualcosa sembra rotto, segnala cosa ha fallito e da dove iniziare a guardare.",
-        },
-        polyglotMinute: {
-          name: "Minuto poliglotta",
-          tagline: "Una frase straniera utile con il caffè del mattino.",
-          prompt:
-            "Insegnami una frase utile in giapponese: la frase, come pronunciarla, il suo significato letterale e quando usarla. Tienila sotto le cinque righe.",
-        },
+      title: "Suggestions",
+      morningBrief: {
+        title: "Morning brief",
+        schedule: "Weekdays at 8:00 AM",
+        description: "Start each weekday with a summary of overnight activity and priorities.",
+        prompt:
+          "Give me a morning brief: summarize overnight activity, unread messages, and the top priorities for today.",
+      },
+      weeklyReview: {
+        title: "Weekly review",
+        schedule: "Fridays at 4:00 PM",
+        description: "Turn the week's sessions into a concise status update every Friday.",
+        prompt:
+          "Write a weekly review: summarize what was worked on this week, what shipped, and open follow-ups.",
+      },
+      followUps: {
+        title: "Follow-up monitor",
+        schedule: "Weekdays at 9:00 AM",
+        description: "Review recent conversations and flag anything waiting on a reply.",
+        prompt:
+          "Review recent conversations and flag anything that is waiting on a reply or needs my attention.",
       },
     },
-    summary: {
-      enabled: "Abilitato",
+    stats: {
       scheduler: "Pianificatore",
-      jobs: "Processi",
-      nextWake: "Prossimo risveglio",
-      refreshing: "Aggiornamento...",
-      refresh: "Aggiorna",
+      tasks: "Tasks",
+      nextWake: "Next wake",
+    },
+    detail: {
+      newTitle: "New scheduled task",
+      newSubtitle: "Describe what OpenClaw should do, then pick when it runs.",
+      overviewTitle: "Recent activity",
+      overviewSubtitle: "Latest runs across all scheduled tasks.",
+      historyTitle: "Run history",
+      detailsSection: "Details",
+      frequencySection: "Frequency",
+      paused: "Paused",
+    },
+    actions: {
+      runNow: "Run now",
+      runIfDue: "Run if due",
+      pause: "Pause",
+      resume: "Resume",
+      clone: "Clone",
+      remove: "Remove",
+      more: "More actions",
+      history: "History",
     },
     jobs: {
-      title: "Processi",
-      subtitle: "Tutti i processi pianificati memorizzati nel gateway.",
-      shownOf: "{shown} mostrati su {total}",
-      searchJobs: "Cerca processi",
-      searchPlaceholder: "Nome, descrizione o agente",
-      enabled: "Abilitato",
       schedule: "Pianificazione",
       lastRun: "Ultima esecuzione",
       all: "Tutti",
@@ -2581,20 +2544,8 @@ export const it: TranslationMap = {
       ascending: "Crescente",
       descending: "Decrescente",
       reset: "Reimposta",
-      emptyTitle: "No scheduled jobs yet.",
-      emptyHint: "Create one from a plain-language prompt; advanced fields can wait.",
-      emptyFilteredHint: "Clear or change filters to see scheduled jobs.",
-      noMatching: "Nessun processo corrispondente.",
-      loading: "Caricamento...",
-      loadMore: "Carica altri processi",
     },
     runs: {
-      title: "Cronologia esecuzioni",
-      subtitleAll: "Ultime esecuzioni in tutti i processi.",
-      subtitleJob: "Ultime esecuzioni per {title}.",
-      scope: "Ambito",
-      allJobs: "Tutti i processi",
-      selectedJob: "Processo selezionato",
       searchRuns: "Cerca esecuzioni",
       searchPlaceholder: "Riepilogo, errore o processo",
       newestFirst: "Prima i più recenti",
@@ -2604,7 +2555,6 @@ export const it: TranslationMap = {
       clear: "Cancella",
       allStatuses: "Tutti gli stati",
       allDelivery: "Tutte le consegne",
-      selectJobHint: "Seleziona un processo per ispezionare la cronologia delle esecuzioni.",
       noMatching: "Nessuna esecuzione corrispondente.",
       loadMore: "Carica altre esecuzioni",
       runStatusOk: "OK",
@@ -2617,15 +2567,8 @@ export const it: TranslationMap = {
       deliveryNotRequested: "Non richiesto",
     },
     form: {
-      editJob: "Modifica processo",
-      newJob: "Nuovo processo",
-      advancedJob: "Advanced job",
-      updateSubtitle: "Aggiorna il processo pianificato selezionato.",
-      createSubtitle: "Crea un risveglio pianificato o un'esecuzione dell'agente.",
       required: "Obbligatorio",
       requiredSr: "obbligatorio",
-      basics: "Informazioni di base",
-      basicsSub: "Assegna un nome, scegli l'assistente e imposta lo stato abilitato.",
       fieldName: "Nome",
       description: "Descrizione",
       agentId: "ID agente",
@@ -2634,8 +2577,13 @@ export const it: TranslationMap = {
       agentPlaceholder: "main o ops",
       agentHelp:
         "Inizia a digitare per scegliere un agente noto oppure inseriscine uno personalizzato.",
-      schedule: "Pianificazione",
-      scheduleSub: "Controlla quando viene eseguito questo processo.",
+      promptPlaceholder: "Describe what OpenClaw should do...",
+      repeat: "Repeat",
+      repeatInterval: "Interval",
+      repeatOnce: "Once",
+      repeatCron: "Cron expression",
+      repeatOnExit: "On exit",
+      onExitHelp: "Runs when a watched command exits. The schedule cannot be edited here.",
       every: "Ogni",
       at: "Alle",
       cronOption: "Cron",
@@ -2651,20 +2599,16 @@ export const it: TranslationMap = {
       timezonePlaceholder: "America/Los_Angeles",
       timezoneHelp:
         "Scegli un fuso orario comune oppure inserisci qualsiasi fuso orario IANA valido.",
-      jitterHelp:
-        "Serve jitter? Usa Avanzate → finestra di scaglionamento / unità di scaglionamento.",
-      execution: "Esecuzione",
-      executionSub: "Scegli quando risvegliare e cosa deve fare questo processo.",
-      session: "Sessione",
-      main: "Principale",
-      isolated: "Isolata",
+      runsIn: "Runs in",
+      mainSession: "Main session",
+      isolatedSession: "Isolated session",
       sessionHelp:
         "Principale pubblica un evento di sistema. Isolata esegue un turno agente dedicato.",
       wakeMode: "Modalità risveglio",
       now: "Ora",
       nextHeartbeat: "Prossimo heartbeat",
       wakeModeHelp: "Ora attiva immediatamente. Prossimo heartbeat attende il ciclo successivo.",
-      payloadKind: "Cosa deve essere eseguito?",
+      action: "Action",
       command: "Command",
       systemEvent: "Pubblica messaggio nella timeline principale",
       agentTurn: "Esegui attività assistente (isolata)",
@@ -2677,8 +2621,6 @@ export const it: TranslationMap = {
         "Facoltativo. Lascia vuoto per usare il comportamento di timeout predefinito del gateway per questa esecuzione.",
       mainTimelineMessage: "Messaggio timeline principale",
       assistantTaskPrompt: "Prompt attività assistente",
-      deliverySection: "Consegna",
-      deliverySub: "Scegli dove vengono inviati i riepiloghi delle esecuzioni.",
       resultDelivery: "Consegna risultato",
       announceDefault: "Annuncia riepilogo (predefinito)",
       webhookPost: "POST webhook",
@@ -2696,6 +2638,7 @@ export const it: TranslationMap = {
       advanced: "Avanzate",
       advancedHelp:
         "Override facoltativi per garanzie di consegna, jitter di pianificazione e controlli del modello.",
+      startEnabled: "Start enabled",
       deleteAfterRun: "Elimina dopo l'esecuzione",
       deleteAfterRunHelp: "Ideale per promemoria una tantum che devono pulirsi automaticamente.",
       clearAgentOverride: "Cancella override agente",
@@ -2721,36 +2664,11 @@ export const it: TranslationMap = {
       fixFieldsPlural: "Correggi {count} campi per continuare.",
       saving: "Salvataggio...",
       saveChanges: "Salva modifiche",
-      addJob: "Aggiungi processo",
+      createTask: "Create task",
       cancel: "Annulla",
     },
-    jobList: {
-      allJobs: "tutti i processi",
-      selectJob: "(seleziona un processo)",
-      enabled: "abilitato",
-      disabled: "disabilitato",
-      edit: "Modifica",
-      clone: "Clona",
-      disable: "Disabilita",
-      enable: "Abilita",
-      run: "Esegui",
-      runIfDue: "Esegui se previsto",
-      moreActions: "Altre azioni",
-      history: "Cronologia",
-      remove: "Rimuovi",
-    },
-    jobDetail: {
-      system: "Sistema",
-      command: "Comando",
-      cwd: "CWD",
-      prompt: "Prompt",
-      delivery: "Consegna",
-      agent: "Agente",
-    },
     jobState: {
-      status: "Stato",
       next: "Prossimo",
-      last: "Ultimo",
     },
     runEntry: {
       noSummary: "Nessun riepilogo.",
