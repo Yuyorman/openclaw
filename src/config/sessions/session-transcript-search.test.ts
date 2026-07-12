@@ -29,7 +29,7 @@ vi.mock("../config.js", async () => ({
   getRuntimeConfig: vi.fn().mockReturnValue({}),
 }));
 
-type TestPaths = { stateDir: string; storePath: string; tempDir: string };
+type TestPaths = { stateDir: string; tempDir: string };
 
 let paths: TestPaths;
 
@@ -37,7 +37,6 @@ beforeEach(() => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-session-search-"));
   paths = {
     stateDir: path.join(tempDir, "state"),
-    storePath: path.join(tempDir, "openclaw-agent.sqlite"),
     tempDir,
   };
 });
@@ -60,7 +59,6 @@ function transcriptScope(sessionId: string, sessionKey: string) {
     env: env(),
     sessionId,
     sessionKey,
-    storePath: paths.storePath,
   };
 }
 
@@ -165,7 +163,6 @@ describe("searchSessionTranscripts", () => {
       agentId: "main",
       env: env(),
       sessionId: "session-1",
-      storePath: paths.storePath,
     });
     expect(search("ephemeral").hits).toHaveLength(0);
   });
