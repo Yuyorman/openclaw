@@ -53,6 +53,7 @@ export {
   logoutWeb,
   logWebSelfId,
   pickWebChannel,
+  prepareWebAuthForLogin,
   readWebAuthSnapshot,
   readWebAuthState,
   readWebAuthExistsBestEffort,
@@ -100,7 +101,6 @@ function enqueueSaveCreds(
       safeSaveCreds({
         authDir,
         saveCreds,
-        logger,
         beforeCredentialPersistence: options?.beforeCredentialPersistence,
       }),
     (err) => {
@@ -113,7 +113,6 @@ function enqueueSaveCreds(
 async function safeSaveCreds(params: {
   authDir: string;
   saveCreds: () => Promise<void> | void;
-  logger: ReturnType<typeof getChildLogger>;
   beforeCredentialPersistence?: () => Promise<void>;
 }): Promise<void> {
   let backup: { content: string; filePath: string } | undefined;
@@ -149,14 +148,7 @@ async function safeSaveCreds(params: {
   }
 
   await params.beforeCredentialPersistence?.();
-  try {
-    await Promise.resolve(params.saveCreds());
-  } catch (err) {
-    params.logger.warn({ error: String(err) }, "failed saving WhatsApp creds");
-    if (params.beforeCredentialPersistence) {
-      throw err;
-    }
-  }
+  await Promise.resolve(params.saveCreds());
 }
 
 function abortSocketAfterCredentialPersistenceFailure(
@@ -283,12 +275,18 @@ export async function createWaSocket(
       }
     : state.keys;
   const cachedSignalKeys = makeCacheableSignalKeyStore(persistedSignalKeys, logger);
-  const signalKeys: SignalKeyStore = opts.beforeCredentialPersistence
+  // Interactive login observes Baileys' deferred writes even when no setup
+  // authority guard is needed; otherwise a socket can open before persistence fails.
+  const observesCredentialPersistence = Boolean(
+    opts.onCredentialPersistenceError || opts.onCredentialPersistenceTask,
+  );
+  const signalKeys: SignalKeyStore = observesCredentialPersistence
     ? {
         ...cachedSignalKeys,
         get<T extends keyof SignalDataTypeMap>(type: T, ids: string[]) {
           const task = Promise.resolve(cachedSignalKeys.get(type, ids));
           opts.onCredentialPersistenceTask?.(task);
+          void task.then(undefined, reportCredentialPersistenceError);
           return task;
         },
         set(data) {
@@ -305,7 +303,7 @@ export async function createWaSocket(
         },
       }
     : cachedSignalKeys;
-  const makeSignalRepository = opts.onCredentialPersistenceTask
+  const makeSignalRepository = observesCredentialPersistence
     ? (...args: Parameters<typeof createBaileysSignalRepository>) => {
         const repository = createBaileysSignalRepository(...args);
         const storeLidPnMappings = repository.lidMapping.storeLIDPNMappings.bind(
@@ -356,7 +354,7 @@ export async function createWaSocket(
   sock.ev.on("creds.update", () =>
     enqueueSaveCreds(authDir, saveCreds, sessionLogger, {
       beforeCredentialPersistence: opts.beforeCredentialPersistence,
-      onError: reportCredentialPersistenceError,
+      ...(opts.onCredentialPersistenceError ? { onError: reportCredentialPersistenceError } : {}),
     }),
   );
   sock.ev.on("connection.update", (update: Partial<import("baileys").ConnectionState>) => {
