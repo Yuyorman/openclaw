@@ -23,15 +23,15 @@ length, and total response size.
 
 ## Index lifecycle
 
-OpenClaw stores a full-text index in each agent's SQLite database. New user and assistant messages
-enter the index after their transcript append succeeds; tool results, reasoning blocks, and images
-are excluded. Only the transcript's active branch is searchable. Individual oversized JSONL records
-are skipped to keep reconciliation memory-bounded.
+OpenClaw stores a full-text index next to the transcript rows in each agent's SQLite database.
+New user and assistant messages are indexed in the same transaction that persists them, so the
+index never lags live conversations; tool results, reasoning blocks, and images are excluded.
+Only the transcript's active branch is searchable.
 
-The first search after a Gateway start launches a bounded background reconciliation for existing
-transcripts. A response with `indexing: true` can therefore be incomplete; retry after indexing
-finishes. Completed searches use SQLite directly without polling transcript files. Reconciliation
-also removes index entries for deleted transcripts.
+Transcripts that predate the index (for example, sessions imported by `openclaw doctor`) and
+sessions whose active branch was rewound are reindexed by a background reconciliation that starts
+with the next search. A response with `indexing: true` can therefore be incomplete; retry after
+indexing finishes. Deleting a session removes its index entries in the same transaction.
 
 Search currently uses SQLite's Unicode word tokenizer with diacritic removal. Trigram tokenization
 for CJK substring matching is a future improvement.
