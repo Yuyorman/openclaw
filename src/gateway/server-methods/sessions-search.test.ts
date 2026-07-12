@@ -75,7 +75,6 @@ describe("sessions.search gateway method", () => {
 
     expect(searchSessionTranscriptsMock).toHaveBeenCalledWith({
       agentId: "work",
-      config: cfg,
       query: "needle",
       limit: 5,
       sessionKeys: ["agent:work:main", "agent:work:other"],
@@ -112,7 +111,6 @@ describe("sessions.search gateway method", () => {
 
     expect(searchSessionTranscriptsMock).toHaveBeenCalledWith({
       agentId: "work",
-      config: cfg,
       query: "needle",
       limit: undefined,
       sessionKeys: ["agent:work:main", "global"],
@@ -123,7 +121,6 @@ describe("sessions.search gateway method", () => {
     await callSearch({ query: "needle" });
     expect(searchSessionTranscriptsMock).toHaveBeenCalledWith({
       agentId: "main",
-      config: cfg,
       query: "needle",
       limit: undefined,
     });

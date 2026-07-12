@@ -14,7 +14,9 @@ import {
 } from "../../infra/kysely-sync.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
+  isCanonicalSessionTranscriptEntry,
   isSessionTranscriptLeafControl,
+  isSessionTranscriptSideAppendEntry,
   parseSessionTranscriptTreeEntry,
 } from "./transcript-tree.js";
 import {
@@ -215,14 +217,18 @@ export function indexAppendedTranscriptEventInTransaction(
     markSessionTranscriptIndexDirtyInTransaction(db, params.sessionId);
     return;
   }
-  if (isSessionTranscriptLeafControl(params.event)) {
-    // Leaf controls repoint the active branch; the visible path must be
-    // re-resolved rather than guessed at append time.
+  if (
+    isSessionTranscriptLeafControl(params.event) ||
+    isSessionTranscriptSideAppendEntry(params.event)
+  ) {
+    // Leaf controls repoint the active branch and side appends attach off
+    // the main chain; the visible path must be re-resolved rather than
+    // guessed at append time.
     markSessionTranscriptIndexDirtyInTransaction(db, params.sessionId);
     return;
   }
   const treeEntry = parseSessionTranscriptTreeEntry(params.event);
-  if (treeEntry && treeEntry.appendParentId !== watermark.leafEventId) {
+  if (treeEntry && treeEntry.parentId !== watermark.leafEventId) {
     markSessionTranscriptIndexDirtyInTransaction(db, params.sessionId);
     return;
   }
@@ -244,14 +250,16 @@ function applyForwardIndex(
   if (entry) {
     insertFtsRow(db, params.sessionId, entry);
   }
+  // Mirror scanSessionTranscriptTree's leaf advancement: canonical entries
+  // (parent-linked or parentless) become the tip the next append chains to;
+  // headers and unknown control rows leave the tip untouched.
+  const advancesLeaf = params.eventId !== null && isCanonicalSessionTranscriptEntry(params.event);
   writeWatermark(
     db,
     params.sessionId,
     {
       indexedSeq: params.seq,
-      // Identity-bearing events become the chain tip the next tree append
-      // must reference; identity-less control rows keep the current tip.
-      leafEventId: params.eventId ?? watermark.leafEventId,
+      leafEventId: advancesLeaf ? params.eventId : watermark.leafEventId,
       needsRebuild: false,
     },
     params.createdAt,

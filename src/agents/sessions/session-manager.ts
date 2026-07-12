@@ -51,9 +51,9 @@ import {
   publishOwnedSessionFileSnapshot,
 } from "../../config/sessions/transcript-write-context.js";
 import { CURRENT_SESSION_VERSION } from "../../config/sessions/version.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ImageContent, Message, TextContent } from "../../llm/types.js";
 import { logWarn } from "../../logger.js";
-import { emitInternalSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import {
   type AgentMessage,
@@ -217,6 +217,8 @@ export type SessionEntry =
 export type FileEntry = SessionHeader | SessionEntry;
 
 type AppendPersistenceOptions = {
+  config?: OpenClawConfig;
+  idempotencyLookup?: "scan" | "scan-assistant" | "caller-checked";
   invalidateSerializedPrefixCache?: boolean;
 };
 
@@ -2099,7 +2101,6 @@ export class SessionManager {
     if (rememberedWrite.verifiedWrite && options?.publishSnapshot !== false) {
       publishRememberedSessionFileSnapshot(this.sessionFile, rememberedWrite.snapshot);
     }
-    emitInternalSessionTranscriptUpdate({ sessionFile: this.sessionFile, mutation: "replace" });
   }
 
   isPersisted(): boolean {
@@ -2247,7 +2248,7 @@ export class SessionManager {
     publishSnapshot = true,
   ): void {
     if (this.sqlitePersistence) {
-      this.persistSqliteRecord(entry);
+      this.persistSqliteRecord(entry, options);
       return;
     }
     if (!this.shouldPersist || !this.sessionFile) {
@@ -2263,7 +2264,6 @@ export class SessionManager {
       return;
     }
 
-    let mutation: "append" | "replace" = this.flushed ? "append" : "replace";
     if (!this.flushed) {
       const content = this.writeFullFile();
       this.flushed = true;
@@ -2303,7 +2303,6 @@ export class SessionManager {
         canPublishOwnedAppend,
         invalidateSerializedPrefixCache,
       );
-      mutation = rememberedAppend.ownedAppendVerified ? "append" : "replace";
       this.sessionFileSnapshot = rememberedAppend.snapshot;
       if (rememberedAppend.ownedAppendVerified && publishSnapshot) {
         publishRememberedSessionFileSnapshot(this.sessionFile, rememberedAppend.snapshot);
@@ -2317,14 +2316,13 @@ export class SessionManager {
         );
       }
     }
-    emitInternalSessionTranscriptUpdate({ sessionFile: this.sessionFile, mutation });
   }
 
   persist(entry: SessionEntry, options?: AppendPersistenceOptions): void {
     this.persistRecord(entry, options);
   }
 
-  private persistSqliteRecord(entry: unknown): void {
+  private persistSqliteRecord(entry: unknown, options?: AppendPersistenceOptions): void {
     if (!isIndexedSessionEntry(entry)) {
       return;
     }
@@ -2342,13 +2340,21 @@ export class SessionManager {
       appendTranscriptEventSync(scope, entry);
       return;
     }
-    appendTranscriptMessageSync(scope, {
+    const result = appendTranscriptMessageSync(scope, {
       cwd: this.cwd,
       eventId: entry.id,
+      ...(options?.config ? { config: options.config } : {}),
+      ...(options?.idempotencyLookup ? { idempotencyLookup: options.idempotencyLookup } : {}),
       message: entry.message,
       now: Date.parse(entry.timestamp),
       parentId: entry.parentId,
     });
+    if (
+      options?.idempotencyLookup === "caller-checked" &&
+      (!result?.appended || result.messageId !== entry.id)
+    ) {
+      throw new Error(`Session transcript append was not persisted: ${entry.id}`);
+    }
   }
 
   /**
