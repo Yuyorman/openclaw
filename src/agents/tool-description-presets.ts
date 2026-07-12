@@ -35,6 +35,7 @@ export function describeSessionsSendTool(): string {
     "Send message to visible session by sessionKey/label, or configured agent by agentId; sessionKey wins when redundant label metadata is present.",
     "Thread-scoped chats rejected; target parent channel session.",
     "Creates missing configured-agent main session; waits for reply when available.",
+    "watch:true registers you for state-change notices when other actors later interact with the target session.",
   ].join(" ");
 }
 
