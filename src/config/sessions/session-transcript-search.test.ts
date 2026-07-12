@@ -249,9 +249,20 @@ describe("searchSessionTranscripts", () => {
     // session triggers reconcile; force one by clearing the live watermark.
     executeSqliteQuerySync(db, kysely.deleteFrom("session_transcript_index_state"));
 
-    expect(search("ghost").hits).toHaveLength(1);
+    const ghostRows = () =>
+      executeSqliteQuerySync(
+        db,
+        kysely
+          .selectFrom("session_transcript_fts")
+          .select("message_id")
+          .where("session_id", "=", "session-ghost"),
+      ).rows.length;
+    // Ghost rows are already invisible to search (the sessions join drops
+    // them); the sweep reclaims their storage.
+    expect(ghostRows()).toBe(1);
+    expect(search("anchor").indexing).toBe(true);
     await waitForSessionTranscriptReconcileForTest();
-    expect(search("ghost").hits).toHaveLength(0);
+    expect(ghostRows()).toBe(0);
     expect(search("anchor").hits).toHaveLength(1);
   });
 });
