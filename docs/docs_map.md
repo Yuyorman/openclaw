@@ -1511,7 +1511,9 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H2: fleet logs
   - H2: fleet start, fleet stop, and fleet restart
   - H2: fleet upgrade
+  - H3: Pinning by digest
   - H2: fleet rm
+  - H2: Backup and restore
   - H2: Storage and container layout
   - H2: Security profile
   - H2: Token handling

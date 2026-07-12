@@ -278,6 +278,44 @@ export async function probeCellHealth(params: {
   }
 }
 
+export async function waitForHealthyCell(params: {
+  record: FleetCellRecord;
+  containers: FleetContainerRuntime;
+  attemptId: string;
+  fetchImpl: typeof fetch;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  checkpoint: () => void;
+  timeoutMs: number;
+  pollMs: number;
+}): Promise<"healthy" | "not-running" | "unverified" | "timeout"> {
+  const deadline = params.now() + params.timeoutMs;
+  for (;;) {
+    const inspection = await params.containers.inspect(
+      params.record.runtime,
+      params.record.containerName,
+    );
+    if (inspection.kind !== "ok") {
+      return "unverified";
+    }
+    if (inspection.labels[FLEET_ATTEMPT_LABEL] !== params.attemptId || !inspection.running) {
+      return "not-running";
+    }
+    const health = await probeCellHealth({
+      port: params.record.hostPort,
+      fetchImpl: params.fetchImpl,
+    });
+    if (health.status === "ok") {
+      return "healthy";
+    }
+    if (params.now() >= deadline) {
+      return "timeout";
+    }
+    params.checkpoint();
+    await params.sleep(params.pollMs);
+  }
+}
+
 export async function resolvePurgeTarget(
   rootDir: string,
   targetDir: string,

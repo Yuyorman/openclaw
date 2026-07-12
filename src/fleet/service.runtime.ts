@@ -1,8 +1,10 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { createServer } from "node:net";
 import path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
 import {
+  allocateHostPort,
   buildCellEnvironment,
   cellAuthSecretDir,
   cellContainerName,
@@ -27,6 +29,7 @@ import {
 } from "./containers.runtime.js";
 import {
   deleteFleetCell,
+  getFleetCell,
   listFleetCells,
   reserveFleetCell,
   updateFleetCellImage,
@@ -50,16 +53,31 @@ import {
   resolveContainerUser,
   resolvePurgeTarget,
   restorePreviousCell,
+  waitForHealthyCell,
   withFleetCellOperation,
 } from "./service-support.runtime.js";
 
 const OFFICIAL_IMAGE_UID = 1_000;
 const OFFICIAL_IMAGE_GID = 1_000;
-// Mirrors the compose healthcheck contract: an upgrade commits only after /healthz
-// answers. The deadline bounds how long a broken image can hold the cell before
-// restore without rolling back slow-booting cells prematurely.
-const UPGRADE_VERIFY_TIMEOUT_MS = 60_000;
-const UPGRADE_VERIFY_POLL_MS = 1_000;
+// Mirrors the compose healthcheck contract: a started cell succeeds only after
+// /healthz answers, with a deadline that still permits normal slow boots.
+const CELL_VERIFY_TIMEOUT_MS = 60_000;
+const CELL_VERIFY_POLL_MS = 1_000;
+
+async function probeLoopbackPort(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const server = createServer();
+    server.once("error", (error: NodeJS.ErrnoException) => {
+      // The probe exists only to catch the one legible failure early (address in
+      // use). Anything else — e.g. EACCES on a privileged port an unprivileged CLI
+      // cannot bind but a rootful daemon can — defers to the authoritative runtime bind.
+      resolve(error.code !== "EADDRINUSE");
+    });
+    server.listen(port, "127.0.0.1", () => {
+      server.close(() => resolve(true));
+    });
+  });
+}
 
 export type FleetCreateOptions = {
   tenant: string;
@@ -108,10 +126,11 @@ export type FleetStatusResult = {
   image: string;
   created: string;
   dataDir: string;
-  container:
+  container: { imageId?: string } & (
     | { state: string; running: boolean; managed: boolean }
     | { state: "missing"; running: false; managed: false }
-    | { state: "unknown"; running: false; managed: false; error: string };
+    | { state: "unknown"; running: false; managed: false; error: string }
+  );
   health: FleetHealthResult;
 };
 
@@ -141,6 +160,7 @@ export type FleetServiceOptions = {
   getuid?: () => number | undefined;
   getgid?: () => number | undefined;
   sleep?: (ms: number) => Promise<void>;
+  probePort?: (port: number) => Promise<boolean>;
   selinuxEnabled?: () => Promise<boolean>;
   updateImage?: typeof updateFleetCellImage;
 };
@@ -163,6 +183,7 @@ export function createFleetService(options: FleetServiceOptions = {}) {
       }));
   const selinuxEnabled = options.selinuxEnabled ?? detectHostSelinux;
   const updateImage = options.updateImage ?? updateFleetCellImage;
+  const probePort = options.probePort ?? probeLoopbackPort;
 
   return {
     async create(createOptions: FleetCreateOptions): Promise<FleetCreateResult> {
@@ -184,16 +205,57 @@ export function createFleetService(options: FleetServiceOptions = {}) {
         operation: async (checkpoint) => {
           checkpoint();
           const stateDir = resolveStateDir(env);
-          const record = reserveFleetCell(env, {
+          const usedPorts = new Set(listFleetCells(env).map((cell) => cell.hostPort));
+          const reservation = {
             tenantId,
             createdAtMs: now(),
             image,
             runtime,
-            requestedPort: createOptions.port,
             containerName: cellContainerName(tenantId),
             dataDir: cellDataDir(stateDir, tenantId),
-          });
+          };
+          let record: ReturnType<typeof reserveFleetCell> | undefined;
+          if (createOptions.port !== undefined) {
+            const candidatePort = allocateHostPort(usedPorts, createOptions.port);
+            if (!(await probePort(candidatePort))) {
+              throw new Error(
+                `Host port ${candidatePort} is already in use on 127.0.0.1 by another process.`,
+              );
+            }
+            // The probe is best-effort UX; the runtime bind remains authoritative across this TOCTOU gap.
+            record = reserveFleetCell(env, { ...reservation, requestedPort: candidatePort });
+          } else {
+            const unavailablePorts = new Set(usedPorts);
+            // The exclusion set only grows, so this terminates: allocateHostPort throws
+            // its range-exhaustion error once every port through 65535 is excluded.
+            while (!record) {
+              for (const cell of listFleetCells(env)) {
+                unavailablePorts.add(cell.hostPort);
+              }
+              const candidate = allocateHostPort(unavailablePorts);
+              if (!(await probePort(candidate))) {
+                unavailablePorts.add(candidate);
+                continue;
+              }
+              try {
+                // The probe is best-effort UX; the runtime bind remains authoritative across this TOCTOU gap.
+                record = reserveFleetCell(env, { ...reservation, requestedPort: candidate });
+              } catch (error) {
+                if (getFleetCell(env, tenantId)) {
+                  throw error;
+                }
+                const candidateWasReserved = listFleetCells(env).some(
+                  (cell) => cell.hostPort === candidate,
+                );
+                if (!candidateWasReserved) {
+                  throw error;
+                }
+                unavailablePorts.add(candidate);
+              }
+            }
+          }
 
+          let result: FleetCreateResult;
           let networkAttempted = false;
           let containerAttempted = false;
           try {
@@ -252,7 +314,7 @@ export function createFleetService(options: FleetServiceOptions = {}) {
               assertCurrentReservation(env, record);
             }
             const url = `http://127.0.0.1:${record.hostPort}`;
-            return {
+            result = {
               tenant: tenantId,
               containerName: record.containerName,
               port: record.hostPort,
@@ -296,6 +358,26 @@ export function createFleetService(options: FleetServiceOptions = {}) {
             }
             throw error;
           }
+          if (result.started) {
+            const verification = await waitForHealthyCell({
+              record,
+              containers,
+              attemptId,
+              fetchImpl,
+              now,
+              sleep,
+              checkpoint,
+              timeoutMs: CELL_VERIFY_TIMEOUT_MS,
+              pollMs: CELL_VERIFY_POLL_MS,
+            });
+            if (verification !== "healthy") {
+              // Unlike upgrade, create has no previous container to restore; keep the sick cell as evidence.
+              throw new Error(
+                `Fleet cell ${tenantId} was created but did not become healthy within 60s; inspect it with \`openclaw fleet status ${tenantId}\` or \`openclaw fleet logs ${tenantId}\`, or remove it with \`openclaw fleet rm ${tenantId} --force\`.`,
+              );
+            }
+          }
+          return result;
         },
       });
     },
@@ -362,6 +444,7 @@ export function createFleetService(options: FleetServiceOptions = {}) {
           state: managed ? inspection.state : "unknown",
           running: inspection.running,
           managed,
+          ...(managed ? { imageId: inspection.imageId } : {}),
         };
         health =
           managed && inspection.running
@@ -513,29 +596,25 @@ export function createFleetService(options: FleetServiceOptions = {}) {
             // "running" briefly before crashing. Commit only after the replacement answers
             // /healthz (the image's compose health contract): exit/restart-loop fails fast,
             // and the deadline restores the old cell instead of leaving a dead replacement.
-            const verifyDeadline = now() + UPGRADE_VERIFY_TIMEOUT_MS;
-            for (;;) {
-              const replacement = await containers.inspect(record.runtime, record.containerName);
-              if (
-                replacement.kind !== "ok" ||
-                replacement.labels[FLEET_ATTEMPT_LABEL] !== nextAttemptId ||
-                !replacement.running
-              ) {
-                throw new Error(
-                  replacement.kind === "ok"
-                    ? "Replacement cell container is not running after upgrade."
-                    : "Replacement cell container could not be verified after upgrade.",
-                );
-              }
-              const health = await probeCellHealth({ port: record.hostPort, fetchImpl });
-              if (health.status === "ok") {
-                break;
-              }
-              if (now() >= verifyDeadline) {
-                throw new Error("Replacement cell container did not become healthy after upgrade.");
-              }
-              checkpoint();
-              await sleep(UPGRADE_VERIFY_POLL_MS);
+            const verification = await waitForHealthyCell({
+              record,
+              containers,
+              attemptId: nextAttemptId,
+              fetchImpl,
+              now,
+              sleep,
+              checkpoint,
+              timeoutMs: CELL_VERIFY_TIMEOUT_MS,
+              pollMs: CELL_VERIFY_POLL_MS,
+            });
+            if (verification === "not-running") {
+              throw new Error("Replacement cell container is not running after upgrade.");
+            }
+            if (verification === "unverified") {
+              throw new Error("Replacement cell container could not be verified after upgrade.");
+            }
+            if (verification === "timeout") {
+              throw new Error("Replacement cell container did not become healthy after upgrade.");
             }
             checkpoint();
             updateImage(env, record.tenantId, image);

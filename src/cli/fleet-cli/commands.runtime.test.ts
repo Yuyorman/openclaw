@@ -119,7 +119,12 @@ describe("fleet command output", () => {
       image: "image",
       created: "2026-01-01T00:00:00.000Z",
       dataDir: "/tmp/acme",
-      container: { state: "running", running: true, managed: true },
+      container: {
+        state: "running",
+        running: true,
+        managed: true,
+        imageId: "sha256:live-image",
+      },
       health: {
         status: "ok" as const,
         url: "http://127.0.0.1:19100/healthz",
@@ -134,5 +139,28 @@ describe("fleet command output", () => {
 
     expect(mocks.defaultRuntime.writeJson).toHaveBeenCalledWith(status);
     expect(mocks.runtimeLogs).toContain("Removed fleet cell acme; data retained.");
+  });
+
+  it("prints the live image id in human status output", async () => {
+    mocks.status.mockResolvedValue({
+      tenant: "acme",
+      containerName: "openclaw-cell-acme",
+      runtime: "docker",
+      port: 19_100,
+      image: "image",
+      created: "2026-01-01T00:00:00.000Z",
+      dataDir: "/tmp/acme",
+      container: {
+        state: "running",
+        running: true,
+        managed: true,
+        imageId: "sha256:live-image",
+      },
+      health: { status: "ok", url: "http://127.0.0.1:19100/healthz", httpStatus: 200 },
+    });
+
+    await runFleetStatusCommand({ tenant: "acme", json: false });
+
+    expect(mocks.runtimeLogs).toContain("Image ID: sha256:live-image");
   });
 });

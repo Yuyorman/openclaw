@@ -12,6 +12,8 @@ title: "Fleet"
 
 Fleet is **experimental**. Command names, flags, output shapes, and the container profile can change between releases without a deprecation window while the surface settles.
 
+Fleet is tested on Linux and macOS hosts. Windows hosts are currently untested.
+
 Fleet supports Docker and Podman. The default image is `ghcr.io/openclaw/openclaw:latest`.
 
 ## Quick start
@@ -85,6 +87,8 @@ Image references are passed as one container-runtime argument. Empty references 
 The selected Docker or Podman endpoint must be local. Fleet rejects remote Docker contexts, `DOCKER_HOST` endpoints, and remote Podman services before reserving a port or creating local state; remote cell hosts need a separate storage and endpoint contract and are deferred from this MVP.
 
 The create result includes the tenant ID, container name, host port, Gateway token, and local URL. Even in JSON output, treat the result as secret-bearing because it contains the token.
+
+When Fleet starts a new cell, create waits up to about a minute for its Gateway to answer `/healthz`. If the cell does not become healthy, Fleet leaves its container and registry row intact for `fleet status`, `fleet logs`, or explicit removal. `--no-start` skips this health gate. The generated Gateway token of an unhealthy new cell is not lost — it remains in the container environment (`docker|podman inspect`), and because the cell has served no traffic yet, `fleet rm --force` followed by a fresh create is always a safe alternative.
 
 ## `fleet list`
 
@@ -166,6 +170,10 @@ Move the cell to another image:
 openclaw fleet upgrade acme --image ghcr.io/openclaw/openclaw:<version>
 ```
 
+### Pinning by digest
+
+Create and upgrade accept digest-pinned image references such as `--image ghcr.io/openclaw/openclaw@sha256:<digest>`. Fleet passes the image reference through verbatim to Docker or Podman, which lets an operator keep a cell on immutable image bytes instead of a moving tag.
+
 Upgrade pulls the target image, inspects the existing container and per-cell network, stops and removes the container, then recreates and starts it. The replacement preserves the same host port, data directories, per-cell bridge network, runtime profile, resource limits, restart policy, Fleet-managed environment, and values originally supplied with `--env`. Mounted state survives container replacement; image-default environment can change with the target image.
 
 The replacement is committed only after its Gateway answers `/healthz` on the cell's loopback port, matching the health contract the official compose file uses. A replacement that exits, crash-loops, or fails to become healthy within about a minute is removed and the previous container is restored, so a broken image does not take down a working cell.
@@ -195,6 +203,32 @@ openclaw fleet rm acme --purge-data --force
 Fleet removes the cell container before removing its dedicated bridge network. `--purge-data` requires `--force`. Before recursive deletion, Fleet resolves both Fleet-owned roots and both per-tenant directories. Each target must be the exact expected tenant leaf, strictly inside its root, and not a symlink. These containment checks prevent a corrupted registry path or cross-tenant symlink from redirecting deletion elsewhere.
 
 Purge is retryable when an exact expected tenant directory is already absent. This lets a later invocation finish cleanup after a partial filesystem failure without relaxing the path checks for directories that still exist.
+
+## Backup and restore
+
+Take a cold backup so the cell's SQLite databases are not copied while live and potentially crash-inconsistent:
+
+```bash
+openclaw fleet stop <tenant>
+# Archive both directories:
+# <state-dir>/fleet/cells/<tenant>/
+# <state-dir>/fleet/auth-profile-secrets/<tenant>/
+openclaw fleet start <tenant>
+```
+
+Both directories are required. The auth-profile-secrets directory holds the encryption keys for credentials stored inside the cell state directory; a state-only archive cannot restore those encrypted credentials.
+
+Also record the original create options. Image or digest, runtime, `--env` values, memory, CPU, PID limit, port, and Gateway token are container or registry settings and are not all recoverable from those two directories.
+
+To restore a cell, first recreate its registry row and stopped container, then replace both new directory contents with the archived contents:
+
+```bash
+openclaw fleet create <tenant> --no-start [--port <port>] [--gateway-token <existing-token>]
+# Restore both archived directory contents, preserving ownership described below.
+openclaw fleet start <tenant>
+```
+
+Reapply every non-default original create option, especially `--image` (including a digest pin), `--runtime`, repeated `--env`, `--memory`, `--cpus`, and `--pids-limit`. Use the original Gateway token when clients must retain the same credential. Keep restored paths writable by the effective container user as described in [Storage and container layout](#storage-and-container-layout).
 
 ## Storage and container layout
 

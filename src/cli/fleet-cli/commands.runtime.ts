@@ -82,6 +82,9 @@ export async function runFleetStatusCommand(options: {
   defaultRuntime.log(`State: ${result.container.state}`);
   defaultRuntime.log(`Port: ${result.port}`);
   defaultRuntime.log(`Image: ${result.image}`);
+  if (result.container.imageId) {
+    defaultRuntime.log(`Image ID: ${result.container.imageId}`);
+  }
   defaultRuntime.log(`Created: ${result.created}`);
   defaultRuntime.log(`Data: ${result.dataDir}`);
   defaultRuntime.log(`Health: ${formatHealth(result.health)}`);
