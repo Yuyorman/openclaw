@@ -880,7 +880,6 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     try {
       const result = searchSessionTranscripts({
         agentId,
-        config: cfg,
         query,
         limit: params.limit,
         ...(sessionKeys ? { sessionKeys } : {}),

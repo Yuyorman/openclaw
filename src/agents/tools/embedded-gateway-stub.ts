@@ -267,7 +267,6 @@ async function handleSessionsSearch(params: Record<string, unknown>) {
     requestedAgentId ?? agentIds.values().next().value ?? rt.resolveDefaultAgentId(cfg);
   const result = rt.searchSessionTranscripts({
     agentId,
-    config: cfg,
     query,
     limit: readPositiveIntegerParam(params, "limit"),
     ...(sessionKeys ? { sessionKeys } : {}),

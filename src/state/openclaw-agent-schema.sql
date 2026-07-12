@@ -230,20 +230,16 @@ CREATE TABLE IF NOT EXISTS memory_index_state (
   revision INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS session_transcript_files (
+CREATE TABLE IF NOT EXISTS session_transcript_index_state (
   session_id TEXT NOT NULL PRIMARY KEY,
-  session_key TEXT NOT NULL,
-  path TEXT NOT NULL UNIQUE,
-  indexed_bytes INTEGER NOT NULL DEFAULT 0,
-  leaf_id TEXT,
-  mtime INTEGER NOT NULL DEFAULT 0,
-  size INTEGER NOT NULL DEFAULT 0,
+  indexed_seq INTEGER NOT NULL,
+  leaf_event_id TEXT,
+  needs_rebuild INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS session_transcript_fts USING fts5(
   text,
-  session_key UNINDEXED,
   session_id UNINDEXED,
   message_id UNINDEXED,
   role UNINDEXED,
@@ -303,6 +299,3 @@ CREATE INDEX IF NOT EXISTS idx_memory_index_chunks_path
 
 CREATE INDEX IF NOT EXISTS idx_memory_index_chunks_source
   ON memory_index_chunks(source);
-
-CREATE INDEX IF NOT EXISTS idx_session_transcript_files_session_key
-  ON session_transcript_files(session_key);
