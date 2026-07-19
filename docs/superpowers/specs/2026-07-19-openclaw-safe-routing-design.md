@@ -166,7 +166,7 @@ effect_safety  = CLEAN | COMMITTED | INDETERMINATE | RECONCILED
 | `task_safety_state` | 完成度、降级、阻塞、复核和副作用安全 | Phase 1 |
 | `model_capability_snapshots` | 不可变能力声明和探针结果 | Phase 1 |
 | `model_route_attempts` | 候选过滤、切换和故障域审计 | Phase 1 |
-| `task_checkpoints` | 可移交检查点和证据摘要 | Phase 2 |
+| `task_checkpoints` | Phase 1 保存最小只读检查点，Phase 2 启用可续跑交接语义 | Phase 1 |
 | `effects` | 非交付类外部动作账本 | Phase 3 |
 | `task_reviews` | 独立复核记录 | Phase 4 |
 | `finalizations` | 正式终结门禁快照 | Phase 5 |
@@ -417,7 +417,7 @@ FinalizationRejectedError
 - 不切换真实模型，不改变候选顺序。
 - 不接管主会话，不发送、导出或发布。
 - 只计算“候选是否满足、理论上会选谁”。
-- 只写 TaskContract、Safety State、能力快照和 route attempts。
+- 只写 TaskContract、Safety State、最小只读 checkpoint、能力快照和 route attempts。
 - 输出内部审计报告；未验证能力显示 `unverified`。
 
 ## 15. 能力探针
@@ -533,11 +533,11 @@ src/agents/tool-effects/
 
 ### Phase 1：影子能力门
 
-只创建 `task_contracts`、`task_safety_state`、`model_capability_snapshots`、`model_route_attempts`。普通任务行为必须零变化，影子判断不得改变候选，且关闭开关必须立即恢复原行为。
+只创建 `task_contracts`、`task_safety_state`、`task_checkpoints`、`model_capability_snapshots`、`model_route_attempts`。其中 checkpoint 仅记录规范化输入 digest、契约 digest、策略版本和能力快照引用，不启用跨模型续跑。普通任务行为必须零变化，影子判断不得改变候选，且关闭开关必须立即恢复原行为。
 
-### Phase 2：真实文本能力门与检查点
+### Phase 2：真实文本能力门与可续跑检查点
 
-仅启用只读低风险任务。不合格模型调用次数为零；全链不可用时准确进入 `CAPABLE_MODEL`。
+仅启用只读低风险任务。不合格模型调用次数为零；全链不可用时准确进入 `CAPABLE_MODEL`。在 Phase 1 最小 checkpoint 上增加可移交消息投影、工具结果指针、源指纹、已完成步骤和未完成事项，再启用跨模型续跑。
 
 ### Phase 3：Effect Ledger
 
