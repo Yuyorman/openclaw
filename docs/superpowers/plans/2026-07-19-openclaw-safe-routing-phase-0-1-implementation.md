@@ -4,7 +4,9 @@
 
 **目标：** 在不改变任何现有真实模型选择和 fallback 行为的前提下，实现可关闭的文本只读影子路由，并持久化任务契约、最小 checkpoint、能力快照和候选决策证据。
 
-**架构：** Core 提供规范化数据、共享 SQLite 事实源、候选预览和状态转换服务；`extensions/safe-routing` 只提供配置、显式 CLI 试点入口和审计输出。本阶段不将安全门接入真实 `runWithModelFallback` 执行循环；Phase 2 在复用同一候选评估器的基础上接入 enforce。
+**架构：** Core 提供规范化数据、共享 SQLite 事实源、候选预览和只读观测适配器；`extensions/safe-routing` 驻留在活网关，通过现有 typed hook 被动收集实际模型调用，并通过 gateway method 提供显式 CLI 控制/查询。本阶段不将安全门接入真实 `runWithModelFallback` 执行循环；Phase 2 在复用同一候选评估器的基础上接入 enforce。
+
+**Core 例外边界：** 这是用户已批准的专项 Core 补丁，但 Phase 1 只新增事实存储、租约 CAS、网关内只读适配和窄 SDK；不扩展 `TaskStatus`，不改 live fallback，不改 gateway/protocol/UI，不接 Effect Ledger 或正式交付。每个 Core 文件都必须在提交说明中记录上游冲突面和后续移除条件。
 
 **技术栈：** TypeScript、Node.js SQLite、Kysely、Vitest、OpenClaw Plugin SDK、现有 `resolveModelCandidateChain`。
 
@@ -29,10 +31,11 @@
 
 - 功能开发基线：`origin/main@2e2366b6d394e5e4300642155759a2ab62db7816`，包版本 `2026.7.2`。
 - 当前 WIP 集成分支：`wip/subagent-health-v1`，不在其脏工作区中实施 Core 功能。
-- 实际运行版本：`2026.7.1-2 / 0790d9f`，影子功能验收后才安排构建和替换。
+- 实际运行版本：npm-global `2026.7.1-2 / 0790d9f`；该对象当前不在仓库中，未完成来源和差异审计前不得替换。
 - 新分支：`feature/safe-routing-shadow-v1`。
 - 新 worktree：`D:\\工作区\\Codex项目\\openclaw-safe-routing-shadow-v1`。
 - 规范文档提交 `0d40b0c2` 和修正提交 `0c1dc60c` 在新 worktree 上单独 cherry-pick。
+- 设计取证快照为 `a1376194`，仅作事实来源，不作为开发基线；它比 `2e2366b6` 多出的 15 个 subagent-health 提交不进入本分支。
 
 ---
 
@@ -72,7 +75,7 @@ git rev-parse --show-toplevel
 node -p "require('./package.json').version"
 ```
 
-预期：分支为 `feature/safe-routing-shadow-v1`，包版本为 `2026.7.2`，无功能脏改动。
+预期：分支为 `feature/safe-routing-shadow-v1`，包版本为 `2026.7.2`，无功能脏改动。若目标是 npm-global 生产影子试点，先停止并取得 `0790d9f` 的源码/构建来源；在此之前只允许隔离测试网关。
 
 **Step 4: 安装依赖并运行定向基线**
 
@@ -94,7 +97,7 @@ pnpm lint:kysely
 1. 先确认在干净 `origin/main` 基线上可复现。
 2. 将修复做成独立前置提交，不与 safe-routing 功能混合。
 3. 对 SQLite 测试连续运行三次，确认不是偶然绿。
-4. 基线未稳定前不进入 Task 1。
+4. 基线未稳定前不进入 Task 1；若 clean-base 与设计取证快照存在行为差异，记录差异并以 `2e2366b6` 的实测结果为准。
 
 **Step 6: 提交**
 
@@ -109,7 +112,7 @@ pnpm lint:kysely
 - Create: `src/tasks/safety/contracts.ts`
 - Create: `src/tasks/safety/contracts.test.ts`
 - Reuse: `src/agents/stable-stringify.ts`
-- Reuse: `src/infra/crypto-digest.ts` 或 Node `createHash`
+- Reuse: `src/infra/crypto-digest.ts` 的 `sha256Hex`
 
 **Step 1: 写失败测试**
 
@@ -118,7 +121,7 @@ pnpm lint:kysely
 - 完整契约规范化后字段顺序稳定。
 - 同义输入产生相同 digest。
 - modality、decision grade、risk class、delivery mode 和 data policy 的非法值被拒绝。
-- `minEffectiveContextTokens` 和 `minOutputTokens` 必须是正整数。
+- `minContextWindowTokens` 和 `minOutputTokens` 必须是正整数。
 - `runtimeIds` 和 modalities 去重、排序并且不保存空字符串。
 - digest 不包含运行时、创建时间或随机值。
 
@@ -142,7 +145,7 @@ normalizeTaskContract(input)
 digestTaskContract(contract)
 ```
 
-使用现有 `stableStringify`，digest 格式固定为 `sha256:<64 lowercase hex>`。不增加通用 schema 框架或可配置抽象。
+使用现有 `stableStringify` 和 `sha256Hex`，digest 格式固定为 `sha256:<64 lowercase hex>`。不增加通用 schema 框架或可配置抽象。
 
 **Step 4: 运行测试**
 
@@ -161,65 +164,54 @@ git commit -m "feat(tasks): define safe routing task contracts"
 
 ---
 
-### Task 2: 增加受管任务安全状态和转换约束
+### Task 2: 接入网关内只读观测租约和 typed hook 关联
 
 **文件：**
 
-- Modify: `src/tasks/task-registry.types.ts`
-- Modify: `src/tasks/task-status.ts`
-- Modify: `src/tasks/task-executor-policy.ts`
-- Modify: `src/tasks/task-registry.ts`
-- Modify: `src/tasks/task-registry.summary.ts`
-- Create: `src/tasks/safety/state.ts`
-- Create: `src/tasks/safety/transitions.ts`
-- Create: `src/tasks/safety/transitions.test.ts`
-- Modify tests: `src/tasks/task-executor-policy.test.ts`
-- Modify tests: `src/tasks/task-status.test.ts`
-- Modify tests: `src/tasks/task-registry.test.ts`
+- Create: `src/tasks/safety/observation-lease.ts`
+- Create: `src/tasks/safety/observation-lease.test.ts`
+- Create: `src/agents/model-routing/observed-attempt.ts`
+- Create: `src/agents/model-routing/observed-attempt.test.ts`
+- Reuse without modification: `src/plugins/hook-types.ts`
+- Reuse without modification: `src/agents/embedded-agent-runner/run/attempt.model-diagnostic-events.ts`
 
 **Step 1: 写失败测试**
 
-- `blocked` 是 active/non-terminal，不触发 terminal delivery 和 cleanup。
-- 历史 `terminalOutcome=blocked` 仍是终态语义，不等于 `status=blocked`。
-- 只有挂载 Safety State 的任务能进入新 `blocked`。
-- `INDETERMINATE` 只能对应 `blocked/UNSAFE_RETRY`。
-- `APPROVED` 必须绑定当前 checkpoint。
-- Phase 1 服务拒绝创建 `deliveryMode=internal/formal` 的试点任务；底层状态校验同时保证 formal 任务没有 ACTIVE finalization 证明时不能进入 `succeeded`。
-- `deliveryMode=none` 的影子任务可以在无 finalization 时正常结束。
-- 旧 `rowVersion` 的更新被拒绝。
+- 观测租约只能由 gateway method 创建，拥有短 TTL、单次消费和 contract/config digest 绑定。
+- 普通会话没有租约时，`model_call_started` / `model_call_ended` 只经过现有空检查，不写安全路由事实。
+- 活网关收到匹配的 `model_call_started` 后，以 CAS 绑定首个 `runId/callId`；并发调用不能抢占。
+- started/ended 缺配对、进程中断、租约过期或配置指纹变化时，观测为 `partial`，不得进入一致率分母。
+- 事件中没有证据的 auth profile、runtime、endpoint、cooldown 和 failure domain 均为 `unverified`。
+- 观测处理不得调用 `resolveAuthProfileOrder`，不得清理或改变 cooldown/order，也不得改变模型选择。
 
-**Step 2: 运行测试确认失败**
+**Step 2: 实现最小关联器**
 
-```powershell
-pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/transitions.test.ts src/tasks/task-executor-policy.test.ts src/tasks/task-status.test.ts
-```
-
-**Step 3: 实现最小状态机**
-
-导出类型和函数：
+实现只读数据结构：
 
 ```ts
-TaskSafetyState
-TaskSafetyTransition
-TaskSafetyTransitionError
-validateTaskSafetyState(state, taskStatus, contract)
-applyTaskSafetyTransition(current, transition)
+ObservationLease
+ObservedModelAttempt
+createObservationLease(...)
+consumeObservationLease(...)
+correlateModelCallEvent(...)
 ```
 
-不让插件或模型直接构造“下一状态”；它们只提交有限的 transition intent。
+租约绑定只保存 `sha256(taskId + sessionKey)` 任务域 hash，不保存原始 session key。事件字段沿用现有 typed hook 已提供的 `runId`、`callId`、provider、model、api、transport 和 context window 事实。
 
-**Step 4: 运行定向测试**
+**Step 3: 运行定向测试**
 
 ```powershell
-pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/transitions.test.ts src/tasks/task-executor-policy.test.ts src/tasks/task-status.test.ts src/tasks/task-registry.test.ts
+pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/observation-lease.test.ts
+pnpm exec vitest run --config test/vitest/vitest.agents-core.config.ts src/agents/model-routing/observed-attempt.test.ts
+pnpm exec vitest run --config test/vitest/vitest.plugins.config.ts src/plugins/wired-hooks-llm.test.ts
 ```
 
-**Step 5: 提交**
+**Step 4: 提交**
 
 ```powershell
-git add -- src/tasks/task-registry.types.ts src/tasks/task-status.ts src/tasks/task-executor-policy.ts src/tasks/task-registry.ts src/tasks/task-registry.summary.ts src/tasks/safety/state.ts src/tasks/safety/transitions.ts src/tasks/safety/transitions.test.ts src/tasks/task-executor-policy.test.ts src/tasks/task-status.test.ts src/tasks/task-registry.test.ts
+git add -- src/tasks/safety/observation-lease.ts src/tasks/safety/observation-lease.test.ts src/agents/model-routing/observed-attempt.ts src/agents/model-routing/observed-attempt.test.ts
 git diff --cached --check
-git commit -m "feat(tasks): add managed task safety states"
+git commit -m "feat(safe-routing): correlate gateway model observations"
 ```
 
 ---
@@ -241,13 +233,13 @@ git commit -m "feat(tasks): add managed task safety states"
 
 **Step 1: 写失败测试**
 
-- 新建受管任务时，`task_runs`、`task_contracts`、`task_safety_state` 和首个最小 checkpoint 在同一事务提交。
-- 任一 insert 失败时四类记录全部回滚；内存 registry 也不得出现幽灵任务。
-- `task_safety_state.row_version` 使用 compare-and-swap，迟到写入不能覆盖新状态。
+- 新建影子任务时，`task_runs`、`task_contracts` 和首个最小 checkpoint 在同一事务提交。
+- 任一 insert 失败时三类记录全部回滚；内存 registry 也不得出现幽灵任务。
 - 相同 `(task_id, sequence)` checkpoint 不能重复。
+- observation lease 的 TTL、单次消费和 `bound_run_id/bound_call_id` 使用 checkpoint row version CAS，迟到或并发绑定必须失败。
 - capability snapshot 按 digest 复用，但已经引用的 snapshot 不原地改写。
 - route attempt 必须引用存在的 task、checkpoint 和 snapshot。
-- 旧任务不自动补写安全表；只有显式创建的受管任务进入新链路。
+- 旧任务不自动补写安全表；只有显式创建的影子任务进入新链路。
 
 **Step 2: 增加最小 additive schema**
 
@@ -260,39 +252,35 @@ task_contracts
   risk_class, review_required, delivery_mode
   routing_policy_version, created_at, updated_at
 
-task_safety_state
-  task_id PK/FK task_runs
-  phase, execution_mode, completion, block_reason
-  review, effect_safety
-  current_checkpoint_id, reviewed_checkpoint_id
-  evidence_complete, achieved_decision_grade
-  row_version, created_at, updated_at
-
 task_checkpoints
   checkpoint_id PK
   task_id FK task_runs, sequence
   contract_digest, input_digest, routing_policy_version
   capability_snapshot_ids_json, manifest_json
+  observation_lease_id, lease_expires_at, lease_state
+  bound_run_id, bound_call_id, row_version
   created_at
   UNIQUE(task_id, sequence)
 
 model_capability_snapshots
   snapshot_id PK
-  provider, model, runtime_id
+  provider, model, runtime_id NULLABLE
   verification_status, capabilities_json, evidence_json
   snapshot_digest UNIQUE, created_at, expires_at
 
 model_route_attempts
   attempt_id PK
   task_id FK, checkpoint_id FK
-  ordinal, provider, model, runtime_id
+  ordinal, provider, model, runtime_id NULLABLE
+  run_id NULLABLE, call_id NULLABLE
   capability_snapshot_id FK
   evaluation_mode, eligibility
   rejection_code, rejection_reason, would_select
-  failure_domain_json, created_at
+  auth_profile_ref NULLABLE, endpoint_id NULLABLE
+  failure_domain_json, observation_completeness, created_at
 ```
 
-为 `(task_id, checkpoint_id, ordinal)`、`(provider, model, created_at)` 和状态查询建立必要索引。Phase 1 不建立 `effects`、`finalizations`、`delivery_outbox`，避免先造空壳事务。
+为 `(task_id, checkpoint_id, ordinal)`、`(provider, model, created_at)` 和观测关联查询建立必要索引。Phase 1 不建立 `task_safety_state`、`effects`、`finalizations`、`delivery_outbox`，避免先造空壳状态和事务。
 
 **Step 3: 生成 Kysely 类型并检查漂移**
 
@@ -309,14 +297,12 @@ pnpm lint:kysely
 ```ts
 createManagedTaskWithCheckpoint(...)
 getTaskContract(taskId)
-getTaskSafetyState(taskId)
-compareAndSetTaskSafetyState(...)
 putCapabilitySnapshot(...)
 appendRouteAttempts(...)
 listRouteAttempts(taskId, checkpointId)
 ```
 
-插件不得直接获取 Kysely handle。`createManagedTaskWithCheckpoint` 复用 task registry 的数据库事务；只有事务成功后才更新内存 registry。
+插件不得直接获取 Kysely handle。`createManagedTaskWithCheckpoint` 复用 task registry 的数据库事务；只有事务成功后才更新内存 registry。Phase 1 不扩展 `TaskStatus`、gateway/protocol/UI 映射或状态转换服务。
 
 **Step 5: 运行定向测试并做 Windows 稳定性验证**
 
@@ -349,14 +335,13 @@ git commit -m "feat(state): persist safe routing shadow facts"
 - Create: `src/agents/model-routing/capability-snapshot.test.ts`
 - Create: `src/agents/model-routing/candidate-admission.ts`
 - Create: `src/agents/model-routing/candidate-admission.test.ts`
-- Modify if needed: `src/agents/model-fallback.types.ts`
 - Reuse: `src/config/types.models.ts`
-- Reuse: `src/agents/model-fallback.ts`
+- Reuse without modification: `src/agents/model-fallback.ts`
 
 **Step 1: 写失败测试**
 
 - 配置声明、运行时上限和观测证据汇总为一个 immutable snapshot。
-- effective context/output limit 取已知约束中的最小值，不取最乐观值。
+- 静态 context window/output limit 取已知约束中的最小值，不取最乐观值；不读取动态累计 token usage。
 - 配置与观测冲突时标记 `contradicted`，并采用更保守值。
 - 未经探针证明的 structured output、tool calling、runtime 或 modality 标记 `unverified`。
 - 契约要求的字段为 unknown/unverified/contradicted 且不能证明满足时，候选被拒绝。
@@ -381,6 +366,8 @@ evaluateCandidateAdmission(contract, snapshot, policy)
 
 Phase 1 首批只支持 `text`、`image` 两种 modality；`audio` 契约可以被解析，但没有已验证候选时必须拒绝。不要把 provider 名称或“同档模型”当作能力证据。
 
+Phase 1 admission 只返回静态窗口、模态、工具、结构化输出和数据策略判断；不填充 `resolvedRuntimeId`、auth target 或 failure domain，相关字段必须显式为 `unverified`。这些字段的真实解析属于 Phase 2 live loop observer。
+
 **Step 3: 运行定向测试**
 
 ```powershell
@@ -391,14 +378,14 @@ pnpm check
 **Step 4: 提交**
 
 ```powershell
-git add -- src/agents/model-routing/capability-snapshot.ts src/agents/model-routing/capability-snapshot.test.ts src/agents/model-routing/candidate-admission.ts src/agents/model-routing/candidate-admission.test.ts src/agents/model-fallback.types.ts
+git add -- src/agents/model-routing/capability-snapshot.ts src/agents/model-routing/capability-snapshot.test.ts src/agents/model-routing/candidate-admission.ts src/agents/model-routing/candidate-admission.test.ts
 git diff --cached --check
 git commit -m "feat(agents): evaluate model capability snapshots"
 ```
 
 ---
 
-### Task 5: 实现只读影子路由评估和审计写入
+### Task 5: 在活网关内评估理论准入并写入模型级审计
 
 **文件：**
 
@@ -407,62 +394,52 @@ git commit -m "feat(agents): evaluate model capability snapshots"
 - Create: `src/agents/model-routing/route-attempt-observer.ts`
 - Create: `src/tasks/safety/service.ts`
 - Create: `src/tasks/safety/service.test.ts`
-- Modify minimally: `src/agents/model-fallback.ts`
+- Reuse without modification: `src/agents/model-fallback.ts`
+- Reuse without modification: `src/plugins/hook-types.ts`
 
 **Step 1: 写失败测试**
 
-构造 A/B/C 候选：A 是当前 primary，B 能力不足，C 能力满足且故障域独立。验证：
+构造 A/B/C 候选：A 是当前真实选择，B 能力不足，C 理论上满足。验证：
 
-- 当前真实选择仍是 A；影子输出只报告理论选择 C。
-- 影子评估不得调用模型、工具或 provider health mutation。
-- B 的每个拒绝理由有机器码和可读证据。
-- 候选顺序、snapshot id、contract digest 和 routing policy version 全部落库。
-- 同一完整解析后的 route target 在同一 task/checkpoint 默认只记一次评估；只有显式、安全且有策略依据的重试才允许新 attempt。
+- 活网关当前真实调用仍是 A；理论评估只报告 C，不改变候选顺序或执行。
+- evaluator 使用活网关当前进程的 plugin registry、环境和配置；独立进程的 registry 结果不能冒充 live 真值。
+- evaluator 不调用模型、工具、`resolveAuthProfileOrder` 或任何 provider health mutation。
+- B 的每个拒绝理由有机器码和可读证据；静态 context window 不读取动态累计 token usage。
+- `model_call_started` / `model_call_ended` 事件能关联到租约、task/checkpoint 和 route attempt；缺配对时标记 `partial`。
+- auth profile、runtime、endpoint、cooldown 和 failure domain 没有事件证据时标为 `unverified`。
+- 同一模型级 `(provider, model)` 在同一 task/checkpoint 默认只记一次；完整 route-target 去重和一次尝试限制推迟 Phase 2。
 - 批量写 route attempts 失败时，不留下半条候选链。
-- 当前配置若没有合格候选，输出 `WAITING_CAPABLE_MODEL` 的派生建议，但不改变真实任务路由。
 
-**Step 2: 实现纯评估器**
+**Step 2: 实现网关内纯评估器和观测适配器**
 
-复用现有导出的 `resolveModelCandidateChain` 构建当前候选顺序，新增：
+复用现有导出的 `resolveModelCandidateChain` 构建当前模型级候选顺序，但只在活网关服务中调用。新增：
 
 ```ts
 evaluateShadowRoute({ contract, candidates, snapshots, policy })
-recordShadowRouteEvaluation(...)
+recordObservedModelAttempt(...)
 ```
 
-返回：
+返回理论选择、候选准入决定、拒绝原因、观测完整性和 policy version。`model-fallback.ts` 不因复用该导出而修改；不要捕获 live fallback 异常、替换候选链或自行调用会改变冷却状态的解析器。
 
-```ts
-{
-  currentSelection,
-  theoreticalSelection,
-  candidateDecisions,
-  derivedBlockReason,
-  policyVersion,
-}
-```
+**Step 3: 实现 Core 安全服务和 gateway method 适配**
 
-不要改 `runWithModelFallback`、不要捕获它的异常重试、不要替换其候选链。若为共享纯函数而调整 `model-fallback.ts`，必须保证现有调用签名和结果完全不变。
-
-**Step 3: 实现 Core 安全服务**
-
-`service.ts` 组合 TaskContract、snapshot resolver、shadow evaluator 和 store，但只暴露读/追加事实能力；禁止调用 live fallback 执行器。
+`service.ts` 组合 TaskContract、当前进程 resolver、shadow evaluator、观测租约和 store，只暴露窄口径的创建租约、评估和审计查询。普通任务没有租约时只经过 hook 空检查，不写事实。插件不得直接获取 Kysely handle，也不得在 CLI 进程复制路由逻辑。
 
 **Step 4: 运行测试**
 
 ```powershell
-pnpm exec vitest run --config test/vitest/vitest.agents-core.config.ts src/agents/model-routing/shadow-evaluator.test.ts
+pnpm exec vitest run --config test/vitest/vitest.agents-core.config.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/observed-attempt.test.ts
 pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/service.test.ts
-pnpm exec vitest run --config test/vitest/vitest.agents-core.config.ts src/agents/model-fallback.test.ts
+pnpm exec vitest run --config test/vitest/vitest.plugins.config.ts src/plugins/wired-hooks-llm.test.ts
 pnpm check
 ```
 
 **Step 5: 提交**
 
 ```powershell
-git add -- src/agents/model-routing/shadow-evaluator.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/route-attempt-observer.ts src/tasks/safety/service.ts src/tasks/safety/service.test.ts src/agents/model-fallback.ts
+git add -- src/agents/model-routing/shadow-evaluator.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/route-attempt-observer.ts src/tasks/safety/service.ts src/tasks/safety/service.test.ts
 git diff --cached --check
-git commit -m "feat(agents): add read-only shadow route evaluation"
+git commit -m "feat(agents): add gateway shadow route observation"
 ```
 
 ---
@@ -489,25 +466,26 @@ rg -n "registerCli|plugin-sdk|services:" packages/plugin-sdk src extensions -g "
 
 **Step 2: 写失败测试**
 
-插件侧只能调用：
+插件侧只能调用活网关提供的窄口径服务：
 
 ```ts
-createShadowTask(contract, inputDigest)
-evaluateShadowRoute(taskId)
+createShadowObservationLease(contract, sessionKey)
+evaluateShadowRouteInGateway(leaseId)
 getShadowAudit(taskId)
 ```
 
 验证：
 
 - SDK 不暴露数据库 handle、任意 SQL、任意状态写入或 enforce API。
-- `createShadowTask` 强制 `deliveryMode=none`，并创建首个 checkpoint。
+- `createShadowObservationLease` 强制 `deliveryMode=none`，创建首个最小 checkpoint，并设置短 TTL/单次消费。
 - 非受管 task id、损坏契约或不存在 checkpoint 返回稳定错误码。
+- gateway method 必须在活网关进程执行；CLI 进程不得自行加载 registry、auth store 或 provider health。
 - 返回值不含 provider token、base URL credentials、会话正文或隐藏推理。
 - API baseline 能检测意外导出扩大。
 
 **Step 3: 实现适配层**
 
-Runtime adapter 只转发到 Task 5 的 Core service。插件进程不得自行重新解析配置或复制路由逻辑。
+Runtime adapter 只转发到 Task 5 的 Core service。插件进程不得自行重新解析配置或复制路由逻辑；Phase 1 不暴露 enforce 或状态转换 API。
 
 **Step 4: 更新并核对 SDK API baseline**
 
@@ -518,7 +496,7 @@ pnpm check:architecture
 pnpm check
 ```
 
-检查生成 diff，只接受与 `safe-routing` 三个方法和相关类型直接对应的变化。
+检查生成 diff，只接受与 `safe-routing` 三个只读方法和相关类型直接对应的变化。
 
 **Step 5: 提交**
 
@@ -566,7 +544,7 @@ git sparse-checkout add extensions/safe-routing
 - `approvedProviders` 缺失或 `allowedTaskKinds` 不含固定的 `safe-routing-readonly-shadow` 时拒绝运行。
 - `mode=off` 不创建 task、checkpoint、snapshot 或 route attempt。
 - CLI 输出 JSON 稳定、可审计，不输出密钥、会话正文或 provider 私有配置。
-- 扩展不注册模型 tool，不监听普通聊天，不修改全局 fallback。
+- 扩展只注册 gateway method 和显式 CLI，不注册模型 tool，不监听普通聊天，不修改全局 fallback。
 
 **Step 3: 实现扩展清单和配置 schema**
 
@@ -587,18 +565,18 @@ Phase 1 最小配置：
 命令：
 
 ```powershell
-openclaw safe-routing shadow --contract <path> --json
+openclaw safe-routing shadow --contract <path> --session <session-key> --json
 ```
 
 行为：
 
-1. 读取并校验契约文件。
+1. 读取并校验契约文件，确认 `deliveryMode=none`。
 2. Phase 1 只接受固定 task kind `safe-routing-readonly-shadow`，且配置 allowlist 必须显式包含它。
-3. 创建 `deliveryMode=none` 的影子任务与 checkpoint。
-4. 读取当前已解析模型链和能力快照，执行一次理论评估。
-5. 输出 `taskId`、current selection、theoretical selection、rejections、snapshot verification status 和 policy version。
+3. 通过认证 gateway method 在活网关创建短 TTL、单次消费的 observation lease 和最小 checkpoint。
+4. 由活网关读取当前进程 registry/config、执行理论评估，并在下一次匹配的 model-call hook 上关联实际调用。
+5. CLI 只查询并输出 `taskId`、current selection、theoretical selection、rejections、observation completeness、snapshot verification status 和 policy version。
 
-命令不得发起模型请求、工具调用、消息发送、导出或发布。
+命令本身不得发起模型请求、工具调用、消息发送、导出或发布；它也不得在 CLI 进程内重新解析 auth order、cooldown 或 provider health。
 
 **Step 5: 运行扩展测试**
 
@@ -632,21 +610,22 @@ git commit -m "feat(safe-routing): add explicit shadow routing CLI"
 
 **Step 1: 写端到端测试场景**
 
-使用临时 SQLite 和假模型目录，覆盖：
+使用临时 SQLite、假模型目录和可控的 gateway hook harness，覆盖：
 
 1. 当前主模型 A 仍被真实路由选中。
 2. A 的快照不满足契约，B 满足；影子审计报告理论选择 B，但真实路由不变。
-3. 所有候选能力不足；报告 `CAPABLE_MODEL` 阻塞建议，任务可以以 `deliveryMode=none` 结束审计。
+3. 所有候选能力不足；报告 `CAPABLE_MODEL` 派生建议，影子任务仍按现有生命周期结束，不写 `blocked`。
 4. provider 未获数据策略批准；候选被拒绝。
-5. 同一候选由别名解析到同一完整 route target；默认只产生一次 attempt。
-6. CLI 重复读取审计不产生新 route attempts。
-7. `mode=off` 全程零写入。
+5. 活网关 registry/config 与离线 CLI 进程不同；CLI 结果仍以网关事实为准，离线 what-if 标记 live 字段 `unverified`。
+6. 同一模型级 `(provider, model)` 在同一 lease/checkpoint 默认只产生一次 observation；完整 route-target 去重留到 Phase 2。
+7. CLI 重复读取审计不产生新 route attempts。
+8. `mode=off` 全程零写入，普通会话只经过 hook 空检查。
 
 **Step 2: 执行定向回归**
 
 ```powershell
 pnpm exec vitest run --config test/vitest/vitest.agents-core.config.ts src/agents/model-routing/capability-snapshot.test.ts src/agents/model-routing/candidate-admission.test.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/shadow-evaluator.integration.test.ts src/agents/model-fallback.test.ts
-pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/contracts.test.ts src/tasks/safety/transitions.test.ts src/tasks/safety/store.sqlite.test.ts src/tasks/safety/service.test.ts src/tasks/task-registry.store.sqlite.test.ts src/tasks/task-registry.test.ts
+pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/contracts.test.ts src/tasks/safety/observation-lease.test.ts src/tasks/safety/store.sqlite.test.ts src/tasks/safety/service.test.ts src/tasks/task-registry.store.sqlite.test.ts src/tasks/task-registry.test.ts
 pnpm exec vitest run --config test/vitest/vitest.plugins.config.ts extensions/safe-routing/src/config.test.ts extensions/safe-routing/src/cli.test.ts extensions/safe-routing/src/cli.integration.test.ts
 ```
 
@@ -669,7 +648,7 @@ pnpm test:fast
 
 - `runWithModelFallback` 的 live candidate selection、重试和异常行为没有变化。
 - `openclaw.json` 的 primary/fallback 配置未变。
-- 普通会话不会触发 safe-routing 扩展。
+- 普通会话只经过 safe-routing hook 的空检查，不创建租约、不写事实、不改变候选或交付。
 - 扩展默认关闭；只在显式 CLI + allowlist 条件下写 shadow facts。
 - 数据库新增内容只有规范化契约、hash、能力/策略证据和路由审计，不含隐藏思维过程或会话正文。
 
@@ -691,10 +670,11 @@ git commit -m "test(safe-routing): verify phase 1 shadow routing"
 
 ### 启用前
 
-1. 记录构建 commit、OpenClaw 实际版本、配置文件 hash 和共享 SQLite 路径。
-2. 停止 OpenClaw 后复制 `openclaw.sqlite` 及其 `-wal/-shm`（如存在）到带时间戳备份目录，再启动服务。
-3. 首次部署保持 `mode=off`，确认普通会话、现有 fallback 和 task registry 回归正常。
-4. 只把 `safe-routing-readonly-shadow` 加入 allowlist，并配置已批准 provider 列表。
+1. 记录构建 commit、OpenClaw 实际版本、配置文件 hash、共享 SQLite 路径和受影响 agent 的 `openclaw-agent.sqlite` 路径。
+2. 在隔离测试网关复制相关 SQLite 文件及其 `-wal/-shm`（如存在）到带时间戳备份目录，再启动服务。
+3. 因 `0790d9f` 当前无法解析，Phase 1 不替换 npm-global 生产二进制；生产试点须先完成来源/差异审计并另行批准。
+4. 首次启动保持 `mode=off`，确认普通会话、现有 fallback 和 task registry 回归正常。
+5. 只把 `safe-routing-readonly-shadow` 加入 allowlist，并配置已批准 provider 列表。
 
 ### 小范围影子试点
 
@@ -712,14 +692,14 @@ Phase 1 不以“理论选择更好”为成功标准，而以以下硬指标验
 - shadow 事实完整且可复现；
 - 能力未知时拒绝而非猜测；
 - `mode=off` 零写入；
-- SQLite/CAS/事务测试稳定；
+- SQLite 事务、观测租约 CAS 和 typed hook 关联测试稳定；
 - 审计中无凭据、会话正文和隐藏思维过程。
 
 ### 回滚
 
 1. 将扩展设为 `mode=off` 或移除扩展启用项。
 2. 不删除 additive 数据表，不在运行中降级 schema；保留审计事实供复盘。
-3. 如果代码回滚到不认识新表的旧版本，旧版本应忽略 additive tables；先用备份副本验证再切换。
+3. 如果代码回滚到不认识新表的旧版本，旧版本应忽略 Phase 1 additive tables；先用备份副本验证再切换。
 4. 因 Phase 1 没有接管 live fallback，回滚不涉及恢复模型梯队或重放任务。
 
 ---
@@ -730,13 +710,13 @@ Phase 0-1 只有在以下证据同时具备时才算完成：
 
 - clean `origin/main` 基线及已知失败有可复现记录；
 - TaskContract 可规范化、可 hash、非法能力要求会被拒绝；
-- 受管任务的 contract/state/checkpoint 创建具备原子性；
-- 多维状态的转换约束和 CAS 防迟到写入已测试；
+- 影子任务的 contract/checkpoint 创建具备原子性；
+- 观测租约和首个 run/call 关联使用 CAS 防迟到/并发覆盖；
 - 能力快照区分 configured、observed、unverified、contradicted；
-- 影子评估不调用 live fallback，不改变真实候选选择；
+- 影子评估只在活网关读取当前 registry/config，不调用 live fallback，不改变真实候选选择；
 - 插件只获得窄口径 Core 服务，没有数据库直通；
 - 扩展默认 `off`，Phase 1 不存在 `enforce` 配置；
-- 所有新增定向测试通过，SQLite 定向测试连续三次通过；
+- 所有新增定向测试通过，SQLite 定向测试连续三次通过，partial 观测不进入一致率分母；
 - `pnpm check`、架构、Kysely 和 Plugin SDK 门禁通过，或有 clean-base 对照证明的存量失败记录；
 - 没有扩充文本或图片 fallback 链，没有接管普通会话，没有正式交付能力。
 
