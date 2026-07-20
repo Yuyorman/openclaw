@@ -175,12 +175,15 @@ git commit -m "feat(tasks): define safe routing task contracts"
 - Reuse without modification: `src/plugins/hook-types.ts`
 - Reuse without modification: `src/agents/embedded-agent-runner/run/attempt.model-diagnostic-events.ts`
 
+本任务只实现可注入 store 的租约/关联领域逻辑，不在此任务直接依赖 SQLite 或 gateway method。Task 3 接入持久化，Task 5/6 接入活网关和鉴权；在这些任务完成前，不宣称端到端观测已经成立。
+
 **Step 1: 写失败测试**
 
-- 观测租约只能由 gateway method 创建，拥有短 TTL、单次消费和 contract/config digest 绑定。
+- 观测租约只能由经过鉴权的 gateway method 创建，拥有短 TTL、单次消费和 contract/config/plugin-registry/candidate-chain digest 绑定。
 - 普通会话没有租约时，`model_call_started` / `model_call_ended` 只经过现有空检查，不写安全路由事实。
 - 活网关收到匹配的 `model_call_started` 后，以 CAS 绑定首个 `runId/callId`；并发调用不能抢占。
-- started/ended 缺配对、进程中断、租约过期或配置指纹变化时，观测为 `partial`，不得进入一致率分母。
+- Phase 1 只统计经过 embedded-agent model diagnostic dispatch 的调用；没有该 typed hook 覆盖的通用 `runWithModelFallback` 调用标记 `observationCoverage=out-of-scope`，不进入分母。
+- started/ended 缺配对、进程中断、租约过期或任一快照 digest 变化时，观测为 `partial`；observer 异步写入失败标记 `unavailable`；二者均不得进入一致率分母。
 - 事件中没有证据的 auth profile、runtime、endpoint、cooldown 和 failure domain 均为 `unverified`。
 - 观测处理不得调用 `resolveAuthProfileOrder`，不得清理或改变 cooldown/order，也不得改变模型选择。
 
@@ -196,7 +199,7 @@ consumeObservationLease(...)
 correlateModelCallEvent(...)
 ```
 
-租约绑定只保存 `sha256(taskId + sessionKey)` 任务域 hash，不保存原始 session key。事件字段沿用现有 typed hook 已提供的 `runId`、`callId`、provider、model、api、transport 和 context window 事实。
+租约接口接收服务端可解析的 `sessionRef`，不接收原始 session key。gateway 必须验证调用者拥有该 session，或具备显式 operator 读/管控 scope，再签发一次性 lease token；共享库只保存 session binding digest 和 token digest。事件字段沿用现有 typed hook 已提供的 `runId`、`callId`、provider、model、api、transport 和 context window 事实。
 
 **Step 3: 运行定向测试**
 
@@ -229,7 +232,7 @@ git commit -m "feat(safe-routing): correlate gateway model observations"
 - Modify: `src/tasks/task-registry.store.types.ts`
 - Modify: `src/tasks/task-registry.store.sqlite.ts`
 - Modify: `src/tasks/task-registry.ts`
-- Modify tests: `src/tasks/task-registry.store.sqlite.test.ts`
+- Modify tests: `src/tasks/task-registry.store.test.ts`
 
 **Step 1: 写失败测试**
 
@@ -256,8 +259,10 @@ task_checkpoints
   checkpoint_id PK
   task_id FK task_runs, sequence
   contract_digest, input_digest, routing_policy_version
+  config_digest, plugin_registry_digest, candidate_chain_digest
   capability_snapshot_ids_json, manifest_json
   observation_lease_id, lease_expires_at, lease_state
+  session_binding_digest, lease_token_digest
   bound_run_id, bound_call_id, row_version
   created_at
   UNIQUE(task_id, sequence)
@@ -277,7 +282,8 @@ model_route_attempts
   evaluation_mode, eligibility
   rejection_code, rejection_reason, would_select
   auth_profile_ref NULLABLE, endpoint_id NULLABLE
-  failure_domain_json, observation_completeness, created_at
+  failure_domain_json, observation_completeness, observation_coverage
+  observer_error_code, created_at
 ```
 
 为 `(task_id, checkpoint_id, ordinal)`、`(provider, model, created_at)` 和观测关联查询建立必要索引。Phase 1 不建立 `task_safety_state`、`effects`、`finalizations`、`delivery_outbox`，避免先造空壳状态和事务。
@@ -307,7 +313,7 @@ listRouteAttempts(taskId, checkpointId)
 **Step 5: 运行定向测试并做 Windows 稳定性验证**
 
 ```powershell
-pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/store.sqlite.test.ts src/tasks/task-registry.store.sqlite.test.ts src/tasks/task-registry.test.ts
+pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/store.sqlite.test.ts src/tasks/task-registry.store.test.ts src/tasks/task-registry.test.ts
 pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/store.sqlite.test.ts
 pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/store.sqlite.test.ts
 pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/store.sqlite.test.ts
@@ -320,7 +326,7 @@ SQLite 定向测试必须连续三次通过；出现 `EBUSY/EPERM` 时先修复�
 **Step 6: 提交**
 
 ```powershell
-git add -- src/state/openclaw-state-schema.sql src/state/openclaw-state-schema.generated.ts src/state/openclaw-state-db.generated.d.ts src/tasks/safety/store.types.ts src/tasks/safety/store.sqlite.ts src/tasks/safety/store.sqlite.test.ts src/tasks/task-registry.store.types.ts src/tasks/task-registry.store.sqlite.ts src/tasks/task-registry.ts src/tasks/task-registry.store.sqlite.test.ts
+git add -- src/state/openclaw-state-schema.sql src/state/openclaw-state-schema.generated.ts src/state/openclaw-state-db.generated.d.ts src/tasks/safety/store.types.ts src/tasks/safety/store.sqlite.ts src/tasks/safety/store.sqlite.test.ts src/tasks/task-registry.store.types.ts src/tasks/task-registry.store.sqlite.ts src/tasks/task-registry.ts src/tasks/task-registry.store.test.ts
 git diff --cached --check
 git commit -m "feat(state): persist safe routing shadow facts"
 ```
@@ -403,9 +409,10 @@ git commit -m "feat(agents): evaluate model capability snapshots"
 
 - 活网关当前真实调用仍是 A；理论评估只报告 C，不改变候选顺序或执行。
 - evaluator 使用活网关当前进程的 plugin registry、环境和配置；独立进程的 registry 结果不能冒充 live 真值。
+- lease、evaluator 和首个 hook 关联必须绑定同一 config/plugin-registry/candidate-chain digest；任一变化标记 `partial`，不得进入一致率分母。
 - evaluator 不调用模型、工具、`resolveAuthProfileOrder` 或任何 provider health mutation。
 - B 的每个拒绝理由有机器码和可读证据；静态 context window 不读取动态累计 token usage。
-- `model_call_started` / `model_call_ended` 事件能关联到租约、task/checkpoint 和 route attempt；缺配对时标记 `partial`。
+- `model_call_started` / `model_call_ended` 事件能关联到租约、task/checkpoint 和 route attempt；缺配对时标记 `partial`，observer 写入失败标记 `unavailable`，未经过 hook dispatch 的调用标记 `out-of-scope`。
 - auth profile、runtime、endpoint、cooldown 和 failure domain 没有事件证据时标为 `unverified`。
 - 同一模型级 `(provider, model)` 在同一 task/checkpoint 默认只记一次；完整 route-target 去重和一次尝试限制推迟 Phase 2。
 - 批量写 route attempts 失败时，不留下半条候选链。
@@ -448,8 +455,10 @@ git commit -m "feat(agents): add gateway shadow route observation"
 
 **文件：**
 
+- Create: `src/plugin-sdk/safe-routing.ts`
 - Create: `packages/plugin-sdk/src/safe-routing.ts`
-- Modify: `packages/plugin-sdk/src/index.ts`
+- Modify: `scripts/lib/plugin-sdk-entrypoints.json`
+- Regenerate: root `package.json` Plugin SDK exports via `pnpm plugin-sdk:sync-exports`
 - Regenerate: `docs/.generated/plugin-sdk-api-baseline.json`
 - Regenerate: `docs/.generated/plugin-sdk-api-baseline.jsonl`
 - Regenerate: `docs/.generated/plugin-sdk-api-baseline.sha256`
@@ -469,7 +478,7 @@ rg -n "registerCli|plugin-sdk|services:" packages/plugin-sdk src extensions -g "
 插件侧只能调用活网关提供的窄口径服务：
 
 ```ts
-createShadowObservationLease(contract, sessionKey)
+createShadowObservationLease(contract, sessionRef)
 evaluateShadowRouteInGateway(leaseId)
 getShadowAudit(taskId)
 ```
@@ -478,6 +487,7 @@ getShadowAudit(taskId)
 
 - SDK 不暴露数据库 handle、任意 SQL、任意状态写入或 enforce API。
 - `createShadowObservationLease` 强制 `deliveryMode=none`，创建首个最小 checkpoint，并设置短 TTL/单次消费。
+- gateway method 必须验证 session 所有权或显式 operator 读/管控 scope；CLI 不得传递原始 session key，只传 session reference 并接收一次性 lease token。
 - 非受管 task id、损坏契约或不存在 checkpoint 返回稳定错误码。
 - gateway method 必须在活网关进程执行；CLI 进程不得自行加载 registry、auth store 或 provider health。
 - 返回值不含 provider token、base URL credentials、会话正文或隐藏推理。
@@ -502,7 +512,7 @@ pnpm check
 
 ```powershell
 git status --short
-git add -- packages/plugin-sdk/src/safe-routing.ts packages/plugin-sdk/src/index.ts docs/.generated/plugin-sdk-api-baseline.json docs/.generated/plugin-sdk-api-baseline.jsonl docs/.generated/plugin-sdk-api-baseline.sha256
+git add -- src/plugin-sdk/safe-routing.ts packages/plugin-sdk/src/safe-routing.ts scripts/lib/plugin-sdk-entrypoints.json package.json docs/.generated/plugin-sdk-api-baseline.json docs/.generated/plugin-sdk-api-baseline.jsonl docs/.generated/plugin-sdk-api-baseline.sha256
 ```
 
 再把 Step 1 定位到的 runtime adapter 和对应测试逐个用完整路径加入，不得使用 `git add src`、`git add packages/plugin-sdk` 或其他目录级 pathspec。然后检查并提交：
@@ -565,16 +575,16 @@ Phase 1 最小配置：
 命令：
 
 ```powershell
-openclaw safe-routing shadow --contract <path> --session <session-key> --json
+openclaw safe-routing shadow --contract <path> --session-ref <opaque-session-ref> --json
 ```
 
 行为：
 
 1. 读取并校验契约文件，确认 `deliveryMode=none`。
 2. Phase 1 只接受固定 task kind `safe-routing-readonly-shadow`，且配置 allowlist 必须显式包含它。
-3. 通过认证 gateway method 在活网关创建短 TTL、单次消费的 observation lease 和最小 checkpoint。
+3. 通过认证 gateway method 在活网关验证 session 所有权或 operator scope，创建短 TTL、单次消费的 observation lease 和最小 checkpoint；CLI 不传原始 session key。
 4. 由活网关读取当前进程 registry/config、执行理论评估，并在下一次匹配的 model-call hook 上关联实际调用。
-5. CLI 只查询并输出 `taskId`、current selection、theoretical selection、rejections、observation completeness、snapshot verification status 和 policy version。
+5. CLI 只查询并输出 `taskId`、current selection、theoretical selection、rejections、observation completeness/coverage、snapshot verification status 和 policy version。
 
 命令本身不得发起模型请求、工具调用、消息发送、导出或发布；它也不得在 CLI 进程内重新解析 auth order、cooldown 或 provider health。
 
@@ -616,16 +626,17 @@ git commit -m "feat(safe-routing): add explicit shadow routing CLI"
 2. A 的快照不满足契约，B 满足；影子审计报告理论选择 B，但真实路由不变。
 3. 所有候选能力不足；报告 `CAPABLE_MODEL` 派生建议，影子任务仍按现有生命周期结束，不写 `blocked`。
 4. provider 未获数据策略批准；候选被拒绝。
-5. 活网关 registry/config 与离线 CLI 进程不同；CLI 结果仍以网关事实为准，离线 what-if 标记 live 字段 `unverified`。
-6. 同一模型级 `(provider, model)` 在同一 lease/checkpoint 默认只产生一次 observation；完整 route-target 去重留到 Phase 2。
-7. CLI 重复读取审计不产生新 route attempts。
-8. `mode=off` 全程零写入，普通会话只经过 hook 空检查。
+5. 活网关 registry/config/candidate-chain digest 与离线 CLI 进程不同；CLI 结果仍以网关事实为准，离线 what-if 标记 live 字段 `unverified`。
+6. 未经过 embedded-agent model diagnostic hook 的通用 fallback 调用标记 `out-of-scope`，不进入一致率分母；observer 写入失败标记 `unavailable`。
+7. 同一模型级 `(provider, model)` 在同一 lease/checkpoint 默认只产生一次 observation；完整 route-target 去重留到 Phase 2。
+8. CLI 重复读取审计不产生新 route attempts；越权 session lease 被拒绝。
+9. `mode=off` 全程零写入，普通会话只经过 hook 空检查。
 
 **Step 2: 执行定向回归**
 
 ```powershell
 pnpm exec vitest run --config test/vitest/vitest.agents-core.config.ts src/agents/model-routing/capability-snapshot.test.ts src/agents/model-routing/candidate-admission.test.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/shadow-evaluator.integration.test.ts src/agents/model-fallback.test.ts
-pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/contracts.test.ts src/tasks/safety/observation-lease.test.ts src/tasks/safety/store.sqlite.test.ts src/tasks/safety/service.test.ts src/tasks/task-registry.store.sqlite.test.ts src/tasks/task-registry.test.ts
+pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/contracts.test.ts src/tasks/safety/observation-lease.test.ts src/tasks/safety/store.sqlite.test.ts src/tasks/safety/service.test.ts src/tasks/task-registry.store.test.ts src/tasks/task-registry.test.ts
 pnpm exec vitest run --config test/vitest/vitest.plugins.config.ts extensions/safe-routing/src/config.test.ts extensions/safe-routing/src/cli.test.ts extensions/safe-routing/src/cli.integration.test.ts
 ```
 
@@ -712,11 +723,13 @@ Phase 0-1 只有在以下证据同时具备时才算完成：
 - TaskContract 可规范化、可 hash、非法能力要求会被拒绝；
 - 影子任务的 contract/checkpoint 创建具备原子性；
 - 观测租约和首个 run/call 关联使用 CAS 防迟到/并发覆盖；
+- lease、理论评估和首个 hook 关联绑定同一 config/plugin-registry/candidate-chain digest；变化时样本被排除；
 - 能力快照区分 configured、observed、unverified、contradicted；
+- hook 覆盖范围、partial/unavailable/out-of-scope 样本和一致率分母有明确审计记录；
 - 影子评估只在活网关读取当前 registry/config，不调用 live fallback，不改变真实候选选择；
 - 插件只获得窄口径 Core 服务，没有数据库直通；
 - 扩展默认 `off`，Phase 1 不存在 `enforce` 配置；
-- 所有新增定向测试通过，SQLite 定向测试连续三次通过，partial 观测不进入一致率分母；
+- 所有新增定向测试通过，SQLite 定向测试连续三次通过，partial/unavailable/out-of-scope 观测不进入一致率分母；
 - `pnpm check`、架构、Kysely 和 Plugin SDK 门禁通过，或有 clean-base 对照证明的存量失败记录；
 - 没有扩充文本或图片 fallback 链，没有接管普通会话，没有正式交付能力。
 
