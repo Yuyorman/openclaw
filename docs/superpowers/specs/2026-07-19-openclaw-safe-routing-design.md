@@ -201,6 +201,8 @@ task_runs.status = succeeded
 
 Phase 1 的 `task_checkpoints` 只保存规范化输入 digest、契约 digest、路由策略版本、观测关联 ID 和能力快照引用。Phase 2 才增加已完成步骤、规范化消息或 transcript 指针、工具结果 schema/hash、源文件指纹、证据 digest、未完成事项和已明示假设。不保存隐藏思维过程。
 
+为保证理论判断和实际观测针对同一运行时快照，Phase 1 checkpoint/lease 还必须绑定 `configDigest`、`pluginRegistryDigest` 和 `candidateChainDigest`。lease 创建、理论评估和首个 hook 关联之间任一 digest 变化，都标记观测为 `partial`，不得进入一致率分母。
+
 ## 7. 能力快照与真实路由目标
 
 保持 `ModelCandidate = { provider, model }` 作为身份。能力快照区分 `declared | catalog | observed | verified | contradicted | unverified`。
@@ -217,11 +219,12 @@ type Phase1ObservedModelAttempt = {
   transport?: string;
   contextTokenBudget?: number;
   contextWindowSource?: string;
-  observationCompleteness: "complete" | "partial";
+  observationCompleteness: "complete" | "partial" | "unavailable";
+  observationCoverage: "hook-covered" | "out-of-scope";
 };
 ```
 
-这些字段由活网关现有 `model_call_started` / `model_call_ended` typed hook 取得。hook 未触发、进程退出或关联失败的 run 标记 `partial`，不得进入 Phase 2 一致率分母。
+这些字段由活网关现有 `model_call_started` / `model_call_ended` typed hook 取得。Phase 1 的覆盖范围限定为实际经过 embedded-agent model diagnostic dispatch 的调用；没有这两个 typed hook 的通用 `runWithModelFallback` 调用标记 `observationCoverage=out-of-scope`，不得进入一致率分母。hook 未触发、模型 run 进程退出或关联失败标记 `partial`；observer 异步写入失败或 observer 进程中断标记 `unavailable`；两者都不得进入一致率分母。typed hook 是尽力观测路径，不是事务边界。
 
 下列 `ResolvedRouteTarget` 是 Phase 2 以后的目标结构，不伪装成 Phase 1 已经具备：
 
@@ -447,14 +450,14 @@ Phase 1 只按现有 `{provider, model}` 候选身份去重，并明确审计粒
 - 不接管主会话，不发送、导出或发布。
 - safe-routing 扩展加载在活网关中，使用 `api.on("model_call_started")` 和 `api.on("model_call_ended")` 被动记录实际 provider/model 调用；不使用可能只注册不派发的旧式 `registerHook` 路径。
 - 理论候选链和能力判断由活网关内的窄口径 Core 服务计算，使用该进程当前插件注册表、环境和配置；不得由独立 CLI 重新初始化一套 registry 后充当 live 真值。
-- CLI 通过扩展 gateway method 查询或发起影子诊断。若提供显式离线 what-if，只能输出静态 `{provider, model}` 判断，并把 live availability、auth target、runtime、endpoint 和 failure domain 标为 `unverified`；离线结果不得用于 Phase 2 一致率门槛。
+- CLI 通过扩展 gateway method 查询或发起影子诊断。CLI 不接受原始 session key；gateway 解析服务端 session reference 并签发一次性 lease token，调用者必须拥有该 session，或具备显式 operator 读/管控 scope。共享库只保存 session binding digest 和 lease token digest，不保存原始 session key/token。若提供显式离线 what-if，只能输出静态 `{provider, model}` 判断，并把 live availability、auth target、runtime、endpoint 和 failure domain 标为 `unverified`；离线结果不得用于 Phase 2 一致率门槛。
 - 只写 TaskContract、最小只读 checkpoint、能力快照和模型级 route attempts；Phase 1 不创建 Safety State。
-- typed hook 是尽力观测路径；缺少 started/ended 配对或进程中断时标记 `observationCompleteness=partial`，不得把不完整样本伪装成已验证一致。
+- typed hook 是尽力观测路径；缺少 started/ended 配对或进程中断时标记 `observationCompleteness=partial`，observer 写入失败标记 `unavailable`，未经过 hook dispatch 的调用标记 `observationCoverage=out-of-scope`；这些样本不得伪装成已验证一致。
 - 输出内部审计报告；未验证能力显示 `unverified`。
 
 Phase 1 的主验收证据来自网关内“理论准入判断 vs 实际 provider/model 调用”的相关记录。CLI 的作用是控制和查看，不是另一个路由器。
 
-显式试点使用一次性观测租约关联真实调用：CLI 通过认证 gateway method 为指定 session 建立短 TTL、单次消费的 shadow checkpoint；共享库只保存 `sha256(taskId + sessionKey)` 形式的任务域绑定 hash，不保存原始 session key。活网关收到下一次匹配的 `model_call_started` 后以 CAS 绑定首个 run/call，后续并发调用不抢占；租约过期、配置指纹变化、未绑定或缺少 ended 事件均标记 `partial`。普通会话没有租约时只经过现有 hook 的空检查，不写任何事实。
+显式试点使用一次性观测租约关联真实调用：CLI 通过认证 gateway method 为指定 session reference 建立短 TTL、单次消费的 shadow checkpoint；gateway 在服务端验证 session 所有权或 operator scope 后签发 lease token，共享库只保存 session binding digest 和 token digest，不保存原始 session key/token。lease/checkpoint 同时绑定 contract、config、plugin registry 和 candidate chain digest。活网关收到下一次匹配的 `model_call_started` 后以 CAS 绑定首个 run/call，后续并发调用不抢占；租约过期、任一快照 digest 变化、未绑定或缺少 ended 事件均标记 `partial`，observer 写入失败标记 `unavailable`。普通会话没有租约时只经过现有 hook 的空检查，不写任何事实。
 
 ## 15. 能力探针
 
@@ -475,7 +478,10 @@ Phase 1 预计修改：
 ```text
 src/tasks/task-registry.store.sqlite.ts
 src/state/openclaw-state-schema.sql
-packages/plugin-sdk/src/
+src/plugin-sdk/safe-routing.ts
+packages/plugin-sdk/src/safe-routing.ts
+scripts/lib/plugin-sdk-entrypoints.json
+package.json  (由 plugin-sdk:sync-exports 生成 Plugin SDK exports)
 ```
 
 Phase 1 预计新增：
@@ -564,7 +570,8 @@ src/tasks/safety/
 - 能力完全满足时通过，任一强制能力未验证时拒绝。
 - 静态上下文窗口判断不读取动态累计 token usage。
 - 网关内 evaluator 使用当前进程 registry/config，离线 what-if 明确标记 live 字段 `unverified`。
-- `model_call_started` / `model_call_ended` 能按 run/call 关联；缺配对时标记 `partial`。
+- evaluator、lease 和首个 hook 关联使用同一 config/plugin-registry/candidate-chain digest；任一变化标记 `partial`。
+- `model_call_started` / `model_call_ended` 能按 run/call 关联；缺配对时标记 `partial`，observer 写入失败标记 `unavailable`，未经过 hook dispatch 的调用标记 `out-of-scope`。
 - shadow 不调用 `resolveAuthProfileOrder`，不改变 cooldown、auth order、候选顺序或真实模型调用。
 - Phase 1 数据事务只写 contract、最小 checkpoint、capability snapshot 和 route attempts。
 - 审计不泄露鉴权材料、会话正文或隐藏思维过程。
@@ -573,7 +580,7 @@ src/tasks/safety/
 
 使用假 provider A（当前真实选择）、B（能力不足）、C（理论上满足）。验收真实路由仍选择 A，shadow 报告理论判断及 B 的拒绝原因；关闭扩展后不写任何安全路由事实。
 
-同时覆盖 typed hook 配对、进程中断产生 partial、活网关 registry 与离线 registry 不同、真实低风险任务契约少报/多报、普通会话兼容性和 CLI 只通过 gateway method 查询。
+同时覆盖 typed hook 配对、hook 未覆盖调用不进分母、observer 写入失败产生 unavailable、进程中断产生 partial、活网关 registry/config/candidate-chain digest 变化、真实低风险任务契约少报/多报、普通会话兼容性、越权 session lease 被拒绝，以及 CLI 只通过 gateway method 查询。
 
 ### 18.3 Phase 2 fallback 集成测试
 
@@ -674,7 +681,7 @@ delivery_reconciliation_unresolved
 以下条件全部满足前，不启用真实模型切换：
 
 - 影子判断可重现且证据完整。
-- Phase 2 一致率只使用活网关内 `observationCompleteness=complete` 的相关样本；离线 what-if 不进入分母。
+- Phase 2 一致率只使用活网关内 `observationCompleteness=complete` 且 `observationCoverage=hook-covered` 的相关样本；`partial`、`unavailable`、`out-of-scope` 和离线 what-if 不进入分母。
 - 普通会话和普通任务行为零变化。
 - 关闭开关有效。
 - 目标分支的定向测试基线干净。
