@@ -12,6 +12,11 @@ import { createTaskRecord } from "../task-registry.js";
 import { upsertTaskRegistryRecordToSqlite } from "../task-registry.store.sqlite.js";
 import type { TaskRecord } from "../task-registry.types.js";
 import type {
+  ObservationLease,
+  ObservationLeaseState,
+  ObservationLeaseStore,
+} from "./observation-lease.js";
+import type {
   AppendRouteAttemptInput,
   CapabilitySnapshotRow,
   CreateTaskCheckpointInput,
@@ -20,6 +25,7 @@ import type {
   RouteAttemptRow,
   TaskCheckpointRow,
   TaskContractRow,
+  UpdateRouteAttemptObservationInput,
 } from "./store.types.js";
 
 const log = createSubsystemLogger("tasks.safety.store");
@@ -380,4 +386,176 @@ export function getTaskCheckpoint(checkpointId: string): TaskCheckpointRow | und
     getSafetyKysely(db).selectFrom("task_checkpoints").selectAll().where("checkpoint_id", "=", checkpointId),
   ).rows[0];
   return row ? rowToTaskCheckpoint(row) : undefined;
+}
+
+/** Phase 1 creates exactly one checkpoint (sequence 0) per managed task; this returns its most recent one. */
+export function getTaskCheckpointByTaskId(taskId: string): TaskCheckpointRow | undefined {
+  const { db } = openOpenClawStateDatabase();
+  const row = executeSqliteQuerySync(
+    db,
+    getSafetyKysely(db)
+      .selectFrom("task_checkpoints")
+      .selectAll()
+      .where("task_id", "=", taskId)
+      .orderBy("sequence", "desc"),
+  ).rows[0];
+  return row ? rowToTaskCheckpoint(row) : undefined;
+}
+
+/** A checkpoint only doubles as a lease once its lease columns have been populated by `insert`. */
+function checkpointToObservationLease(checkpoint: TaskCheckpointRow): ObservationLease | undefined {
+  if (
+    checkpoint.observationLeaseId === undefined ||
+    checkpoint.leaseExpiresAt === undefined ||
+    checkpoint.leaseState === undefined ||
+    checkpoint.sessionBindingDigest === undefined ||
+    checkpoint.leaseTokenDigest === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    leaseId: checkpoint.observationLeaseId,
+    taskId: checkpoint.taskId,
+    checkpointId: checkpoint.checkpointId,
+    sessionBindingDigest: checkpoint.sessionBindingDigest,
+    leaseTokenDigest: checkpoint.leaseTokenDigest,
+    contractDigest: checkpoint.contractDigest,
+    configDigest: checkpoint.configDigest,
+    pluginRegistryDigest: checkpoint.pluginRegistryDigest,
+    candidateChainDigest: checkpoint.candidateChainDigest,
+    expiresAt: checkpoint.leaseExpiresAt,
+    state: checkpoint.leaseState as ObservationLeaseState,
+    ...(checkpoint.tokenConsumedAt !== undefined ? { tokenConsumedAt: checkpoint.tokenConsumedAt } : {}),
+    ...(checkpoint.boundRunId !== undefined ? { boundRunId: checkpoint.boundRunId } : {}),
+    ...(checkpoint.boundCallId !== undefined ? { boundCallId: checkpoint.boundCallId } : {}),
+    rowVersion: checkpoint.rowVersion,
+  };
+}
+
+/**
+ * SQLite-backed `ObservationLeaseStore`: a lease is not a separate row, it is
+ * the lease-shaped columns on the checkpoint row it was created against (see
+ * Task 3 schema notes). `insert` therefore updates the existing checkpoint
+ * rather than creating a new record.
+ */
+export function createSqliteObservationLeaseStore(): ObservationLeaseStore {
+  return {
+    insert(lease) {
+      const { db } = openOpenClawStateDatabase();
+      executeSqliteQuerySync(
+        db,
+        getSafetyKysely(db)
+          .updateTable("task_checkpoints")
+          .set({
+            observation_lease_id: lease.leaseId,
+            lease_expires_at: lease.expiresAt,
+            lease_state: lease.state,
+            session_binding_digest: lease.sessionBindingDigest,
+            lease_token_digest: lease.leaseTokenDigest,
+            token_consumed_at: lease.tokenConsumedAt ?? null,
+            bound_run_id: lease.boundRunId ?? null,
+            bound_call_id: lease.boundCallId ?? null,
+            row_version: lease.rowVersion,
+          })
+          .where("checkpoint_id", "=", lease.checkpointId),
+      );
+    },
+    findById(leaseId) {
+      const { db } = openOpenClawStateDatabase();
+      const row = executeSqliteQuerySync(
+        db,
+        getSafetyKysely(db).selectFrom("task_checkpoints").selectAll().where("observation_lease_id", "=", leaseId),
+      ).rows[0];
+      return row ? checkpointToObservationLease(rowToTaskCheckpoint(row)) : undefined;
+    },
+    findPendingBySessionBindingDigest(sessionBindingDigest) {
+      const { db } = openOpenClawStateDatabase();
+      const row = executeSqliteQuerySync(
+        db,
+        getSafetyKysely(db)
+          .selectFrom("task_checkpoints")
+          .selectAll()
+          .where("session_binding_digest", "=", sessionBindingDigest)
+          .where("lease_state", "=", "pending"),
+      ).rows[0];
+      return row ? checkpointToObservationLease(rowToTaskCheckpoint(row)) : undefined;
+    },
+    findBoundByRunAndCall(runId, callId) {
+      const { db } = openOpenClawStateDatabase();
+      const row = executeSqliteQuerySync(
+        db,
+        getSafetyKysely(db)
+          .selectFrom("task_checkpoints")
+          .selectAll()
+          .where("bound_run_id", "=", runId)
+          .where("bound_call_id", "=", callId)
+          .where("lease_state", "=", "bound"),
+      ).rows[0];
+      return row ? checkpointToObservationLease(rowToTaskCheckpoint(row)) : undefined;
+    },
+    compareAndSwap(leaseId, expectedRowVersion, patch) {
+      return runOpenClawStateWriteTransaction(() => {
+        const { db } = openOpenClawStateDatabase();
+        const result = executeSqliteQuerySync(
+          db,
+          getSafetyKysely(db)
+            .updateTable("task_checkpoints")
+            .set({
+              ...(patch.state !== undefined ? { lease_state: patch.state } : {}),
+              ...(patch.tokenConsumedAt !== undefined ? { token_consumed_at: patch.tokenConsumedAt } : {}),
+              ...(patch.boundRunId !== undefined ? { bound_run_id: patch.boundRunId } : {}),
+              ...(patch.boundCallId !== undefined ? { bound_call_id: patch.boundCallId } : {}),
+              row_version: expectedRowVersion + 1,
+            })
+            .where("observation_lease_id", "=", leaseId)
+            .where("row_version", "=", expectedRowVersion),
+        );
+        return (result.numAffectedRows ?? 0n) > 0n;
+      });
+    },
+  };
+}
+
+/**
+ * Updates a previously-appended route attempt's observed-call fields once a
+ * real model_call_started/model_call_ended event correlates to it. Idempotent:
+ * a repeat update carrying the same runId/callId onto an already-"complete"
+ * attempt is a no-op, so duplicate ended events never double-write.
+ */
+export function updateRouteAttemptObservation(
+  attemptId: string,
+  patch: UpdateRouteAttemptObservationInput,
+): boolean {
+  return runOpenClawStateWriteTransaction(() => {
+    const { db } = openOpenClawStateDatabase();
+    const kysely = getSafetyKysely(db);
+    const existing = executeSqliteQuerySync(
+      db,
+      kysely.selectFrom("model_route_attempts").selectAll().where("attempt_id", "=", attemptId),
+    ).rows[0];
+    if (!existing) {
+      return false;
+    }
+    if (
+      existing.observation_completeness === "complete" &&
+      existing.run_id === (patch.runId ?? null) &&
+      existing.call_id === (patch.callId ?? null)
+    ) {
+      return true;
+    }
+    const result = executeSqliteQuerySync(
+      db,
+      kysely
+        .updateTable("model_route_attempts")
+        .set({
+          run_id: patch.runId ?? null,
+          call_id: patch.callId ?? null,
+          observation_completeness: patch.observationCompleteness,
+          observation_coverage: patch.observationCoverage,
+          observer_error_code: patch.observerErrorCode ?? null,
+        })
+        .where("attempt_id", "=", attemptId),
+    );
+    return (result.numAffectedRows ?? 0n) > 0n;
+  });
 }

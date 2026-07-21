@@ -15,9 +15,11 @@ import type { CreateTaskCheckpointInput, CreateTaskContractInput } from "./store
 import {
   appendRouteAttempts,
   createManagedTaskWithCheckpoint,
+  createSqliteObservationLeaseStore,
   getTaskContract,
   listRouteAttempts,
   putCapabilitySnapshot,
+  updateRouteAttemptObservation,
 } from "./store.sqlite.js";
 
 const ORIGINAL_ENV = captureEnv(["OPENCLAW_STATE_DIR"]);
@@ -265,6 +267,157 @@ describe("safety store sqlite", () => {
         ).toThrow();
 
         expect(listRouteAttempts(task.taskId, checkpointId)).toEqual([]);
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
+  it("attaches, finds, and CAS-updates a lease on its checkpoint row via the SQLite lease store", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-store-lease-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const { task, checkpointId } = createManagedTask();
+        const leaseStore = createSqliteObservationLeaseStore();
+
+        leaseStore.insert({
+          leaseId: "lease-1",
+          taskId: task.taskId,
+          checkpointId,
+          sessionBindingDigest: "sha256:session-digest",
+          leaseTokenDigest: "sha256:token-digest",
+          contractDigest: "sha256:contract-digest",
+          configDigest: "sha256:config-digest",
+          pluginRegistryDigest: "sha256:registry-digest",
+          candidateChainDigest: "sha256:candidate-digest",
+          expiresAt: Date.now() + 60_000,
+          state: "pending",
+          rowVersion: 1,
+        });
+
+        const byId = leaseStore.findById("lease-1");
+        expect(byId).toMatchObject({ taskId: task.taskId, checkpointId, state: "pending", rowVersion: 1 });
+
+        const byPending = leaseStore.findPendingBySessionBindingDigest("sha256:session-digest");
+        expect(byPending?.leaseId).toBe("lease-1");
+
+        const casApplied = leaseStore.compareAndSwap("lease-1", 1, {
+          state: "bound",
+          boundRunId: "run-1",
+          boundCallId: "call-1",
+        });
+        expect(casApplied).toBe(true);
+
+        expect(leaseStore.findPendingBySessionBindingDigest("sha256:session-digest")).toBeUndefined();
+        const byBound = leaseStore.findBoundByRunAndCall("run-1", "call-1");
+        expect(byBound).toMatchObject({ leaseId: "lease-1", state: "bound", rowVersion: 2 });
+
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
+  it("rejects a lease CAS whose expected rowVersion is stale, leaving the row untouched", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-store-lease-cas-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const { task, checkpointId } = createManagedTask();
+        const leaseStore = createSqliteObservationLeaseStore();
+        leaseStore.insert({
+          leaseId: "lease-1",
+          taskId: task.taskId,
+          checkpointId,
+          sessionBindingDigest: "sha256:session-digest",
+          leaseTokenDigest: "sha256:token-digest",
+          contractDigest: "sha256:contract-digest",
+          configDigest: "sha256:config-digest",
+          pluginRegistryDigest: "sha256:registry-digest",
+          candidateChainDigest: "sha256:candidate-digest",
+          expiresAt: Date.now() + 60_000,
+          state: "pending",
+          rowVersion: 1,
+        });
+
+        const staleCas = leaseStore.compareAndSwap("lease-1", 99, { state: "partial" });
+        expect(staleCas).toBe(false);
+        expect(leaseStore.findById("lease-1")).toMatchObject({ state: "pending", rowVersion: 1 });
+
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
+  it("updates a route attempt's observed-call fields and is idempotent for a repeat terminal update", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-store-observe-attempt-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const { task, checkpointId } = createManagedTask();
+        const snapshot = putCapabilitySnapshot({
+          provider: "anthropic",
+          model: "claude-sonnet-5",
+          verificationStatus: "verified",
+          capabilities: {},
+          evidence: {},
+          snapshotDigest: "sha256:snapshot-digest",
+        });
+        const [attempt] = appendRouteAttempts(task.taskId, checkpointId, [
+          {
+            ordinal: 0,
+            provider: "anthropic",
+            model: "claude-sonnet-5",
+            capabilitySnapshotId: snapshot.snapshotId,
+            evaluationMode: "shadow",
+            eligibility: "eligible",
+            wouldSelect: true,
+            observationCompleteness: "unavailable",
+            observationCoverage: "out-of-scope",
+          },
+        ]);
+
+        const firstUpdate = updateRouteAttemptObservation(attempt.attemptId, {
+          runId: "run-1",
+          callId: "call-1",
+          observationCompleteness: "complete",
+          observationCoverage: "hook-covered",
+        });
+        expect(firstUpdate).toBe(true);
+
+        const [afterFirst] = listRouteAttempts(task.taskId, checkpointId);
+        expect(afterFirst).toMatchObject({
+          runId: "run-1",
+          callId: "call-1",
+          observationCompleteness: "complete",
+          observationCoverage: "hook-covered",
+        });
+
+        const duplicateEndedUpdate = updateRouteAttemptObservation(attempt.attemptId, {
+          runId: "run-1",
+          callId: "call-1",
+          observationCompleteness: "complete",
+          observationCoverage: "hook-covered",
+        });
+        expect(duplicateEndedUpdate).toBe(true);
+
+        const [afterDuplicate] = listRouteAttempts(task.taskId, checkpointId);
+        expect(afterDuplicate).toEqual(afterFirst);
+
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
+  it("returns false when updating observation fields for a nonexistent route attempt", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-store-observe-missing-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const updated = updateRouteAttemptObservation("nonexistent-attempt-id", {
+          observationCompleteness: "unavailable",
+          observationCoverage: "out-of-scope",
+        });
+        expect(updated).toBe(false);
         closeOpenClawStateDatabase();
       },
     );

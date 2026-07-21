@@ -107,3 +107,12 @@ export type RouteAttemptRow = AppendRouteAttemptInput & {
   checkpointId: string;
   createdAt: number;
 };
+
+/** Patches a previously-appended route attempt's observed-call fields once a real hook event correlates to it. */
+export type UpdateRouteAttemptObservationInput = {
+  runId?: string;
+  callId?: string;
+  observationCompleteness: string;
+  observationCoverage: string;
+  observerErrorCode?: string;
+};
