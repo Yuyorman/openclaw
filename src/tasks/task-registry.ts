@@ -1884,6 +1884,14 @@ export function createTaskRecord(params: {
   progressSummary?: string | null;
   terminalSummary?: string | null;
   terminalOutcome?: TaskTerminalOutcome | null;
+  /**
+   * Overrides the default persistence call so a caller can atomically persist
+   * additional rows in the same transaction as the task_runs insert, before
+   * the in-memory registry is updated. Returns whether persistence succeeded.
+   * Used only by createManagedTaskWithCheckpoint; existing callers never pass
+   * this and see no behavior change.
+   */
+  persistOverride?: (record: TaskRecord, deliveryState: TaskDeliveryState | undefined) => boolean;
 }): TaskRecord | null {
   ensureTaskRegistryReady();
   const requesterSessionKey = resolveTaskRequesterSessionKey(params);
@@ -1984,7 +1992,10 @@ export function createTaskRecord(params: {
         requesterOrigin,
       }
     : undefined;
-  if (!tryPersistTaskUpsert(record, "create", deliveryState)) {
+  const persisted = params.persistOverride
+    ? params.persistOverride(record, deliveryState)
+    : tryPersistTaskUpsert(record, "create", deliveryState);
+  if (!persisted) {
     return null;
   }
   tasks.set(taskId, record);
