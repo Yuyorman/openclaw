@@ -99,9 +99,19 @@ pnpm lint:kysely
 3. 对 SQLite 测试连续运行三次，确认不是偶然绿。
 4. 基线未稳定前不进入 Task 1；若 clean-base 与设计取证快照存在行为差异，记录差异并以 `2e2366b6` 的实测结果为准。
 
+**已核实的基线豁免清单（2026-07-22，`feature/safe-routing-shadow-v1` 首次执行 Task 0 时确认）**
+
+在零功能代码改动的干净 `2e2366b6` 基线上，以下三类失败已确认与 safe-routing 无关、连续验证 2-3 次结果一致（非偶发）：
+
+1. `src/agents/model-fallback.test.ts` › `runWithModelFallback` › `lets configured CLI runtimes bypass stale provider auth cooldowns` — `MissingAgentHarnessError: Requested agent harness "claude-cli" is not registered.`。该用例依赖的 harness 注册/发现机制在此环境未生效；根因未完全查明，可能是缺少显式 `registerAgentHarness` 调用，也可能依赖真实外部 `claude` CLI 二进制。
+2. `src/tasks/task-registry.store.test.ts` › `task-registry store runtime` 下这 7 个用例：`rejects corrupt persisted task rows during sqlite restore`、`drops invalid requester origins during sqlite restore`、`persists executor and requester agent ids in sqlite task rows`、`persists requester origin atomically when creating sqlite tasks`、`prunes stale sqlite delivery state while retaining current rows`、`prunes large sqlite snapshots without binding every task id at once`、`reopens after the shared state database is closed`——均为 `EBUSY: resource busy or locked, unlink '...openclaw.sqlite(-wal)'`。
+3. `src/infra/outbound/delivery-queue.recovery.test.ts` 套件级失败（39/39 单测断言全部通过，只有 `afterAll` 清理阶段失败）：`EPERM, Permission denied: ...openclaw-dq-suite-<random>`，来自 `delivery-queue.test-helpers.ts` 的 `installDeliveryQueueTmpDirHooks()`。已实测在其 `fs.rmSync` 加 `maxRetries`/`retryDelay` 不能解决——连续 3 次仍 100% 复现同一报错，说明根因更可能是某个资源句柄（例如 `openOpenClawStateDatabase` 打开的连接）在清理前未释放，而非纯瞬时 OS 锁；未定位到确切持有者。
+
+以上三项是**目前唯一**获得豁免的基线失败。一次基线运行只有在失败集合与上述三项逐条一致（相同文件、相同用例名、相同错误类型）时才算"稳定"，可以进入 Task 1。出现任何额外失败、或上述某一项的错误类型/失败用例范围发生变化，均不在本次豁免范围内，必须重新按上面 1-4 步处理（确认可复现→尝试独立修复→连续三次验证→未修复不进 Task 1），不能默认套用本条豁免。三项根因都在 safe-routing 之外的共享测试基础设施里（agent harness 注册机制、SQLite/文件句柄生命周期），不在本计划范围内修复；如后续要修，应作为完全独立于 safe-routing 的工作，不占用 Task 0-8 的任何提交。
+
 **Step 6: 提交**
 
-如没有基线修复，本任务不产生提交。如有修复，按每个独立根因各产生一个提交，并在后续 safe-routing 提交中不重复该 diff。
+如没有基线修复，本任务不产生功能代码提交。如有修复，按每个独立根因各产生一个提交，并在后续 safe-routing 提交中不重复该 diff。若只是把上面"已核实的基线豁免清单"写入本计划文档（未修复任何代码），作为一次独立的 `docs:` 提交记录豁免范围，同样不与后续 safe-routing 功能提交混合。
 
 ---
 
