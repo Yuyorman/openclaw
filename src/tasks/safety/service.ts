@@ -1,0 +1,354 @@
+/**
+ * Core safe-routing shadow service: composes the task contract, the current
+ * process's candidate/capability resolver, the shadow evaluator, the
+ * observation lease, and the store behind three narrow, callerScope-checked
+ * operations. Plugins reach this only through the Task 6 Plugin SDK adapter;
+ * this module never assumes an upper caller already validated `callerScope`.
+ */
+import type { ModelCapabilitySnapshot } from "../../agents/model-routing/capability-snapshot.js";
+import type { ModelRoutingAdmissionPolicy } from "../../agents/model-routing/candidate-admission.js";
+import {
+  evaluateShadowRoute,
+  type ShadowRouteCandidate,
+} from "../../agents/model-routing/shadow-evaluator.js";
+import { stableStringify } from "../../agents/stable-stringify.js";
+import { sha256Hex } from "../../infra/crypto-digest.js";
+import {
+  READ_SCOPE,
+  WRITE_SCOPE,
+  authorizeOperatorScopesForRequiredScope,
+} from "../../gateway/method-scopes.js";
+import {
+  consumeObservationLease,
+  createObservationLease,
+  type ObservationLeaseStore,
+} from "./observation-lease.js";
+import {
+  appendRouteAttempts,
+  createManagedTaskWithCheckpoint,
+  getTaskCheckpointByTaskId,
+  getTaskContract,
+  listRouteAttempts,
+  putCapabilitySnapshot,
+} from "./store.sqlite.js";
+import type { PutCapabilitySnapshotInput, RouteAttemptRow, TaskCheckpointRow, TaskContractRow } from "./store.types.js";
+import { digestTaskContract, normalizeTaskContract, type NormalizedTaskContract, type PersistedTaskContract } from "./contracts.js";
+
+/** The fixed, only Phase 1 task kind — enforced by the Task 7 extension's allowedTaskKinds gate. */
+const SAFE_ROUTING_SHADOW_TASK_KIND = "safe-routing-readonly-shadow";
+
+export type SafeRoutingCallerScope = {
+  sessionKey: string;
+  operatorScopes: readonly string[];
+};
+
+export type SafeRoutingServiceDeps = {
+  now(): number;
+  randomId(): string;
+  leaseTtlMs: number;
+  admissionPolicy: ModelRoutingAdmissionPolicy;
+  /** The live gateway process's current model-level candidate chain (already resolved via `resolveModelCandidateChain`). */
+  resolveCandidates(): ShadowRouteCandidate[];
+  /** Digest of the live gateway process's current config. */
+  configDigest(): string;
+  /** Digest of the live gateway process's current plugin registry. */
+  pluginRegistryDigest(): string;
+  /** Builds a capability snapshot for one candidate from the live process's config/runtime/observed evidence. */
+  buildSnapshotForCandidate(candidate: ShadowRouteCandidate): ModelCapabilitySnapshot;
+  leaseStore: ObservationLeaseStore;
+};
+
+function digestCandidateChain(candidates: readonly ShadowRouteCandidate[]): string {
+  return `sha256:${sha256Hex(stableStringify(candidates))}`;
+}
+
+function authorizesSessionOwnershipOrScope(
+  callerScope: SafeRoutingCallerScope,
+  sessionRef: string,
+  requiredScope: typeof READ_SCOPE | typeof WRITE_SCOPE,
+): boolean {
+  if (callerScope.sessionKey === sessionRef) {
+    return true;
+  }
+  return authorizeOperatorScopesForRequiredScope(requiredScope, callerScope.operatorScopes).allowed;
+}
+
+function summarizeVerificationStatus(snapshot: ModelCapabilitySnapshot): string {
+  const verifications = [
+    snapshot.contextWindowTokens.verification,
+    snapshot.outputTokens.verification,
+    snapshot.modalities.verification,
+    snapshot.toolCalling.verification,
+    snapshot.structuredOutput.verification,
+    snapshot.runtimeIds.verification,
+    snapshot.api.verification,
+    snapshot.authorizedDecisionGrade.verification,
+  ];
+  if (verifications.includes("contradicted")) {
+    return "contradicted";
+  }
+  if (verifications.includes("unverified")) {
+    return "unverified";
+  }
+  return "verified";
+}
+
+/** Bridges Task 4's per-field-verified snapshot shape onto Task 3's single-verificationStatus row shape, keeping full per-field evidence in `evidence`. */
+function snapshotToStoreInput(snapshot: ModelCapabilitySnapshot): PutCapabilitySnapshotInput {
+  return {
+    provider: snapshot.provider,
+    model: snapshot.model,
+    verificationStatus: summarizeVerificationStatus(snapshot),
+    capabilities: {
+      contextWindowTokens: snapshot.contextWindowTokens.value,
+      outputTokens: snapshot.outputTokens.value,
+      modalities: snapshot.modalities.value,
+      toolCalling: snapshot.toolCalling.value,
+      structuredOutput: snapshot.structuredOutput.value,
+      runtimeIds: snapshot.runtimeIds.value,
+      api: snapshot.api.value,
+      authorizedDecisionGrade: snapshot.authorizedDecisionGrade.value,
+    },
+    evidence: {
+      contextWindowTokens: snapshot.contextWindowTokens,
+      outputTokens: snapshot.outputTokens,
+      modalities: snapshot.modalities,
+      toolCalling: snapshot.toolCalling,
+      structuredOutput: snapshot.structuredOutput,
+      runtimeIds: snapshot.runtimeIds,
+      api: snapshot.api,
+      authorizedDecisionGrade: snapshot.authorizedDecisionGrade,
+    },
+    snapshotDigest: snapshot.snapshotDigest,
+  };
+}
+
+export type CreateShadowObservationLeaseInput = {
+  contract: PersistedTaskContract;
+  sessionRef: string;
+  callerScope: SafeRoutingCallerScope;
+};
+
+export type CreateShadowObservationLeaseResult =
+  | { ok: true; leaseId: string; leaseToken: string }
+  | { ok: false; code: "forbidden" | "invalid_contract" };
+
+/**
+ * Creates a new managed shadow task + first checkpoint + single-use
+ * observation lease, all bound to the live process's current
+ * config/plugin-registry/candidate-chain digests. Forces `deliveryMode=none`
+ * regardless of what the caller's contract requested.
+ */
+export function createShadowObservationLease(
+  deps: SafeRoutingServiceDeps,
+  input: CreateShadowObservationLeaseInput,
+): CreateShadowObservationLeaseResult {
+  if (!authorizesSessionOwnershipOrScope(input.callerScope, input.sessionRef, WRITE_SCOPE)) {
+    return { ok: false, code: "forbidden" };
+  }
+
+  let normalized: NormalizedTaskContract;
+  try {
+    normalized = normalizeTaskContract({ ...input.contract, deliveryMode: "none" });
+  } catch {
+    return { ok: false, code: "invalid_contract" };
+  }
+  const contractDigest = digestTaskContract(normalized);
+  const now = deps.now();
+  const candidates = deps.resolveCandidates();
+  const configDigest = deps.configDigest();
+  const pluginRegistryDigest = deps.pluginRegistryDigest();
+  const candidateChainDigest = digestCandidateChain(candidates);
+
+  const managed = createManagedTaskWithCheckpoint({
+    task: {
+      runtime: "cli",
+      ownerKey: `agent:main:${input.sessionRef}`,
+      scopeKind: "session",
+      task: SAFE_ROUTING_SHADOW_TASK_KIND,
+      status: "succeeded",
+      deliveryStatus: "not_applicable",
+      notifyPolicy: "silent",
+    },
+    contract: {
+      schemaVersion: 1,
+      contractJson: stableStringify(normalized),
+      contractDigest,
+      riskClass: normalized.riskClass,
+      reviewRequired: normalized.reviewRequired,
+      deliveryMode: normalized.deliveryMode,
+      routingPolicyVersion: normalized.routingPolicyVersion,
+    },
+    checkpoint: {
+      sequence: 0,
+      contractDigest,
+      inputDigest: contractDigest,
+      routingPolicyVersion: normalized.routingPolicyVersion,
+      configDigest,
+      pluginRegistryDigest,
+      candidateChainDigest,
+    },
+  });
+  if (!managed) {
+    return { ok: false, code: "invalid_contract" };
+  }
+
+  const leaseId = deps.randomId();
+  const leaseToken = deps.randomId();
+  createObservationLease(deps.leaseStore, {
+    leaseId,
+    taskId: managed.task.taskId,
+    checkpointId: managed.checkpointId,
+    sessionBindingDigest: `sha256:${sha256Hex(input.sessionRef)}`,
+    leaseTokenDigest: `sha256:${sha256Hex(leaseToken)}`,
+    contractDigest,
+    configDigest,
+    pluginRegistryDigest,
+    candidateChainDigest,
+    ttlMs: deps.leaseTtlMs,
+    now,
+  });
+
+  return { ok: true, leaseId, leaseToken };
+}
+
+export type EvaluateShadowRouteInGatewayInput = {
+  leaseId: string;
+  leaseToken: string;
+};
+
+export type EvaluateShadowRouteInGatewayResult =
+  | {
+      ok: true;
+      routingPolicyVersion: string;
+      theoreticalChoice?: ShadowRouteCandidate;
+      digestsConsistent: boolean;
+    }
+  | { ok: false; code: "not_found" | "invalid_token" | "expired" | "already_consumed" };
+
+/**
+ * Consumes the lease's one-time token, then runs the pure shadow evaluator
+ * against the live process's current candidates/snapshots and persists the
+ * resulting candidate judgments. A live digest drift from the lease's bound
+ * digests does not block evaluation, but marks every attempt `partial`
+ * instead of the default `unavailable` (see design: must not enter the
+ * consistency-rate denominator as if it were consistent).
+ */
+export function evaluateShadowRouteInGateway(
+  deps: SafeRoutingServiceDeps,
+  input: EvaluateShadowRouteInGatewayInput,
+): EvaluateShadowRouteInGatewayResult {
+  const lease = deps.leaseStore.findById(input.leaseId);
+  if (!lease) {
+    return { ok: false, code: "not_found" };
+  }
+  if (`sha256:${sha256Hex(input.leaseToken)}` !== lease.leaseTokenDigest) {
+    return { ok: false, code: "invalid_token" };
+  }
+  const consumed = consumeObservationLease(deps.leaseStore, input.leaseId, deps.now());
+  if (!consumed.ok) {
+    return { ok: false, code: consumed.code === "not_found" ? "not_found" : consumed.code };
+  }
+
+  const contractRow = getTaskContract(lease.taskId);
+  const checkpoint = getTaskCheckpointByTaskId(lease.taskId);
+  if (!contractRow || !checkpoint) {
+    return { ok: false, code: "not_found" };
+  }
+  const normalized = JSON.parse(contractRow.contractJson) as NormalizedTaskContract;
+
+  const candidates = deps.resolveCandidates();
+  const liveConfigDigest = deps.configDigest();
+  const livePluginRegistryDigest = deps.pluginRegistryDigest();
+  const liveCandidateChainDigest = digestCandidateChain(candidates);
+  const digestsConsistent =
+    liveConfigDigest === lease.configDigest &&
+    livePluginRegistryDigest === lease.pluginRegistryDigest &&
+    liveCandidateChainDigest === lease.candidateChainDigest;
+
+  const seen = new Set<string>();
+  const dedupedCandidates = candidates.filter((candidate) => {
+    const key = `${candidate.provider} ${candidate.model}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+  const snapshots = dedupedCandidates.map((candidate) => {
+    const built = deps.buildSnapshotForCandidate(candidate);
+    const persisted = putCapabilitySnapshot(snapshotToStoreInput(built));
+    return { built, snapshotId: persisted.snapshotId };
+  });
+
+  const evaluation = evaluateShadowRoute({
+    contract: normalized,
+    candidates: dedupedCandidates,
+    snapshots: snapshots.map((s) => s.built),
+    policy: deps.admissionPolicy,
+  });
+
+  const snapshotIdByKey = new Map(snapshots.map((s) => [`${s.built.provider} ${s.built.model}`, s.snapshotId]));
+  appendRouteAttempts(
+    lease.taskId,
+    checkpoint.checkpointId,
+    evaluation.attempts.map((attempt) => ({
+      ordinal: attempt.ordinal,
+      provider: attempt.provider,
+      model: attempt.model,
+      capabilitySnapshotId: snapshotIdByKey.get(`${attempt.provider} ${attempt.model}`) ?? "unknown",
+      evaluationMode: "shadow",
+      eligibility: attempt.decision.outcome === "eligible" ? "eligible" : "rejected",
+      ...(attempt.decision.outcome === "ineligible"
+        ? { rejectionCode: attempt.decision.code, rejectionReason: attempt.decision.reason }
+        : {}),
+      wouldSelect: attempt.decision.outcome === "eligible",
+      observationCompleteness: digestsConsistent ? "unavailable" : "partial",
+      observationCoverage: "out-of-scope",
+    })),
+  );
+
+  return {
+    ok: true,
+    routingPolicyVersion: evaluation.routingPolicyVersion,
+    ...(evaluation.theoreticalChoice ? { theoreticalChoice: evaluation.theoreticalChoice } : {}),
+    digestsConsistent,
+  };
+}
+
+export type GetShadowAuditInput = {
+  taskId: string;
+  callerScope: SafeRoutingCallerScope;
+};
+
+export type GetShadowAuditResult =
+  | { ok: true; contract: TaskContractRow; checkpoint: TaskCheckpointRow; attempts: RouteAttemptRow[] }
+  | { ok: false; code: "not_found" };
+
+/**
+ * Object-level authorization: a caller may read a task's audit only if it is
+ * bound to their own session, or they hold explicit `operator.read` (write/
+ * admin imply read). Unauthorized and nonexistent both return the same
+ * `not_found` code so a caller cannot enumerate task ids by response shape.
+ */
+export function getShadowAudit(input: GetShadowAuditInput): GetShadowAuditResult {
+  const contract = getTaskContract(input.taskId);
+  const checkpoint = contract ? getTaskCheckpointByTaskId(input.taskId) : undefined;
+  if (!contract || !checkpoint) {
+    return { ok: false, code: "not_found" };
+  }
+
+  const callerSessionBindingDigest = `sha256:${sha256Hex(input.callerScope.sessionKey)}`;
+  const ownsSession = checkpoint.sessionBindingDigest === callerSessionBindingDigest;
+  const hasReadScope = authorizeOperatorScopesForRequiredScope(READ_SCOPE, input.callerScope.operatorScopes).allowed;
+  if (!ownsSession && !hasReadScope) {
+    return { ok: false, code: "not_found" };
+  }
+
+  return {
+    ok: true,
+    contract,
+    checkpoint,
+    attempts: listRouteAttempts(input.taskId, checkpoint.checkpointId),
+  };
+}
