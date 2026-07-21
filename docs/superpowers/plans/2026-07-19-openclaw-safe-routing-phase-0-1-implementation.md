@@ -199,7 +199,7 @@ consumeObservationLease(...)
 correlateModelCallEvent(...)
 ```
 
-租约接口接收服务端可解析的 `sessionRef`，不接收原始 session key。gateway 必须验证调用者拥有该 session，或具备显式 operator 读/管控 scope，再签发一次性 lease token；共享库只保存 session binding digest 和 token digest。事件字段沿用现有 typed hook 已提供的 `runId`、`callId`、provider、model、api、transport 和 context window 事实。
+租约接口接收服务端可解析的 `sessionRef`，不接收原始 session key。gateway 必须验证调用者拥有该 session，或具备显式 `operator.write`（`operator.admin` 按 `src/gateway/method-scopes.ts` 的 `authorizeOperatorScopesForRequiredScope` 既有规则始终隐含满足，不必单独解释），再签发一次性 lease token；共享库只保存 session binding digest 和 token digest。调用者身份必须来自网关连接层已认证的上下文，不得由调用者自己传入的 `sessionRef` 自证（具体形态见 Task 6 Step 2 的 `callerScope`）。事件字段沿用现有 typed hook 已提供的 `runId`、`callId`、provider、model、api、transport 和 context window 事实。
 
 **Step 3: 运行定向测试**
 
@@ -239,7 +239,7 @@ git commit -m "feat(safe-routing): correlate gateway model observations"
 - 新建影子任务时，`task_runs`、`task_contracts` 和首个最小 checkpoint 在同一事务提交。
 - 任一 insert 失败时三类记录全部回滚；内存 registry 也不得出现幽灵任务。
 - 相同 `(task_id, sequence)` checkpoint 不能重复。
-- observation lease 的 TTL、单次消费和 `bound_run_id/bound_call_id` 使用 checkpoint row version CAS，迟到或并发绑定必须失败。
+- observation lease 的 `bound_run_id/bound_call_id` 绑定和 `token_consumed_at` 单次消费标记各自使用 checkpoint `row_version` CAS 独立保护，迟到或并发的绑定/消费尝试必须失败；两者是独立事实，消费 token 不得使 lease 提前失去被后续真实调用绑定的资格（TTL 内仍可绑定）。
 - capability snapshot 按 digest 复用，但已经引用的 snapshot 不原地改写。
 - route attempt 必须引用存在的 task、checkpoint 和 snapshot。
 - 旧任务不自动补写安全表；只有显式创建的影子任务进入新链路。
@@ -262,7 +262,7 @@ task_checkpoints
   config_digest, plugin_registry_digest, candidate_chain_digest
   capability_snapshot_ids_json, manifest_json
   observation_lease_id, lease_expires_at, lease_state
-  session_binding_digest, lease_token_digest
+  session_binding_digest, lease_token_digest, token_consumed_at
   bound_run_id, bound_call_id, row_version
   created_at
   UNIQUE(task_id, sequence)
@@ -398,6 +398,7 @@ git commit -m "feat(agents): evaluate model capability snapshots"
 - Create: `src/agents/model-routing/shadow-evaluator.ts`
 - Create: `src/agents/model-routing/shadow-evaluator.test.ts`
 - Create: `src/agents/model-routing/route-attempt-observer.ts`
+- Create: `src/agents/model-routing/route-attempt-observer.test.ts`
 - Create: `src/tasks/safety/service.ts`
 - Create: `src/tasks/safety/service.test.ts`
 - Reuse without modification: `src/agents/model-fallback.ts`
@@ -416,6 +417,7 @@ git commit -m "feat(agents): evaluate model capability snapshots"
 - auth profile、runtime、endpoint、cooldown 和 failure domain 没有事件证据时标为 `unverified`。
 - 同一模型级 `(provider, model)` 在同一 task/checkpoint 默认只记一次；完整 route-target 去重和一次尝试限制推迟 Phase 2。
 - 批量写 route attempts 失败时，不留下半条候选链。
+- `route-attempt-observer.ts` 是独立的适配层，其 fire-and-forget 行为不被 `shadow-evaluator.test.ts`（纯评估逻辑）或 Task 2 `observed-attempt.test.ts`（只读关联数据结构）覆盖，须在 `route-attempt-observer.test.ts` 里单独断言：写入失败转 `unavailable`；started/ended 正确配对；重复 ended 事件幂等（不重复写入或重复计数）；进程中断遗留的租约在下次读取时呈现为 `partial`；错误事件不留下半条 route attempt；provider/model/runId/callId 字段映射完整；异步写入失败不产生未处理 promise rejection。
 
 **Step 2: 实现网关内纯评估器和观测适配器**
 
@@ -430,12 +432,12 @@ recordObservedModelAttempt(...)
 
 **Step 3: 实现 Core 安全服务和 gateway method 适配**
 
-`service.ts` 组合 TaskContract、当前进程 resolver、shadow evaluator、观测租约和 store，只暴露窄口径的创建租约、评估和审计查询。普通任务没有租约时只经过 hook 空检查，不写事实。插件不得直接获取 Kysely handle，也不得在 CLI 进程复制路由逻辑。
+`service.ts` 组合 TaskContract、当前进程 resolver、shadow evaluator、观测租约和 store，只暴露窄口径的创建租约、评估和审计查询；这三个方法在 `service.ts` 内部就地校验 `callerScope`（对象级授权细节见 Task 6 Step 2），不假定上层调用者已经检查过。普通任务没有租约时只经过 hook 空检查，不写事实。插件不得直接获取 Kysely handle，也不得在 CLI 进程复制路由逻辑。
 
 **Step 4: 运行测试**
 
 ```powershell
-pnpm exec vitest run --config test/vitest/vitest.agents-core.config.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/observed-attempt.test.ts
+pnpm exec vitest run --config test/vitest/vitest.agents-core.config.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/route-attempt-observer.test.ts src/agents/model-routing/observed-attempt.test.ts
 pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safety/service.test.ts
 pnpm exec vitest run --config test/vitest/vitest.plugins.config.ts src/plugins/wired-hooks-llm.test.ts
 pnpm check
@@ -444,7 +446,7 @@ pnpm check
 **Step 5: 提交**
 
 ```powershell
-git add -- src/agents/model-routing/shadow-evaluator.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/route-attempt-observer.ts src/tasks/safety/service.ts src/tasks/safety/service.test.ts
+git add -- src/agents/model-routing/shadow-evaluator.ts src/agents/model-routing/shadow-evaluator.test.ts src/agents/model-routing/route-attempt-observer.ts src/agents/model-routing/route-attempt-observer.test.ts src/tasks/safety/service.ts src/tasks/safety/service.test.ts
 git diff --cached --check
 git commit -m "feat(agents): add gateway shadow route observation"
 ```
@@ -456,64 +458,89 @@ git commit -m "feat(agents): add gateway shadow route observation"
 **文件：**
 
 - Create: `src/plugin-sdk/safe-routing.ts`
+- Create: `src/plugin-sdk/safe-routing.test.ts`
 - Create: `packages/plugin-sdk/src/safe-routing.ts`
+- Modify: `packages/plugin-sdk/package.json`（facade 包 exports 手工维护；`rg -n "packages/plugin-sdk/package\.json" scripts -g "*.mjs"` 核验过没有脚本会同步或覆盖这个字段，需手动新增 `safe-routing` 条目）
+- Modify: `src/plugins/contracts/extension-package-project-boundaries.test.ts`（`packages/plugin-sdk/package.json` 的 `exports` 字段目前只有这个测试的逐条硬编码 `expect` 校验。`plugin-sdk:api:gen/check` 只校验 canonical entrypoint 列表对应的 `src/plugin-sdk/<entry>.ts` TypeScript API surface，不读取任何 package.json；根 `package.json` 的 exports 由 `plugin-sdk:sync-exports`/`check-exports` 单独校验。这是三道互不重叠的门禁，漏加这个测试文件时，facade 包里 `safe-routing` 条目缺失或写错不会被其余两道发现；但这三道门禁都只校验类型/导出面，不校验运行时授权语义，那部分的断言归属见下方 `safe-routing.test.ts`）
 - Modify: `scripts/lib/plugin-sdk-entrypoints.json`
 - Regenerate: root `package.json` Plugin SDK exports via `pnpm plugin-sdk:sync-exports`
 - Regenerate: `docs/.generated/plugin-sdk-api-baseline.json`
 - Regenerate: `docs/.generated/plugin-sdk-api-baseline.jsonl`
 - Regenerate: `docs/.generated/plugin-sdk-api-baseline.sha256`
-- Modify: Core plugin runtime service adapter files discovered during implementation
-- Create/Modify: corresponding Plugin SDK and runtime adapter tests
+- Modify: Core plugin runtime service adapter files discovered during implementation（含 Task 5 `service.ts` 内落实的 `callerScope` 校验；若 Step 1 定位到需要单独的 gateway method 注册文件，一并列出并新增对应 `.test.ts`）
+- Create/Modify: corresponding Plugin SDK and runtime adapter tests——`src/plugin-sdk/safe-routing.test.ts` 覆盖 Step 2 列出的全部安全语义断言，不得只靠 facade exports 测试或 API baseline 兜底
 
 **Step 1: 先定位现有服务注入模式**
+
+本仓库当前是 cone 模式 sparse-checkout（`git sparse-checkout list` 核验过只含 `apps/packages/patches/scripts/src/test/ui`，不含 `extensions`）：下面这条 `rg` 会静默漏搜 `extensions/`，Step 4 的 `extension-package-project-boundaries.test.ts` 也会因此 `ENOENT`（已实测复现）。先执行 `git sparse-checkout add extensions`（或改用完整检出）把 `extensions/` materialize 出来，再跑本步和 Step 4。
 
 ```powershell
 rg -n "registerCli|plugin-sdk|services:" packages/plugin-sdk src extensions -g "*.ts"
 ```
 
-沿用现有命名、生命周期和错误边界，不创建第二套插件容器。
+沿用现有命名、生命周期和错误边界，不创建第二套插件容器；同时确认 `src/gateway/server-methods/cron-caller-scope.ts` 的既有模式（`readCronCallerScope(client: GatewayClient) → CronCallerScope`，从可信连接对象派生调用者身份，而非从客户端参数派生）——Step 2 的 `callerScope` 沿用同一模式，不发明新的鉴权中间层。gateway method 本身按 `extensions/safe-routing` 里的既有注册方式由扩展自己注册（`method-scopes.ts` 的 `getPluginRegistryState()?.activeRegistry?.gatewayMethodDescriptors` 已经通用支持插件注册方法的 scope 校验），`callerScope` 只是扩展的方法 handler 读取分发时已经可用的连接身份后自己组装的值，不新增 core `src/gateway/server-methods/*` 文件，不改 `packages/gateway-protocol/` 或核心分发基础设施——符合本计划开头「不改 gateway/protocol/UI」的 Core 例外边界。
 
 **Step 2: 写失败测试**
 
 插件侧只能调用活网关提供的窄口径服务：
 
 ```ts
-createShadowObservationLease(contract, sessionRef)
-evaluateShadowRouteInGateway(leaseId)
-getShadowAudit(taskId)
+createShadowObservationLease(contract, sessionRef, callerScope): { leaseId, leaseToken }
+evaluateShadowRouteInGateway(leaseId, leaseToken)
+getShadowAudit(taskId, callerScope)
 ```
+
+`leaseId` 对应 schema 里的 `observation_lease_id`，是非密的查找/关联标识，可安全记日志；`leaseToken` 是一次性 bearer 密钥，网关只持久化 `lease_token_digest`（Task 3 schema），从不落盘明文。两者职责不同，不得合并成同一个值。
+
+`callerScope` 是网关连接层派生并传入的可信调用者身份，沿用既有 `readCronCallerScope(client: GatewayClient) → CronCallerScope` 模式（`src/gateway/server-methods/cron-caller-scope.ts`），至少包含调用者的 `sessionKey`（判断 session 归属用）和已认证的 operator scopes。`sessionRef`/`taskId` 是调用者自己传入的参数，不能自证身份——`callerScope` 必须由 gateway method 分发层从当前连接对象派生后传入，插件或 CLI 不得自行构造，Core service 也不得在缺少 `callerScope` 时放行。`evaluateShadowRouteInGateway` 不单独接收 `callerScope`：合法未消费的 `leaseToken` 本身就是凭证（只能来自已经过 `callerScope` 校验的 `createShadowObservationLease` 调用），不必再重复派生一次调用者身份去做 operator scope 判断。
+
+`leaseToken` 的一次性消费只终结这个 bearer 凭证自身的可重放性（写入 Task 3 schema 新增的 `token_consumed_at`），用来阻止同一 token 被重复呈现来重复触发理论评估；它与 `lease_state` 是两条独立生命周期，消费 token 不改写、也不提前终止 `lease_state` 描述的观测绑定生命周期（等待绑定 → 收到匹配 `model_call_started` 后由 Task 2/5 的 hook 路径 CAS 绑定 `bound_run_id/bound_call_id` → 配对 `model_call_ended` 后完成，或因过期/未配对/digest 漂移转 `partial`）。理论评估调用消费的是 token，不是 lease；真实调用到达时，无论 token 是否已消费，lease 只要未过期、尚未被绑定，就必须仍可被 CAS 绑定。
 
 验证：
 
 - SDK 不暴露数据库 handle、任意 SQL、任意状态写入或 enforce API。
 - `createShadowObservationLease` 强制 `deliveryMode=none`，创建首个最小 checkpoint，并设置短 TTL/单次消费。
-- gateway method 必须验证 session 所有权或显式 operator 读/管控 scope；CLI 不得传递原始 session key，只传 session reference 并接收一次性 lease token。
+- gateway method 必须用 `callerScope` 验证 session 所有权，或具备显式 `operator.write`（`operator.admin` 按 `src/gateway/method-scopes.ts` 的 `authorizeOperatorScopesForRequiredScope` 既有规则始终隐含满足）；CLI 不得传递原始 session key，只传 session reference 并接收一次性 `leaseToken`。
+- `evaluateShadowRouteInGateway` 必须同时校验 `leaseToken`：网关对呈现的 token 摘要后与 `lease_token_digest` 比对，仅凭 `leaseId` 不能触发评估；`leaseToken` 呈现一次后即写入 `token_consumed_at` 并失效，重复呈现返回稳定错误码，不得把 `leaseId` 当作可重放凭证；这次消费不写入、也不依赖 `lease_state`，不得影响该 lease 后续被真实 `model_call_started` CAS 绑定的资格（两条独立生命周期，见上）。
+- `getShadowAudit` 在网关内用 `callerScope` 做对象级授权：普通调用者只能读取绑定到自己 session 的 task（`callerScope.sessionKey` 与 task 绑定 session 一致），operator 需要显式 `operator.read`（`operator.write`/`operator.admin` 按既有规则隐含满足 read）；跨 session 查询一律拒绝，且「无权访问」与「task 不存在」的错误码和响应耗时不可区分，不得通过错误差异枚举 task id。
 - 非受管 task id、损坏契约或不存在 checkpoint 返回稳定错误码。
 - gateway method 必须在活网关进程执行；CLI 进程不得自行加载 registry、auth store 或 provider health。
-- 返回值不含 provider token、base URL credentials、会话正文或隐藏推理。
+- 返回值不含 provider token、base URL credentials、会话正文或隐藏推理；`leaseToken` 本身也不得出现在日志、错误正文或 `getShadowAudit` 返回值里。
 - API baseline 能检测意外导出扩大。
+- `extension-package-project-boundaries.test.ts` 的「keeps plugin-sdk package types generated from the package build」用例新增两条断言：`packageJson.exports?.["./safe-routing"]?.types` 指向 `./dist/src/plugin-sdk/safe-routing.d.ts`，`packageJson.exports?.["./safe-routing"]?.default` 指向 `./src/safe-routing.ts`（facade 包 exports 共 64 个条目，现有断言只对其中 29 个做抽样校验，且都只查 `types`，对 `default` 缺失/写错/指错目标没有覆盖；本任务新增的这条不重复这个盲区，但不回头补齐其余条目，那是既有缺口不在本任务范围内）。这是目前唯一验证 facade 包 `exports` 字段的测试，但它只校验类型声明是否存在，不能替代下面这条运行时授权语义测试。
+- 上面列出的安全语义——token 重放拒绝、跨 session 创建/查询拒绝、`operator.read` 不能创建/评估、返回值不泄漏 `leaseToken`、Core service 不能在缺少 `callerScope` 时被绕过调用——必须在 `src/plugin-sdk/safe-routing.test.ts` 里逐条断言；API baseline 和 facade exports 测试都只覆盖类型面，不覆盖运行时授权行为，不能互相替代或兜底。
 
 **Step 3: 实现适配层**
 
 Runtime adapter 只转发到 Task 5 的 Core service。插件进程不得自行重新解析配置或复制路由逻辑；Phase 1 不暴露 enforce 或状态转换 API。
 
-**Step 4: 更新并核对 SDK API baseline**
+**Step 4: 同步根 package.json exports 并核对 SDK API baseline**
 
 ```powershell
+pnpm plugin-sdk:sync-exports
+pnpm plugin-sdk:check-exports
 pnpm plugin-sdk:api:gen
 pnpm plugin-sdk:api:check
+pnpm exec vitest run src/plugin-sdk/safe-routing.test.ts
+pnpm exec vitest run src/plugins/contracts/extension-package-project-boundaries.test.ts
 pnpm check:architecture
 pnpm check
 ```
 
+`plugin-sdk:sync-exports`／`plugin-sdk:check-exports`（`scripts/sync-plugin-sdk-exports.mjs`）读取 `scripts/lib/plugin-sdk-entrypoints.json` 生成/校验根 `package.json` 的 `exports`；`pnpm check` 不会间接跑这一步（`scripts/check.mjs` 里唯一相关项是 `lint:extensions:no-plugin-sdk-wildcard-reexports`，与 exports 同步无关），改了 `entrypoints.json` 后必须显式先跑这两条，否则根 `package.json` 可能没同步就进入后续步骤。
+
 检查生成 diff，只接受与 `safe-routing` 三个只读方法和相关类型直接对应的变化。
+
+`plugin-sdk:api:gen/check` 每次都从 `src/plugin-sdk/*.ts` 现有源码用 TS 编译器重新生成完整 baseline，只把哈希与已提交的 `.sha256` 比对，不读取 gitignored 的 `.json/.jsonl`；干净检出、这两个文件不存在时 `--check` 照常工作，drift 会显式 `exit 1` 并提示运行 `pnpm plugin-sdk:api:gen`，不会静默跳过。这条链路只校验 canonical entrypoint 对应的 TypeScript API surface，不读取任何 package.json；根 `package.json` 的 `exports` 由上面的 `plugin-sdk:sync-exports`/`check-exports` 校验，facade 包 `packages/plugin-sdk/package.json` 的 `exports` 字段则靠 `extension-package-project-boundaries.test.ts` 断言单独验证——三道门禁各管一段，互不替代。
 
 **Step 5: 提交**
 
 ```powershell
 git status --short
-git add -- src/plugin-sdk/safe-routing.ts packages/plugin-sdk/src/safe-routing.ts scripts/lib/plugin-sdk-entrypoints.json package.json docs/.generated/plugin-sdk-api-baseline.json docs/.generated/plugin-sdk-api-baseline.jsonl docs/.generated/plugin-sdk-api-baseline.sha256
+git add -- src/plugin-sdk/safe-routing.ts src/plugin-sdk/safe-routing.test.ts packages/plugin-sdk/src/safe-routing.ts packages/plugin-sdk/package.json src/plugins/contracts/extension-package-project-boundaries.test.ts scripts/lib/plugin-sdk-entrypoints.json package.json docs/.generated/plugin-sdk-api-baseline.sha256
 ```
+
+`docs/.generated/plugin-sdk-api-baseline.json` 和 `.jsonl` 命中 `.gitignore`（`docs/.generated/*.json` / `*.jsonl`），只有 `.sha256` 受版本控制，不要把前两者加入 `git add`。
 
 再把 Step 1 定位到的 runtime adapter 和对应测试逐个用完整路径加入，不得使用 `git add src`、`git add packages/plugin-sdk` 或其他目录级 pathspec。然后检查并提交：
 
@@ -582,7 +609,7 @@ openclaw safe-routing shadow --contract <path> --session-ref <opaque-session-ref
 
 1. 读取并校验契约文件，确认 `deliveryMode=none`。
 2. Phase 1 只接受固定 task kind `safe-routing-readonly-shadow`，且配置 allowlist 必须显式包含它。
-3. 通过认证 gateway method 在活网关验证 session 所有权或 operator scope，创建短 TTL、单次消费的 observation lease 和最小 checkpoint；CLI 不传原始 session key。
+3. 通过认证 gateway method 在活网关验证 session 所有权或显式 `operator.write`（`operator.admin` 隐含满足，见 Task 6 Step 2），创建短 TTL、单次消费的 observation lease 和最小 checkpoint；CLI 不传原始 session key，只传 `sessionRef`——`callerScope` 由网关连接层派生，CLI 的 `--session-ref` 参数不能自证身份。
 4. 由活网关读取当前进程 registry/config、执行理论评估，并在下一次匹配的 model-call hook 上关联实际调用。
 5. CLI 只查询并输出 `taskId`、current selection、theoretical selection、rejections、observation completeness/coverage、snapshot verification status 和 policy version。
 
@@ -722,7 +749,7 @@ Phase 0-1 只有在以下证据同时具备时才算完成：
 - clean `origin/main` 基线及已知失败有可复现记录；
 - TaskContract 可规范化、可 hash、非法能力要求会被拒绝；
 - 影子任务的 contract/checkpoint 创建具备原子性；
-- 观测租约和首个 run/call 关联使用 CAS 防迟到/并发覆盖；
+- 观测租约的 token 单次消费（`token_consumed_at`）和首个 run/call 绑定（`bound_run_id/bound_call_id`）分别使用 CAS 防迟到/并发覆盖，且两者是独立事实——消费 token 不提前终止 lease 的绑定资格；
 - lease、理论评估和首个 hook 关联绑定同一 config/plugin-registry/candidate-chain digest；变化时样本被排除；
 - 能力快照区分 configured、observed、unverified、contradicted；
 - hook 覆盖范围、partial/unavailable/out-of-scope 样本和一致率分母有明确审计记录；
