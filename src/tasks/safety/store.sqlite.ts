@@ -1,0 +1,383 @@
+// Single Core store entry point for Phase 1 safe-routing SQLite facts.
+// Plugins and CLI code must go through this module; nothing else may open a
+// Kysely handle against task_contracts/task_checkpoints/
+// model_capability_snapshots/model_route_attempts.
+import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { openOpenClawStateDatabase, runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
+import type { DB as OpenClawStateKyselyDatabase } from "../../state/openclaw-state-db.generated.js";
+import { createTaskRecord } from "../task-registry.js";
+import { upsertTaskRegistryRecordToSqlite } from "../task-registry.store.sqlite.js";
+import type { TaskRecord } from "../task-registry.types.js";
+import type {
+  AppendRouteAttemptInput,
+  CapabilitySnapshotRow,
+  CreateTaskCheckpointInput,
+  CreateTaskContractInput,
+  PutCapabilitySnapshotInput,
+  RouteAttemptRow,
+  TaskCheckpointRow,
+  TaskContractRow,
+} from "./store.types.js";
+
+const log = createSubsystemLogger("tasks.safety.store");
+
+type SafetyStoreDatabase = Pick<
+  OpenClawStateKyselyDatabase,
+  "task_contracts" | "task_checkpoints" | "model_capability_snapshots" | "model_route_attempts"
+>;
+
+function getSafetyKysely(db: DatabaseSync) {
+  return getNodeSqliteKysely<SafetyStoreDatabase>(db);
+}
+
+function serializeJson(value: unknown): string {
+  return JSON.stringify(value ?? null);
+}
+
+function parseJsonRecord(value: string | null): Record<string, unknown> | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  const parsed = JSON.parse(value) as unknown;
+  return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : undefined;
+}
+
+function parseJsonStringArray(value: string): string[] {
+  const parsed = JSON.parse(value) as unknown;
+  return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function insertTaskContractRow(db: DatabaseSync, taskId: string, input: CreateTaskContractInput, now: number): void {
+  executeSqliteQuerySync(
+    db,
+    getSafetyKysely(db)
+      .insertInto("task_contracts")
+      .values({
+        task_id: taskId,
+        schema_version: input.schemaVersion,
+        contract_json: input.contractJson,
+        contract_digest: input.contractDigest,
+        risk_class: input.riskClass,
+        review_required: input.reviewRequired ? 1 : 0,
+        delivery_mode: input.deliveryMode,
+        routing_policy_version: input.routingPolicyVersion,
+        created_at: now,
+        updated_at: now,
+      }),
+  );
+}
+
+function insertTaskCheckpointRow(
+  db: DatabaseSync,
+  taskId: string,
+  checkpointId: string,
+  input: CreateTaskCheckpointInput,
+  now: number,
+): void {
+  executeSqliteQuerySync(
+    db,
+    getSafetyKysely(db)
+      .insertInto("task_checkpoints")
+      .values({
+        checkpoint_id: checkpointId,
+        task_id: taskId,
+        sequence: input.sequence,
+        contract_digest: input.contractDigest,
+        input_digest: input.inputDigest,
+        routing_policy_version: input.routingPolicyVersion,
+        config_digest: input.configDigest,
+        plugin_registry_digest: input.pluginRegistryDigest,
+        candidate_chain_digest: input.candidateChainDigest,
+        capability_snapshot_ids_json: serializeJson(input.capabilitySnapshotIds ?? []),
+        manifest_json: input.manifest !== undefined ? serializeJson(input.manifest) : null,
+        created_at: now,
+      }),
+  );
+}
+
+/**
+ * Atomically creates a new managed (safe-routing shadow) task together with
+ * its contract and first minimal checkpoint. Reuses task-registry's own
+ * record-building/dedup/indices/observer-event pipeline via `persistOverride`
+ * so only the persistence step is swapped — old task-creation call sites are
+ * completely unaffected since none of them pass this option.
+ */
+export function createManagedTaskWithCheckpoint(params: {
+  task: Omit<Parameters<typeof createTaskRecord>[0], "persistOverride">;
+  contract: CreateTaskContractInput;
+  checkpoint: CreateTaskCheckpointInput;
+}): { task: TaskRecord; checkpointId: string } | null {
+  let persistedCheckpointId: string | undefined;
+
+  const record = createTaskRecord({
+    ...params.task,
+    persistOverride: (record) => {
+      try {
+        return runOpenClawStateWriteTransaction(() => {
+          const { db } = openOpenClawStateDatabase();
+          upsertTaskRegistryRecordToSqlite(record);
+          const now = Date.now();
+          insertTaskContractRow(db, record.taskId, params.contract, now);
+          const checkpointId = randomUUID();
+          insertTaskCheckpointRow(db, record.taskId, checkpointId, params.checkpoint, now);
+          persistedCheckpointId = checkpointId;
+          return true;
+        });
+      } catch (error) {
+        log.warn("Failed to persist managed task with checkpoint", {
+          taskId: record.taskId,
+          error,
+        });
+        return false;
+      }
+    },
+  });
+
+  if (!record || !persistedCheckpointId) {
+    return null;
+  }
+  return { task: record, checkpointId: persistedCheckpointId };
+}
+
+export function getTaskContract(taskId: string): TaskContractRow | undefined {
+  const { db } = openOpenClawStateDatabase();
+  const row = executeSqliteQuerySync(
+    db,
+    getSafetyKysely(db).selectFrom("task_contracts").selectAll().where("task_id", "=", taskId),
+  ).rows[0];
+  if (!row) {
+    return undefined;
+  }
+  return {
+    taskId: row.task_id,
+    schemaVersion: row.schema_version,
+    contractJson: row.contract_json,
+    contractDigest: row.contract_digest,
+    riskClass: row.risk_class,
+    reviewRequired: row.review_required === 1,
+    deliveryMode: row.delivery_mode,
+    routingPolicyVersion: row.routing_policy_version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function rowToCapabilitySnapshot(row: {
+  snapshot_id: string;
+  provider: string;
+  model: string;
+  runtime_id: string | null;
+  verification_status: string;
+  capabilities_json: string;
+  evidence_json: string;
+  snapshot_digest: string;
+  created_at: number;
+  expires_at: number | null;
+}): CapabilitySnapshotRow {
+  return {
+    snapshotId: row.snapshot_id,
+    provider: row.provider,
+    model: row.model,
+    ...(row.runtime_id !== null ? { runtimeId: row.runtime_id } : {}),
+    verificationStatus: row.verification_status,
+    capabilities: parseJsonRecord(row.capabilities_json) ?? {},
+    evidence: parseJsonRecord(row.evidence_json) ?? {},
+    snapshotDigest: row.snapshot_digest,
+    createdAt: row.created_at,
+    ...(row.expires_at !== null ? { expiresAt: row.expires_at } : {}),
+  };
+}
+
+/**
+ * Reuses an existing snapshot by digest; never rewrites an already-referenced
+ * snapshot in place. Uses INSERT OR IGNORE + re-select so concurrent callers
+ * racing the same digest converge on the same winning row.
+ */
+export function putCapabilitySnapshot(input: PutCapabilitySnapshotInput): CapabilitySnapshotRow {
+  return runOpenClawStateWriteTransaction(() => {
+    const { db } = openOpenClawStateDatabase();
+    const kysely = getSafetyKysely(db);
+    const existing = executeSqliteQuerySync(
+      db,
+      kysely.selectFrom("model_capability_snapshots").selectAll().where("snapshot_digest", "=", input.snapshotDigest),
+    ).rows[0];
+    if (existing) {
+      return rowToCapabilitySnapshot(existing);
+    }
+    const snapshotId = randomUUID();
+    const now = Date.now();
+    executeSqliteQuerySync(
+      db,
+      kysely
+        .insertInto("model_capability_snapshots")
+        .values({
+          snapshot_id: snapshotId,
+          provider: input.provider,
+          model: input.model,
+          runtime_id: input.runtimeId ?? null,
+          verification_status: input.verificationStatus,
+          capabilities_json: serializeJson(input.capabilities),
+          evidence_json: serializeJson(input.evidence),
+          snapshot_digest: input.snapshotDigest,
+          created_at: now,
+          expires_at: input.expiresAt ?? null,
+        })
+        .onConflict((conflict) => conflict.column("snapshot_digest").doNothing()),
+    );
+    const row = executeSqliteQuerySync(
+      db,
+      kysely.selectFrom("model_capability_snapshots").selectAll().where("snapshot_digest", "=", input.snapshotDigest),
+    ).rows[0];
+    if (!row) {
+      throw new Error(`Failed to persist or find capability snapshot for digest ${input.snapshotDigest}`);
+    }
+    return rowToCapabilitySnapshot(row);
+  });
+}
+
+/** Batch-inserts route attempts atomically: a failure on any one leaves no partial candidate chain. */
+export function appendRouteAttempts(
+  taskId: string,
+  checkpointId: string,
+  attempts: readonly AppendRouteAttemptInput[],
+): RouteAttemptRow[] {
+  if (attempts.length === 0) {
+    return [];
+  }
+  return runOpenClawStateWriteTransaction(() => {
+    const { db } = openOpenClawStateDatabase();
+    const kysely = getSafetyKysely(db);
+    const now = Date.now();
+    const rows: RouteAttemptRow[] = attempts.map((attempt) => ({ ...attempt, attemptId: randomUUID(), taskId, checkpointId, createdAt: now }));
+    for (const row of rows) {
+      executeSqliteQuerySync(
+        db,
+        kysely.insertInto("model_route_attempts").values({
+          attempt_id: row.attemptId,
+          task_id: row.taskId,
+          checkpoint_id: row.checkpointId,
+          ordinal: row.ordinal,
+          provider: row.provider,
+          model: row.model,
+          runtime_id: row.runtimeId ?? null,
+          run_id: row.runId ?? null,
+          call_id: row.callId ?? null,
+          capability_snapshot_id: row.capabilitySnapshotId,
+          evaluation_mode: row.evaluationMode,
+          eligibility: row.eligibility,
+          rejection_code: row.rejectionCode ?? null,
+          rejection_reason: row.rejectionReason ?? null,
+          would_select: row.wouldSelect ? 1 : 0,
+          auth_profile_ref: row.authProfileRef ?? null,
+          endpoint_id: row.endpointId ?? null,
+          failure_domain_json: row.failureDomain !== undefined ? serializeJson(row.failureDomain) : null,
+          observation_completeness: row.observationCompleteness,
+          observation_coverage: row.observationCoverage,
+          observer_error_code: row.observerErrorCode ?? null,
+          created_at: row.createdAt,
+        }),
+      );
+    }
+    return rows;
+  });
+}
+
+export function listRouteAttempts(taskId: string, checkpointId: string): RouteAttemptRow[] {
+  const { db } = openOpenClawStateDatabase();
+  const kysely = getSafetyKysely(db);
+  const rows = executeSqliteQuerySync(
+    db,
+    kysely
+      .selectFrom("model_route_attempts")
+      .selectAll()
+      .where("task_id", "=", taskId)
+      .where("checkpoint_id", "=", checkpointId)
+      .orderBy("ordinal", "asc"),
+  ).rows;
+  return rows.map((row) => ({
+    attemptId: row.attempt_id,
+    taskId: row.task_id,
+    checkpointId: row.checkpoint_id,
+    ordinal: row.ordinal,
+    provider: row.provider,
+    model: row.model,
+    ...(row.runtime_id !== null ? { runtimeId: row.runtime_id } : {}),
+    ...(row.run_id !== null ? { runId: row.run_id } : {}),
+    ...(row.call_id !== null ? { callId: row.call_id } : {}),
+    capabilitySnapshotId: row.capability_snapshot_id,
+    evaluationMode: row.evaluation_mode,
+    eligibility: row.eligibility,
+    ...(row.rejection_code !== null ? { rejectionCode: row.rejection_code } : {}),
+    ...(row.rejection_reason !== null ? { rejectionReason: row.rejection_reason } : {}),
+    wouldSelect: row.would_select === 1,
+    ...(row.auth_profile_ref !== null ? { authProfileRef: row.auth_profile_ref } : {}),
+    ...(row.endpoint_id !== null ? { endpointId: row.endpoint_id } : {}),
+    ...(row.failure_domain_json !== null
+      ? { failureDomain: parseJsonRecord(row.failure_domain_json) }
+      : {}),
+    observationCompleteness: row.observation_completeness,
+    observationCoverage: row.observation_coverage,
+    ...(row.observer_error_code !== null ? { observerErrorCode: row.observer_error_code } : {}),
+    createdAt: row.created_at,
+  }));
+}
+
+function rowToTaskCheckpoint(row: {
+  checkpoint_id: string;
+  task_id: string;
+  sequence: number;
+  contract_digest: string;
+  input_digest: string;
+  routing_policy_version: string;
+  config_digest: string;
+  plugin_registry_digest: string;
+  candidate_chain_digest: string;
+  capability_snapshot_ids_json: string;
+  manifest_json: string | null;
+  observation_lease_id: string | null;
+  lease_expires_at: number | null;
+  lease_state: string | null;
+  session_binding_digest: string | null;
+  lease_token_digest: string | null;
+  token_consumed_at: number | null;
+  bound_run_id: string | null;
+  bound_call_id: string | null;
+  row_version: number;
+  created_at: number;
+}): TaskCheckpointRow {
+  return {
+    checkpointId: row.checkpoint_id,
+    taskId: row.task_id,
+    sequence: row.sequence,
+    contractDigest: row.contract_digest,
+    inputDigest: row.input_digest,
+    routingPolicyVersion: row.routing_policy_version,
+    configDigest: row.config_digest,
+    pluginRegistryDigest: row.plugin_registry_digest,
+    candidateChainDigest: row.candidate_chain_digest,
+    capabilitySnapshotIds: parseJsonStringArray(row.capability_snapshot_ids_json),
+    ...(row.manifest_json !== null ? { manifest: parseJsonRecord(row.manifest_json) } : {}),
+    ...(row.observation_lease_id !== null ? { observationLeaseId: row.observation_lease_id } : {}),
+    ...(row.lease_expires_at !== null ? { leaseExpiresAt: row.lease_expires_at } : {}),
+    ...(row.lease_state !== null ? { leaseState: row.lease_state } : {}),
+    ...(row.session_binding_digest !== null ? { sessionBindingDigest: row.session_binding_digest } : {}),
+    ...(row.lease_token_digest !== null ? { leaseTokenDigest: row.lease_token_digest } : {}),
+    ...(row.token_consumed_at !== null ? { tokenConsumedAt: row.token_consumed_at } : {}),
+    ...(row.bound_run_id !== null ? { boundRunId: row.bound_run_id } : {}),
+    ...(row.bound_call_id !== null ? { boundCallId: row.bound_call_id } : {}),
+    rowVersion: row.row_version,
+    createdAt: row.created_at,
+  };
+}
+
+export function getTaskCheckpoint(checkpointId: string): TaskCheckpointRow | undefined {
+  const { db } = openOpenClawStateDatabase();
+  const row = executeSqliteQuerySync(
+    db,
+    getSafetyKysely(db).selectFrom("task_checkpoints").selectAll().where("checkpoint_id", "=", checkpointId),
+  ).rows[0];
+  return row ? rowToTaskCheckpoint(row) : undefined;
+}
