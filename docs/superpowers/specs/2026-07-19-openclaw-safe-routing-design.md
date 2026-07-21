@@ -450,14 +450,14 @@ Phase 1 只按现有 `{provider, model}` 候选身份去重，并明确审计粒
 - 不接管主会话，不发送、导出或发布。
 - safe-routing 扩展加载在活网关中，使用 `api.on("model_call_started")` 和 `api.on("model_call_ended")` 被动记录实际 provider/model 调用；不使用可能只注册不派发的旧式 `registerHook` 路径。
 - 理论候选链和能力判断由活网关内的窄口径 Core 服务计算，使用该进程当前插件注册表、环境和配置；不得由独立 CLI 重新初始化一套 registry 后充当 live 真值。
-- CLI 通过扩展 gateway method 查询或发起影子诊断。CLI 不接受原始 session key；gateway 解析服务端 session reference 并签发一次性 lease token，调用者必须拥有该 session，或具备显式 operator 读/管控 scope。共享库只保存 session binding digest 和 lease token digest，不保存原始 session key/token。若提供显式离线 what-if，只能输出静态 `{provider, model}` 判断，并把 live availability、auth target、runtime、endpoint 和 failure domain 标为 `unverified`；离线结果不得用于 Phase 2 一致率门槛。
+- CLI 通过扩展 gateway method 查询或发起影子诊断。CLI 不接受原始 session key；gateway 解析服务端 session reference 并签发一次性 lease token：发起诊断（创建租约/理论评估）要求调用者拥有该 session 或具备显式 `operator.write`，查询审计要求拥有该 session 或具备显式 `operator.read`（`operator.admin` 始终隐含满足两者）。授权判断锚定在网关已认证的连接身份上，不由调用者自报的 session reference/task id 自证。共享库只保存 session binding digest 和 lease token digest，不保存原始 session key/token。若提供显式离线 what-if，只能输出静态 `{provider, model}` 判断，并把 live availability、auth target、runtime、endpoint 和 failure domain 标为 `unverified`；离线结果不得用于 Phase 2 一致率门槛。
 - 只写 TaskContract、最小只读 checkpoint、能力快照和模型级 route attempts；Phase 1 不创建 Safety State。
 - typed hook 是尽力观测路径；缺少 started/ended 配对或进程中断时标记 `observationCompleteness=partial`，observer 写入失败标记 `unavailable`，未经过 hook dispatch 的调用标记 `observationCoverage=out-of-scope`；这些样本不得伪装成已验证一致。
-- 输出内部审计报告；未验证能力显示 `unverified`。
+- 输出内部审计报告；未验证能力显示 `unverified`。审计查询按 task 做对象级授权：普通调用者只能读取自己 session 绑定的 task，operator 需要显式 `operator.read`；跨 session 查询拒绝，且拒绝响应不得与「task 不存在」产生可枚举的差异。
 
 Phase 1 的主验收证据来自网关内“理论准入判断 vs 实际 provider/model 调用”的相关记录。CLI 的作用是控制和查看，不是另一个路由器。
 
-显式试点使用一次性观测租约关联真实调用：CLI 通过认证 gateway method 为指定 session reference 建立短 TTL、单次消费的 shadow checkpoint；gateway 在服务端验证 session 所有权或 operator scope 后签发 lease token，共享库只保存 session binding digest 和 token digest，不保存原始 session key/token。lease/checkpoint 同时绑定 contract、config、plugin registry 和 candidate chain digest。活网关收到下一次匹配的 `model_call_started` 后以 CAS 绑定首个 run/call，后续并发调用不抢占；租约过期、任一快照 digest 变化、未绑定或缺少 ended 事件均标记 `partial`，observer 写入失败标记 `unavailable`。普通会话没有租约时只经过现有 hook 的空检查，不写任何事实。
+显式试点使用一次性观测租约关联真实调用：CLI 通过认证 gateway method 为指定 session reference 建立短 TTL、单次消费的 shadow checkpoint；gateway 在服务端验证 session 所有权或显式 `operator.write` 后签发 lease token，共享库只保存 session binding digest 和 token digest，不保存原始 session key/token。lease/checkpoint 同时绑定 contract、config、plugin registry 和 candidate chain digest。呈现 lease token 触发理论评估、与活网关收到下一次匹配的 `model_call_started` 后 CAS 绑定首个 run/call，是两条独立生命周期：前者只终结 token 自身的可重放性，不提前终止后者的绑定资格，后续并发的真实调用绑定不抢占；租约过期、任一快照 digest 变化、未绑定或缺少 ended 事件均标记 `partial`，observer 写入失败标记 `unavailable`。普通会话没有租约时只经过现有 hook 的空检查，不写任何事实。
 
 ## 15. 能力探针
 
@@ -480,6 +480,8 @@ src/tasks/task-registry.store.sqlite.ts
 src/state/openclaw-state-schema.sql
 src/plugin-sdk/safe-routing.ts
 packages/plugin-sdk/src/safe-routing.ts
+packages/plugin-sdk/package.json  (facade 包 exports 手工维护，需手动新增条目)
+src/plugins/contracts/extension-package-project-boundaries.test.ts  (facade 包 exports 字段的唯一校验点)
 scripts/lib/plugin-sdk-entrypoints.json
 package.json  (由 plugin-sdk:sync-exports 生成 Plugin SDK exports)
 ```
