@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { normalizeTaskContract } from "../../tasks/safety/contracts.js";
 import { buildCapabilitySnapshot } from "./capability-snapshot.js";
-import { evaluateShadowRoute } from "./shadow-evaluator.js";
+import { candidateKey, evaluateShadowRoute } from "./shadow-evaluator.js";
 
 const CONTRACT = normalizeTaskContract({
   schemaVersion: 1,
@@ -132,6 +132,34 @@ describe("evaluateShadowRoute", () => {
       },
     ]);
     expect(result.theoreticalChoice).toBeUndefined();
+  });
+
+  it("candidateKey does not collide across a shifted provider/model boundary", () => {
+    expect(candidateKey("foo", "bar baz")).not.toBe(candidateKey("foo bar", "baz"));
+  });
+
+  it("evaluates candidates with a shifted provider/model boundary as distinct, not deduped", () => {
+    const candidates = [
+      { provider: "foo", model: "bar baz" },
+      { provider: "foo bar", model: "baz" },
+    ];
+    const snapshots = [
+      snapshotFor("foo", "bar baz", 200000),
+      snapshotFor("foo bar", "baz", 200000),
+    ];
+
+    const result = evaluateShadowRoute({
+      contract: CONTRACT,
+      candidates,
+      snapshots,
+      policy: POLICY,
+    });
+
+    expect(result.attempts).toHaveLength(2);
+    expect(result.attempts.map((a) => `${a.provider}|${a.model}`)).toEqual([
+      "foo|bar baz",
+      "foo bar|baz",
+    ]);
   });
 
   it("reports no theoretical choice when every candidate is ineligible", () => {

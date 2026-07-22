@@ -37,8 +37,9 @@ export type EvaluateShadowRouteResult = {
   attempts: ShadowRouteAttempt[];
 };
 
-function candidateKey(provider: string, model: string): string {
-  return `${provider} ${model}`;
+/** Length-prefixes `provider` so no two distinct (provider, model) pairs can ever collide, even when either contains the delimiter. */
+export function candidateKey(provider: string, model: string): string {
+  return `${provider.length}:${provider}:${model}`;
 }
 
 /**

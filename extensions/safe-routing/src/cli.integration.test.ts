@@ -10,6 +10,7 @@ import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { closeOpenClawStateDatabaseForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import plugin from "../index.js";
+import { __testing as rateLimitTesting } from "./rate-limit.js";
 
 type RespondCall = [ok: boolean, payload?: unknown, error?: { code?: unknown; message?: unknown }];
 type CapturedHandler = (params: {
@@ -117,6 +118,7 @@ describe("extensions/safe-routing — gateway method handlers (mode gate + end-t
       process.env.OPENCLAW_STATE_DIR = originalStateDir;
     }
     rmSync(tmpStateDir, { recursive: true, force: true });
+    rateLimitTesting.reset();
   });
 
   it("mode=off refuses all three methods and writes nothing", async () => {
@@ -246,6 +248,24 @@ describe("extensions/safe-routing — gateway method handlers (mode gate + end-t
     const result = await callMethod(methods, "safe-routing.audit", { taskId: "whatever" });
 
     expect(result).toMatchObject({ ok: false, error: { code: "not_found" } });
+  });
+
+  it("rate-limits safe-routing.evaluate per caller once its budget is exhausted", async () => {
+    const { methods } = activatePlugin({
+      mode: "shadow",
+      allowedTaskKinds: ["safe-routing-readonly-shadow"],
+      approvedProviders: ["anthropic"],
+    });
+
+    const results: Array<{ ok: boolean; error?: { code?: unknown } }> = [];
+    for (let i = 0; i < 11; i++) {
+      results.push(
+        await callMethod(methods, "safe-routing.evaluate", { leaseId: "x", leaseToken: "y" }),
+      );
+    }
+
+    expect(results.slice(0, 10).every((r) => r.error?.code !== "rate_limited")).toBe(true);
+    expect(results[10]).toMatchObject({ ok: false, error: { code: "rate_limited" } });
   });
 
   it("registers model_call_started/ended hook handlers that no-op safely when mode=off", async () => {
