@@ -5,6 +5,8 @@
  * operations. Plugins reach this only through the Task 6 Plugin SDK adapter;
  * this module never assumes an upper caller already validated `callerScope`.
  */
+import { randomUUID } from "node:crypto";
+import { buildCapabilitySnapshot } from "../../agents/model-routing/capability-snapshot.js";
 import type { ModelCapabilitySnapshot } from "../../agents/model-routing/capability-snapshot.js";
 import type { ModelRoutingAdmissionPolicy } from "../../agents/model-routing/candidate-admission.js";
 import {
@@ -12,12 +14,19 @@ import {
   type ShadowRouteCandidate,
 } from "../../agents/model-routing/shadow-evaluator.js";
 import { stableStringify } from "../../agents/stable-stringify.js";
+import { DEFAULT_PROVIDER } from "../../agents/defaults.js";
+import { resolveModelCandidateChain } from "../../agents/model-fallback.js";
+import { buildModelAliasIndex, resolveModelRefFromString } from "../../agents/model-selection-resolve.js";
+import { getRuntimeConfig } from "../../config/io.js";
+import { resolveAgentModelPrimaryValue } from "../../config/model-input.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { sha256Hex } from "../../infra/crypto-digest.js";
 import {
   READ_SCOPE,
   WRITE_SCOPE,
   authorizeOperatorScopesForRequiredScope,
 } from "../../gateway/method-scopes.js";
+import { getPluginRegistryState } from "../../plugins/runtime-state.js";
 import {
   consumeObservationLease,
   createObservationLease,
@@ -26,6 +35,7 @@ import {
 import {
   appendRouteAttempts,
   createManagedTaskWithCheckpoint,
+  createSqliteObservationLeaseStore,
   getTaskCheckpointByTaskId,
   getTaskContract,
   listRouteAttempts,
@@ -35,7 +45,7 @@ import type { PutCapabilitySnapshotInput, RouteAttemptRow, TaskCheckpointRow, Ta
 import { digestTaskContract, normalizeTaskContract, type NormalizedTaskContract, type PersistedTaskContract } from "./contracts.js";
 
 /** The fixed, only Phase 1 task kind — enforced by the Task 7 extension's allowedTaskKinds gate. */
-const SAFE_ROUTING_SHADOW_TASK_KIND = "safe-routing-readonly-shadow";
+export const SAFE_ROUTING_SHADOW_TASK_KIND = "safe-routing-readonly-shadow";
 
 export type SafeRoutingCallerScope = {
   sessionKey: string;
@@ -60,6 +70,88 @@ export type SafeRoutingServiceDeps = {
 
 function digestCandidateChain(candidates: readonly ShadowRouteCandidate[]): string {
   return `sha256:${sha256Hex(stableStringify(candidates))}`;
+}
+
+function resolveLiveCandidates(cfg: OpenClawConfig): ShadowRouteCandidate[] {
+  const primaryRaw = resolveAgentModelPrimaryValue(cfg.agents?.defaults?.model);
+  if (!primaryRaw?.trim()) {
+    return [];
+  }
+  const aliasIndex = buildModelAliasIndex({ cfg, defaultProvider: DEFAULT_PROVIDER });
+  const resolved = resolveModelRefFromString({
+    cfg,
+    raw: primaryRaw,
+    defaultProvider: DEFAULT_PROVIDER,
+    aliasIndex,
+  });
+  if (!resolved?.ref.provider || !resolved.ref.model) {
+    return [];
+  }
+  return resolveModelCandidateChain({ cfg, provider: resolved.ref.provider, model: resolved.ref.model });
+}
+
+function buildLiveCapabilitySnapshot(cfg: OpenClawConfig, candidate: ShadowRouteCandidate): ModelCapabilitySnapshot {
+  const providerConfig = cfg.models?.providers?.[candidate.provider];
+  const modelConfig = providerConfig?.models?.find((entry) => entry.id === candidate.model);
+  const modalities = modelConfig?.input?.filter(
+    (value): value is "text" | "image" | "audio" => value === "text" || value === "image" || value === "audio",
+  );
+  return buildCapabilitySnapshot({
+    provider: candidate.provider,
+    model: candidate.model,
+    configured: {
+      contextWindowTokens: modelConfig?.contextWindow ?? providerConfig?.contextWindow,
+      outputTokens: modelConfig?.maxTokens ?? providerConfig?.maxTokens,
+      ...(modalities && modalities.length > 0 ? { modalities } : {}),
+      toolCalling: modelConfig?.compat?.supportsTools,
+      api: modelConfig?.api ?? providerConfig?.api,
+    },
+    decisionGradeAuthorization: {
+      maxAuthorizedDecisionGrade: "final",
+      reason:
+        "Phase 1 has no per-model decisionGrade authorization policy source yet; " +
+        "defaulting to unrestricted pending a real routing-policy input (see Task 5/7 disclosure).",
+    },
+  });
+}
+
+export type CreateLiveSafeRoutingServiceDepsInput = {
+  admissionPolicy: ModelRoutingAdmissionPolicy;
+  /** Defaults to 5 minutes — short-lived, single-use per Task 6 Step 2. */
+  leaseTtlMs?: number;
+};
+
+/**
+ * Builds the real, live-gateway-process `SafeRoutingServiceDeps`: reads the
+ * current config via `getRuntimeConfig()`, resolves the current model-level
+ * candidate chain via the unmodified `resolveModelCandidateChain`, and builds
+ * capability snapshots from config declarations only (Phase 1 has no runtime
+ * probe pipeline yet). Extensions call this instead of constructing deps by
+ * hand so Core (not the extension) owns config/model-fallback plumbing and the
+ * lease store's SQLite handle never needs to be exposed through the SDK.
+ */
+export function createLiveSafeRoutingServiceDeps(
+  input: CreateLiveSafeRoutingServiceDepsInput,
+): SafeRoutingServiceDeps {
+  return {
+    now: () => Date.now(),
+    randomId: () => randomUUID(),
+    leaseTtlMs: input.leaseTtlMs ?? 5 * 60_000,
+    admissionPolicy: input.admissionPolicy,
+    resolveCandidates: () => resolveLiveCandidates(getRuntimeConfig()),
+    configDigest: () => `sha256:${sha256Hex(stableStringify(getRuntimeConfig()))}`,
+    pluginRegistryDigest: () => {
+      const state = getPluginRegistryState();
+      return `sha256:${sha256Hex(
+        stableStringify({
+          activeVersion: state?.activeVersion,
+          importedPluginIds: [...(state?.importedPluginIds ?? [])].toSorted(),
+        }),
+      )}`;
+    },
+    buildSnapshotForCandidate: (candidate) => buildLiveCapabilitySnapshot(getRuntimeConfig(), candidate),
+    leaseStore: createSqliteObservationLeaseStore(),
+  };
 }
 
 function authorizesSessionOwnershipOrScope(
@@ -130,7 +222,7 @@ export type CreateShadowObservationLeaseInput = {
 };
 
 export type CreateShadowObservationLeaseResult =
-  | { ok: true; leaseId: string; leaseToken: string }
+  | { ok: true; taskId: string; leaseId: string; leaseToken: string }
   | { ok: false; code: "forbidden" | "invalid_contract" };
 
 /**
@@ -209,7 +301,7 @@ export function createShadowObservationLease(
     now,
   });
 
-  return { ok: true, leaseId, leaseToken };
+  return { ok: true, taskId: managed.task.taskId, leaseId, leaseToken };
 }
 
 export type EvaluateShadowRouteInGatewayInput = {

@@ -79,7 +79,13 @@ describe("plugin-sdk safe-routing facade", () => {
   it("exposes exactly the narrow safe-routing surface — no database handle, arbitrary SQL, or enforce API", () => {
     const valueExports = Object.keys(safeRoutingSdk).toSorted();
 
-    expect(valueExports).toEqual(["createShadowObservationLease", "evaluateShadowRouteInGateway", "getShadowAudit"]);
+    expect(valueExports).toEqual([
+      "SAFE_ROUTING_SHADOW_TASK_KIND",
+      "createLiveSafeRoutingServiceDeps",
+      "createShadowObservationLease",
+      "evaluateShadowRouteInGateway",
+      "getShadowAudit",
+    ]);
   });
 
   it("forces deliveryMode=none through the SDK re-export regardless of the caller's contract", async () => {

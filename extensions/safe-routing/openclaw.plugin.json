@@ -1,0 +1,32 @@
+{
+  "id": "safe-routing",
+  "enabledByDefault": false,
+  "activation": {
+    "onStartup": true,
+    "onCommands": ["safe-routing"]
+  },
+  "name": "Safe Routing (Phase 1 shadow)",
+  "description": "Read-only shadow evaluation of theoretical model routing admission. Mode defaults to off; no facts are written unless explicitly enabled with an approved-provider allowlist.",
+  "catalog": { "featured": false },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": ["off", "shadow"],
+        "default": "off"
+      },
+      "allowedTaskKinds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": []
+      },
+      "approvedProviders": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": []
+      }
+    }
+  }
+}
