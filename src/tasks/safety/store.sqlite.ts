@@ -441,24 +441,44 @@ function checkpointToObservationLease(checkpoint: TaskCheckpointRow): Observatio
 export function createSqliteObservationLeaseStore(): ObservationLeaseStore {
   return {
     insert(lease) {
-      const { db } = openOpenClawStateDatabase();
-      executeSqliteQuerySync(
-        db,
-        getSafetyKysely(db)
-          .updateTable("task_checkpoints")
-          .set({
-            observation_lease_id: lease.leaseId,
-            lease_expires_at: lease.expiresAt,
-            lease_state: lease.state,
-            session_binding_digest: lease.sessionBindingDigest,
-            lease_token_digest: lease.leaseTokenDigest,
-            token_consumed_at: lease.tokenConsumedAt ?? null,
-            bound_run_id: lease.boundRunId ?? null,
-            bound_call_id: lease.boundCallId ?? null,
-            row_version: lease.rowVersion,
-          })
-          .where("checkpoint_id", "=", lease.checkpointId),
-      );
+      runOpenClawStateWriteTransaction(() => {
+        const { db } = openOpenClawStateDatabase();
+        // At most one live pending lease per session: supersede any other
+        // still-pending lease for the same session inside this same
+        // transaction, so a real hook event can never bind to a stale,
+        // already-replaced lease (the new row's own session_binding_digest is
+        // still NULL at this point, so it cannot match and supersede itself).
+        executeSqliteQuerySync(
+          db,
+          getSafetyKysely(db)
+            .updateTable("task_checkpoints")
+            .set({ lease_state: "superseded" })
+            .where("session_binding_digest", "=", lease.sessionBindingDigest)
+            .where("lease_state", "=", "pending"),
+        );
+        const result = executeSqliteQuerySync(
+          db,
+          getSafetyKysely(db)
+            .updateTable("task_checkpoints")
+            .set({
+              observation_lease_id: lease.leaseId,
+              lease_expires_at: lease.expiresAt,
+              lease_state: lease.state,
+              session_binding_digest: lease.sessionBindingDigest,
+              lease_token_digest: lease.leaseTokenDigest,
+              token_consumed_at: lease.tokenConsumedAt ?? null,
+              bound_run_id: lease.boundRunId ?? null,
+              bound_call_id: lease.boundCallId ?? null,
+              row_version: lease.rowVersion,
+            })
+            .where("checkpoint_id", "=", lease.checkpointId),
+        );
+        if ((result.numAffectedRows ?? 0n) !== 1n) {
+          throw new Error(
+            `observation lease insert affected ${result.numAffectedRows ?? 0n} row(s) for checkpointId=${lease.checkpointId}, expected exactly 1`,
+          );
+        }
+      });
     },
     findById(leaseId) {
       const { db } = openOpenClawStateDatabase();

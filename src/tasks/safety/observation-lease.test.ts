@@ -43,6 +43,38 @@ describe("createObservationLease", () => {
   });
 });
 
+describe("ObservationLeaseStore.insert — supersede on create", () => {
+  it("supersedes an existing pending lease for the same session when a new one is created", () => {
+    const store = createInMemoryObservationLeaseStore();
+    createObservationLease(store, buildLeaseInput({ leaseId: "lease-1" }));
+
+    createObservationLease(store, buildLeaseInput({ leaseId: "lease-2" }));
+
+    expect(store.findById("lease-1")).toMatchObject({ state: "superseded" });
+    expect(store.findById("lease-2")).toMatchObject({ state: "pending" });
+    expect(store.findPendingBySessionBindingDigest("sha256:session-digest")?.leaseId).toBe("lease-2");
+  });
+
+  it("does not supersede a pending lease belonging to a different session", () => {
+    const store = createInMemoryObservationLeaseStore();
+    createObservationLease(store, buildLeaseInput({ leaseId: "lease-1", sessionBindingDigest: "sha256:session-a" }));
+
+    createObservationLease(store, buildLeaseInput({ leaseId: "lease-2", sessionBindingDigest: "sha256:session-b" }));
+
+    expect(store.findById("lease-1")).toMatchObject({ state: "pending" });
+  });
+
+  it("does not disturb an already-bound lease for the same session", () => {
+    const store = createInMemoryObservationLeaseStore();
+    createObservationLease(store, buildLeaseInput({ leaseId: "lease-1" }));
+    store.compareAndSwap("lease-1", 1, { state: "bound", boundRunId: "run-1", boundCallId: "call-1" });
+
+    createObservationLease(store, buildLeaseInput({ leaseId: "lease-2" }));
+
+    expect(store.findById("lease-1")).toMatchObject({ state: "bound", boundRunId: "run-1" });
+  });
+});
+
 describe("consumeObservationLease", () => {
   it("consumes the token exactly once", () => {
     const store = createInMemoryObservationLeaseStore();

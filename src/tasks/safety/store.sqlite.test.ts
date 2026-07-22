@@ -317,6 +317,84 @@ describe("safety store sqlite", () => {
     );
   });
 
+  it("supersedes an existing pending lease for the same session when a second lease is inserted", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-store-lease-supersede-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const first = createManagedTask();
+        const second = createManagedTask();
+        const leaseStore = createSqliteObservationLeaseStore();
+
+        leaseStore.insert({
+          leaseId: "lease-1",
+          taskId: first.task.taskId,
+          checkpointId: first.checkpointId,
+          sessionBindingDigest: "sha256:session-digest",
+          leaseTokenDigest: "sha256:token-digest-1",
+          contractDigest: "sha256:contract-digest",
+          configDigest: "sha256:config-digest",
+          pluginRegistryDigest: "sha256:registry-digest",
+          candidateChainDigest: "sha256:candidate-digest",
+          expiresAt: Date.now() + 60_000,
+          state: "pending",
+          rowVersion: 1,
+        });
+
+        leaseStore.insert({
+          leaseId: "lease-2",
+          taskId: second.task.taskId,
+          checkpointId: second.checkpointId,
+          sessionBindingDigest: "sha256:session-digest",
+          leaseTokenDigest: "sha256:token-digest-2",
+          contractDigest: "sha256:contract-digest",
+          configDigest: "sha256:config-digest",
+          pluginRegistryDigest: "sha256:registry-digest",
+          candidateChainDigest: "sha256:candidate-digest",
+          expiresAt: Date.now() + 60_000,
+          state: "pending",
+          rowVersion: 1,
+        });
+
+        expect(leaseStore.findById("lease-1")).toMatchObject({ state: "superseded" });
+        expect(leaseStore.findById("lease-2")).toMatchObject({ state: "pending" });
+        expect(leaseStore.findPendingBySessionBindingDigest("sha256:session-digest")?.leaseId).toBe("lease-2");
+
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
+  it("throws and leaves no row affected when insert targets a nonexistent checkpoint", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-store-lease-insert-missing-checkpoint-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const leaseStore = createSqliteObservationLeaseStore();
+
+        expect(() =>
+          leaseStore.insert({
+            leaseId: "lease-1",
+            taskId: "no-such-task",
+            checkpointId: "no-such-checkpoint",
+            sessionBindingDigest: "sha256:session-digest",
+            leaseTokenDigest: "sha256:token-digest",
+            contractDigest: "sha256:contract-digest",
+            configDigest: "sha256:config-digest",
+            pluginRegistryDigest: "sha256:registry-digest",
+            candidateChainDigest: "sha256:candidate-digest",
+            expiresAt: Date.now() + 60_000,
+            state: "pending",
+            rowVersion: 1,
+          }),
+        ).toThrow(/expected exactly 1/);
+
+        expect(leaseStore.findById("lease-1")).toBeUndefined();
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
   it("rejects a lease CAS whose expected rowVersion is stale, leaving the row untouched", async () => {
     await withOpenClawTestState(
       { layout: "state-only", prefix: "openclaw-safety-store-lease-cas-" },
