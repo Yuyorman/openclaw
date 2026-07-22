@@ -350,12 +350,6 @@ importers:
         specifier: 0.1.9
         version: 0.1.9
 
-  examples/ai-chat:
-    dependencies:
-      '@openclaw/ai':
-        specifier: workspace:*
-        version: link:../../packages/ai
-
   extensions/acpx:
     dependencies:
       '@agentclientprotocol/claude-agent-acp':
@@ -1659,6 +1653,15 @@ importers:
       '@openclaw/plugin-sdk':
         specifier: workspace:*
         version: link:../../packages/plugin-sdk
+
+  extensions/safe-routing:
+    devDependencies:
+      '@openclaw/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+      openclaw:
+        specifier: workspace:*
+        version: link:../..
 
   extensions/searxng:
     devDependencies:
