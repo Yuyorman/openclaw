@@ -142,13 +142,11 @@ export function evaluateCandidateAdmission(
         `Provider ${snapshot.provider} is not in the approved-providers allowlist`,
       );
     }
-  } else {
-    if (snapshot.api.value === undefined || !LOCAL_ONLY_APIS.has(snapshot.api.value)) {
-      return ineligible(
-        "DATA_POLICY",
-        `Candidate api ${snapshot.api.value ?? "unverified"} is not a recognized local-only runtime`,
-      );
-    }
+  } else if (snapshot.api.value === undefined || !LOCAL_ONLY_APIS.has(snapshot.api.value)) {
+    return ineligible(
+      "DATA_POLICY",
+      `Candidate api ${snapshot.api.value ?? "unverified"} is not a recognized local-only runtime`,
+    );
   }
 
   if (

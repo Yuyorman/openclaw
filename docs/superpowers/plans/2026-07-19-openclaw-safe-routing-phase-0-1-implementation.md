@@ -16,14 +16,14 @@
 
 ## 1. 实施包分解
 
-| 实施包 | 范围 | 启用条件 |
-|---|---|---|
-| A | Phase 0-1：基线、契约、最小 checkpoint、能力快照、影子路由 | 本计划详细实施 |
-| B | Phase 2：真实候选能力门和可续跑 checkpoint | A 稳定运行一周且影子决策验证通过 |
-| C | Phase 3：Effect Ledger 和 Replay Guard | B 的真实只读切换验收通过 |
-| D | Phase 4：完整状态门禁和独立复核 | C 的故障注入全部通过 |
-| E | Phase 5：原子 finalization 与现有 delivery queue 绑定 | D 的旧 checkpoint/旧复核阻断通过 |
-| F | Phase 6：受控文本、图片和高风险模型梯队 | E 的并发、崩溃和对账验收通过 |
+| 实施包 | 范围                                                       | 启用条件                         |
+| ------ | ---------------------------------------------------------- | -------------------------------- |
+| A      | Phase 0-1：基线、契约、最小 checkpoint、能力快照、影子路由 | 本计划详细实施                   |
+| B      | Phase 2：真实候选能力门和可续跑 checkpoint                 | A 稳定运行一周且影子决策验证通过 |
+| C      | Phase 3：Effect Ledger 和 Replay Guard                     | B 的真实只读切换验收通过         |
+| D      | Phase 4：完整状态门禁和独立复核                            | C 的故障注入全部通过             |
+| E      | Phase 5：原子 finalization 与现有 delivery queue 绑定      | D 的旧 checkpoint/旧复核阻断通过 |
+| F      | Phase 6：受控文本、图片和高风险模型梯队                    | E 的并发、崩溃和对账验收通过     |
 
 实施包 B-F 各自使用独立规范、计划和用户批准，不在本计划中预写未经验证的代码细节。
 
@@ -148,11 +148,11 @@ pnpm exec vitest run --config test/vitest/vitest.tasks.config.ts src/tasks/safet
 导出：
 
 ```ts
-TaskCapabilityRequirements
-PersistedTaskContract
-NormalizedTaskContract
-normalizeTaskContract(input)
-digestTaskContract(contract)
+TaskCapabilityRequirements;
+PersistedTaskContract;
+NormalizedTaskContract;
+normalizeTaskContract(input);
+digestTaskContract(contract);
 ```
 
 使用现有 `stableStringify` 和 `sha256Hex`，digest 格式固定为 `sha256:<64 lowercase hex>`。不增加通用 schema 框架或可配置抽象。

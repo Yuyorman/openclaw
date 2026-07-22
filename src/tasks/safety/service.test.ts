@@ -49,7 +49,7 @@ function buildContract(overrides: Partial<PersistedTaskContract> = {}): Persiste
 }
 
 function createTestDeps(overrides: Partial<SafeRoutingServiceDeps> = {}): SafeRoutingServiceDeps {
-  let clock = 1_000;
+  const clock = 1_000;
   let idCounter = 0;
   return {
     now: () => clock,
@@ -111,13 +111,17 @@ describe("safety service", () => {
         });
 
         expect(result.ok).toBe(true);
-        if (!result.ok) throw new Error("unreachable");
+        if (!result.ok) {
+          throw new Error("unreachable");
+        }
         const lease = deps.leaseStore.findById(result.leaseId);
         expect(lease).toMatchObject({ state: "pending" });
 
         const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
         expect(audit.ok).toBe(true);
-        if (!audit.ok) throw new Error("unreachable");
+        if (!audit.ok) {
+          throw new Error("unreachable");
+        }
         expect(audit.contract.deliveryMode).toBe("none");
 
         closeOpenClawStateDatabase();
@@ -223,7 +227,9 @@ describe("safety service", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
 
         const result = evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
@@ -238,7 +244,9 @@ describe("safety service", () => {
 
         const lease = deps.leaseStore.findById(created.leaseId);
         const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
-        if (!audit.ok) throw new Error("unreachable");
+        if (!audit.ok) {
+          throw new Error("unreachable");
+        }
         expect(audit.attempts).toHaveLength(2);
         expect(audit.attempts.find((a) => a.provider === "openai")).toMatchObject({
           eligibility: "rejected",
@@ -267,7 +275,9 @@ describe("safety service", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
 
         const driftedDeps: SafeRoutingServiceDeps = {
           ...deps,
@@ -281,7 +291,9 @@ describe("safety service", () => {
         expect(result).toMatchObject({ ok: true, digestsConsistent: false });
         const lease = deps.leaseStore.findById(created.leaseId);
         const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
-        if (!audit.ok) throw new Error("unreachable");
+        if (!audit.ok) {
+          throw new Error("unreachable");
+        }
         expect(audit.attempts.every((a) => a.observationCompleteness === "partial")).toBe(true);
 
         closeOpenClawStateDatabase();
@@ -300,7 +312,9 @@ describe("safety service", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
 
         const result = evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
@@ -325,7 +339,9 @@ describe("safety service", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
           leaseToken: created.leaseToken,
@@ -353,14 +369,18 @@ describe("safety service", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!first.ok) throw new Error("unreachable");
+        if (!first.ok) {
+          throw new Error("unreachable");
+        }
 
         const second = createShadowObservationLease(deps, {
           contract: buildContract(),
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!second.ok) throw new Error("unreachable");
+        if (!second.ok) {
+          throw new Error("unreachable");
+        }
 
         const evaluatedFirst = evaluateShadowRouteInGateway(deps, {
           leaseId: first.leaseId,
@@ -407,7 +427,9 @@ describe("safety service", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         const lease = deps.leaseStore.findById(created.leaseId);
 
         const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
@@ -429,7 +451,9 @@ describe("safety service", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         const lease = deps.leaseStore.findById(created.leaseId);
 
         const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OTHER_SESSION });
@@ -453,7 +477,9 @@ describe("safety service", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         const lease = deps.leaseStore.findById(created.leaseId);
 
         const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OPERATOR_READ });

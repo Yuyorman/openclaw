@@ -26,6 +26,13 @@ function writeLine(value: string): void {
   process.stdout.write(`${value}\n`);
 }
 
+/** Safely renders a gateway-boundary `unknown` value that is expected to be a scalar; never risks a `[object Object]`-style base toString. */
+function describeScalar(value: unknown, fallback: string): string {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+    ? String(value)
+    : fallback;
+}
+
 async function callSafeRoutingGateway(
   method: string,
   options: JsonOptions & { url?: string; token?: string; timeout?: string; expectFinal?: boolean },
@@ -120,9 +127,9 @@ export function registerSafeRoutingCli(params: { program: Command }): void {
       writeJson(result);
       return;
     }
-    writeLine(`taskId: ${result.taskId}`);
-    writeLine(`routingPolicyVersion: ${String(result.routingPolicyVersion ?? "unknown")}`);
-    writeLine(`digestsConsistent: ${String(result.digestsConsistent ?? "unknown")}`);
+    writeLine(`taskId: ${describeScalar(result.taskId, "unknown")}`);
+    writeLine(`routingPolicyVersion: ${describeScalar(result.routingPolicyVersion, "unknown")}`);
+    writeLine(`digestsConsistent: ${describeScalar(result.digestsConsistent, "unknown")}`);
     writeLine(
       `theoreticalSelection: ${result.theoreticalSelection ? JSON.stringify(result.theoreticalSelection) : "none eligible"}`,
     );

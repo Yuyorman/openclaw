@@ -123,14 +123,7 @@ Phase 2 首次需要可恢复阻塞时，再单独设计和迁移非终态 `bloc
 
 ```ts
 type TaskStatus =
-  | "queued"
-  | "running"
-  | "blocked"
-  | "succeeded"
-  | "failed"
-  | "timed_out"
-  | "cancelled"
-  | "lost";
+  "queued" | "running" | "blocked" | "succeeded" | "failed" | "timed_out" | "cancelled" | "lost";
 ```
 
 未来的 `status=blocked` 是可恢复的非终态，仅用于挂载 `task_safety_state` 的受管任务。届时必须一并更新所有穷尽映射、gateway protocol、CLI/UI 展示和测试，并明确它与既有终态 `terminalOutcome=blocked` 的区别。旧二进制读取新状态值的兼容性必须在 Phase 2 部署门中验证。
@@ -165,16 +158,16 @@ effect_safety  = CLEAN | COMMITTED | INDETERMINATE | RECONCILED
 
 ### 6.3 目标表
 
-| 表 | 用途 | 阶段 |
-|---|---|---|
-| `task_contracts` | 任务契约、风险和所需能力 | Phase 1 |
-| `model_capability_snapshots` | 不可变能力声明和探针结果 | Phase 1 |
-| `model_route_attempts` | Phase 1 保存模型级候选判断和实际调用观测；Phase 2 扩展真实路由目标 | Phase 1 |
-| `task_checkpoints` | Phase 1 保存最小只读检查点，Phase 2 启用可续跑交接语义 | Phase 1 |
-| `task_safety_state` | Phase 2 增加完成度/降级/能力阻塞，Phase 3/4 再扩展副作用和复核事实 | Phase 2 |
-| `effects` | 非交付类外部动作账本 | Phase 3 |
-| `task_reviews` | 独立复核记录 | Phase 4 |
-| `finalizations` | 正式终结门禁快照 | Phase 5 |
+| 表                           | 用途                                                               | 阶段    |
+| ---------------------------- | ------------------------------------------------------------------ | ------- |
+| `task_contracts`             | 任务契约、风险和所需能力                                           | Phase 1 |
+| `model_capability_snapshots` | 不可变能力声明和探针结果                                           | Phase 1 |
+| `model_route_attempts`       | Phase 1 保存模型级候选判断和实际调用观测；Phase 2 扩展真实路由目标 | Phase 1 |
+| `task_checkpoints`           | Phase 1 保存最小只读检查点，Phase 2 启用可续跑交接语义             | Phase 1 |
+| `task_safety_state`          | Phase 2 增加完成度/降级/能力阻塞，Phase 3/4 再扩展副作用和复核事实 | Phase 2 |
+| `effects`                    | 非交付类外部动作账本                                               | Phase 3 |
+| `task_reviews`               | 独立复核记录                                                       | Phase 4 |
+| `finalizations`              | 正式终结门禁快照                                                   | Phase 5 |
 
 不新增 `provider_health`。鉴权凭据和冷却真值位于各 agent 的 `openclaw-agent.sqlite`，活网关还持有按 agent 路径分组的进程内 runtime snapshot；不得假设共享 `state/openclaw.sqlite` 中同名旧表是实时来源，也不得对共享库和 agent 库做长期 live join。
 
@@ -333,7 +326,9 @@ type ToolEffectDescriptor = {
     canonicalIntent: unknown;
   };
   extractReceipt?: (result: unknown) => { remoteReceipt?: string };
-  reconcile?: (effect: EffectRecord) => Promise<
+  reconcile?: (
+    effect: EffectRecord,
+  ) => Promise<
     | { status: "committed"; receipt?: string }
     | { status: "not_committed" }
     | { status: "unresolved"; retryable: boolean }
@@ -420,21 +415,21 @@ FinalizationRejectedError
 
 ## 13. 错误路由矩阵
 
-| 事件 | 候选处理 | fallback/状态 |
-|---|---|---|
-| 能力不满足或强制能力未验证 | 跳过 | 检查下一候选；全部不合格则 `blocked/CAPABLE_MODEL` |
-| 额度耗尽 | 先走现有 auth rotation | 账号池耗尽后切故障域 |
-| 429/rate limit | 冷却当前模型或账号池 | 允许 |
-| 401/鉴权失败 | 隔离实际 auth target | 允许切其他账号池或 provider |
-| model not found | 隔离精确 provider/model | 允许并持久告警 |
-| provider/gateway unavailable | 标记当次故障域 | 跨故障域 |
-| 超时且无副作用 | 记录超时 | 允许 |
-| 超时且有不确定副作用 | 停止 | `blocked/UNSAFE_RETRY` |
-| 已提交副作用但无提交后 checkpoint | 保留现场 | `blocked/UNSAFE_RETRY` |
-| 上下文超限 | 以静态窗口重新校验候选；动态余量只作诊断 | 仅允许静态窗口满足契约的候选 |
-| runtime/harness 不兼容 | 跳过 | 全部不兼容则 `blocked/CAPABLE_MODEL` |
-| 数据策略不允许 provider | 调用前跳过 | 无合规候选则 `blocked/CAPABLE_MODEL` |
-| 未分类错误 | 先执行 Replay Guard | 无副作用时可切，否则停止 |
+| 事件                              | 候选处理                                 | fallback/状态                                      |
+| --------------------------------- | ---------------------------------------- | -------------------------------------------------- |
+| 能力不满足或强制能力未验证        | 跳过                                     | 检查下一候选；全部不合格则 `blocked/CAPABLE_MODEL` |
+| 额度耗尽                          | 先走现有 auth rotation                   | 账号池耗尽后切故障域                               |
+| 429/rate limit                    | 冷却当前模型或账号池                     | 允许                                               |
+| 401/鉴权失败                      | 隔离实际 auth target                     | 允许切其他账号池或 provider                        |
+| model not found                   | 隔离精确 provider/model                  | 允许并持久告警                                     |
+| provider/gateway unavailable      | 标记当次故障域                           | 跨故障域                                           |
+| 超时且无副作用                    | 记录超时                                 | 允许                                               |
+| 超时且有不确定副作用              | 停止                                     | `blocked/UNSAFE_RETRY`                             |
+| 已提交副作用但无提交后 checkpoint | 保留现场                                 | `blocked/UNSAFE_RETRY`                             |
+| 上下文超限                        | 以静态窗口重新校验候选；动态余量只作诊断 | 仅允许静态窗口满足契约的候选                       |
+| runtime/harness 不兼容            | 跳过                                     | 全部不兼容则 `blocked/CAPABLE_MODEL`               |
+| 数据策略不允许 provider           | 调用前跳过                               | 无合规候选则 `blocked/CAPABLE_MODEL`               |
+| 未分类错误                        | 先执行 Replay Guard                      | 无副作用时可切，否则停止                           |
 
 Phase 1 只按现有 `{provider, model}` 候选身份去重，并明确审计粒度为 `model-level`。Phase 2 获得 live resolved facts 后，同一路由目标改以 `provider + model + authProfileRef + runtimeId + endpoint/failureDomain` 判定；同一 task/checkpoint 内每个真实路由目标默认最多尝试一次，仅当 Replay Guard 确认安全且策略明确允许时才能增加次数。
 

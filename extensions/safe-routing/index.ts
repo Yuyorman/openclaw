@@ -10,6 +10,7 @@ import {
   recordObservedModelAttemptInGateway,
   type SafeRoutingCallerScope,
 } from "openclaw/plugin-sdk/safe-routing";
+import { asRecord, readStringField } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { registerSafeRoutingCli } from "./src/cli.js";
 import { validateSafeRoutingConfig, type SafeRoutingExtensionConfig } from "./src/config.js";
 
@@ -64,13 +65,13 @@ export default definePluginEntry({
         respondNotFound(respond);
         return;
       }
-      const typed = params as { contract?: unknown; sessionRef?: unknown };
+      const record = asRecord(params);
       const deps = createLiveSafeRoutingServiceDeps({
         admissionPolicy: { approvedProviders: config.approvedProviders },
       });
       const result = createShadowObservationLease(deps, {
-        contract: typed.contract as never,
-        sessionRef: String(typed.sessionRef ?? ""),
+        contract: record.contract as never,
+        sessionRef: readStringField(record, "sessionRef") ?? "",
         callerScope,
       });
       respond(
@@ -86,13 +87,13 @@ export default definePluginEntry({
         respondDisabled(respond);
         return;
       }
-      const typed = params as { leaseId?: unknown; leaseToken?: unknown };
+      const record = asRecord(params);
       const deps = createLiveSafeRoutingServiceDeps({
         admissionPolicy: { approvedProviders: config.approvedProviders },
       });
       const result = evaluateShadowRouteInGateway(deps, {
-        leaseId: String(typed.leaseId ?? ""),
-        leaseToken: String(typed.leaseToken ?? ""),
+        leaseId: readStringField(record, "leaseId") ?? "",
+        leaseToken: readStringField(record, "leaseToken") ?? "",
       });
       respond(
         result.ok,
@@ -112,8 +113,11 @@ export default definePluginEntry({
         respondNotFound(respond);
         return;
       }
-      const typed = params as { taskId?: unknown };
-      const result = getShadowAudit({ taskId: String(typed.taskId ?? ""), callerScope });
+      const record = asRecord(params);
+      const result = getShadowAudit({
+        taskId: readStringField(record, "taskId") ?? "",
+        callerScope,
+      });
       respond(
         result.ok,
         result.ok ? result : undefined,
