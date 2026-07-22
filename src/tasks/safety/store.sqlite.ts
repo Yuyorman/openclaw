@@ -528,10 +528,11 @@ export function createSqliteObservationLeaseStore(): ObservationLeaseStore {
             .updateTable("task_checkpoints")
             .set({
               lease_state: "superseded",
-              // kysely-allow-raw: increments in place; the exact prior value
-              // is irrelevant, only that any concurrent CAS's expected
-              // row_version can no longer match after this commits.
-              row_version: sql<number>`row_version + 1`,
+              row_version:
+                // kysely-allow-raw: increments in place; the exact prior value
+                // is irrelevant, only that any concurrent CAS's expected
+                // row_version can no longer match after this commits.
+                sql<number>`row_version + 1`,
             })
             .where("session_binding_digest", "=", lease.sessionBindingDigest)
             .where("lease_state", "=", "pending"),
