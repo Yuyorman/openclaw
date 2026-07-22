@@ -85,6 +85,7 @@ describe("plugin-sdk safe-routing facade", () => {
       "createShadowObservationLease",
       "evaluateShadowRouteInGateway",
       "getShadowAudit",
+      "recordObservedModelAttemptInGateway",
     ]);
   });
 

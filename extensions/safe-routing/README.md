@@ -48,6 +48,11 @@ openclaw safe-routing shadow --contract ./contract.json --session-ref my-session
   `theoreticalSelection` (first eligible candidate, if any), and
   `currentSelection` (the candidate a real hook-observed call has actually
   correlated to, if any yet).
+- At most one pending lease is ever live per session: creating a new lease
+  immediately supersedes any other still-pending lease for the same session
+  (in the same write transaction), so a real hook event can never bind to a
+  stale, already-replaced lease. Evaluating a superseded lease's token returns
+  `{ ok: false, code: "superseded" }`.
 
 ## Real-call observation
 
@@ -94,6 +99,17 @@ OpenClaw builds that do not recognize these tables simply ignore them.
   key only; it does not yet have a verified way to read `operator.write`/
   `operator.read` scopes off a plugin gateway method's `client` object, so
   only session ownership (not the operator-scope fallback) is enforced today.
+- `recordObservedModelAttemptInGateway` (the hook-bridge used for real-call
+  observation) has no caller-identity check of its own — it trusts its
+  `event`/`ctx` arguments verbatim, because its only intended caller is Core's
+  own typed-hook dispatcher. Any other installed plugin that also constructs
+  `SafeRoutingServiceDeps` could call it directly with a fabricated
+  `ctx.sessionKey`, corrupting the observation trail of a session that
+  currently holds an active lease. This cannot corrupt real routing or real
+  model calls — Phase 1 never enforces anything — only the shadow audit's own
+  report data for a session that voluntarily opted into shadow evaluation.
+  Closing it fully needs Core to give hook dispatch tamper-evident
+  provenance; out of scope for Phase 1.
 
 ## Phase 1 boundaries (by design, not just "not implemented yet")
 

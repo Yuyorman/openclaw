@@ -269,6 +269,39 @@ describe("safety service", () => {
     });
   });
 
+  it("supersedes an earlier pending lease when a second is created for the same session; the superseded lease can never be evaluated", async () => {
+    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-supersede-" }, async () => {
+      resetTaskRegistryForTests();
+      const deps = createTestDeps();
+      const first = createShadowObservationLease(deps, {
+        contract: buildContract(),
+        sessionRef: "session-owner",
+        callerScope: OWNER,
+      });
+      if (!first.ok) throw new Error("unreachable");
+
+      const second = createShadowObservationLease(deps, {
+        contract: buildContract(),
+        sessionRef: "session-owner",
+        callerScope: OWNER,
+      });
+      if (!second.ok) throw new Error("unreachable");
+
+      const evaluatedFirst = evaluateShadowRouteInGateway(deps, {
+        leaseId: first.leaseId,
+        leaseToken: first.leaseToken,
+      });
+      expect(evaluatedFirst).toEqual({ ok: false, code: "superseded" });
+
+      const evaluatedSecond = evaluateShadowRouteInGateway(deps, {
+        leaseId: second.leaseId,
+        leaseToken: second.leaseToken,
+      });
+      expect(evaluatedSecond.ok).toBe(true);
+      closeOpenClawStateDatabase();
+    });
+  });
+
   it("returns not_found for evaluation against an unknown leaseId", async () => {
     await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-unknown-lease-" }, async () => {
       resetTaskRegistryForTests();

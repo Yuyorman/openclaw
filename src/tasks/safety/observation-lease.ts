@@ -4,7 +4,7 @@
  * for live-gateway authentication and hook wiring).
  */
 
-export type ObservationLeaseState = "pending" | "bound" | "complete" | "partial";
+export type ObservationLeaseState = "pending" | "bound" | "complete" | "partial" | "superseded";
 
 export type ObservationLease = {
   leaseId: string;
@@ -51,6 +51,18 @@ export function createInMemoryObservationLeaseStore(): ObservationLeaseStore {
 
   return {
     insert(lease) {
+      // At most one live pending lease per session: a new lease immediately
+      // supersedes any other still-pending lease for the same session, so a
+      // real hook event can never bind to a stale, already-replaced lease.
+      for (const [leaseId, existing] of leasesById) {
+        if (
+          leaseId !== lease.leaseId &&
+          existing.state === "pending" &&
+          existing.sessionBindingDigest === lease.sessionBindingDigest
+        ) {
+          leasesById.set(leaseId, { ...existing, state: "superseded", rowVersion: existing.rowVersion + 1 });
+        }
+      }
       leasesById.set(lease.leaseId, { ...lease });
     },
     findById(leaseId) {

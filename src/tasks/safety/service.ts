@@ -326,7 +326,7 @@ export type EvaluateShadowRouteInGatewayResult =
       theoreticalChoice?: ShadowRouteCandidate;
       digestsConsistent: boolean;
     }
-  | { ok: false; code: "not_found" | "invalid_token" | "expired" | "already_consumed" };
+  | { ok: false; code: "not_found" | "invalid_token" | "expired" | "already_consumed" | "superseded" };
 
 /**
  * Consumes the lease's one-time token, then runs the pure shadow evaluator
@@ -346,6 +346,12 @@ export function evaluateShadowRouteInGateway(
   }
   if (`sha256:${sha256Hex(input.leaseToken)}` !== lease.leaseTokenDigest) {
     return { ok: false, code: "invalid_token" };
+  }
+  if (lease.state === "superseded") {
+    // A newer createShadowObservationLease call for the same session replaced
+    // this lease before it was evaluated; it can never be evaluated now (see
+    // ObservationLeaseStore.insert's supersede-on-create step).
+    return { ok: false, code: "superseded" };
   }
   const consumed = consumeObservationLease(deps.leaseStore, input.leaseId, deps.now());
   if (!consumed.ok) {
@@ -479,6 +485,18 @@ export type RecordObservedModelAttemptInGatewayInput =
  * Task 7 extension) into `route-attempt-observer.ts`'s pure correlation and
  * persistence logic. Fire-and-forget by construction (never throws — see
  * `recordObservedModelAttempt`'s own contract).
+ *
+ * Trust boundary: unlike the other three exported methods, this one has no
+ * caller-identity check of its own — it trusts `input.ctx`/`input.event`
+ * verbatim, because the only intended caller is Core's own typed-hook
+ * dispatcher (which supplies a real session's `ctx`, not attacker-suppliable
+ * data). Only call this from an `api.on("model_call_started"/"model_call_ended", ...)`
+ * handler; calling it directly with a fabricated `ctx.sessionKey` lets the
+ * caller record a fabricated observation against any session that currently
+ * holds an active lease. That residual is disclosed in
+ * extensions/safe-routing/README.md's Known Phase 1 limitations — closing it
+ * fully would require Core to give hook dispatch tamper-evident provenance,
+ * which is out of Phase 1's scope.
  */
 export async function recordObservedModelAttemptInGateway(
   deps: SafeRoutingServiceDeps,
