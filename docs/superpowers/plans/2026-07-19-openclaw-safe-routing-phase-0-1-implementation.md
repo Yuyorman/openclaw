@@ -774,6 +774,17 @@ Phase 0-1 只有在以下证据同时具备时才算完成：
 
 ---
 
+## 实施期间已验证的偏差（Task 0-8 全部完成后补记）
+
+- **Task 3**：租约的 SQLite 持久化没有走计划预测的独立表，而是发现 `task_checkpoints` 行本身已经带有全部租约字段（`observation_lease_id`/`lease_state`/... ），`insert` 语义等价于对既有 checkpoint 行的 UPDATE；因此没有改 `task-registry.store.*` 任何文件，只在 `task-registry.ts` 加了 13 行 `persistOverride` 钩子。
+- **Task 5/7**：`SafeRoutingServiceDeps` 里"当前进程 resolver"最初设计成由调用方（扩展）自行拼装，实测发现扩展只能碰 plugin-sdk 窄口径，够不到 `resolveModelCandidateChain`/插件注册表——改为 Core 侧 `createLiveSafeRoutingServiceDeps()` 工厂，扩展只传 `approvedProviders`。
+- **Task 7**：真实调用观测（`model_call_started`/`model_call_ended`）一度被误判为"需要改 Core 公开 API 才能订阅"；深入排查后确认 `api.on(hookName, handler)`（`registerTypedHook` 的公开别名）本来就支持这两个 hook 名——`extensions/workboard` 早就用同一机制订阅别的事件——最终零 Core 改动，只在 `extensions/safe-routing/index.ts` 加了两个 `api.on` 订阅 + service.ts 第四个窄口径方法 `recordObservedModelAttemptInGateway`。
+- **Task 7 Step 5 / Task 8 Step 2**：两处测试命令原文写的 `vitest.plugins.config.ts` 对 `extensions/` 目录不生效（该 config 的 `dir`/`include` 只扫 `src/plugins/**`），实际覆盖 `extensions/**/*.test.ts` 的是 `vitest.extensions.config.ts`；本仓库当时是 sparse-checkout 且不含 `extensions/`，落地时补了 `git sparse-checkout add extensions` 和 `git sparse-checkout add docs`（后者是因为 `docs/.generated/plugin-sdk-api-baseline.sha256` 也不在原有 sparse 范围内）。
+- **`pnpm check`** 的 `database-first legacy-store guard` 一项在补上 `extensions/` 到 sparse-checkout 后由失败转为通过——此前的失败是该检查在不完整工作树下的误报，不是代码问题。
+- **`pnpm test:fast`**：跑过一次（`vitest.unit.config.ts`），10+ 分钟仍未跑完被 stall 检测杀掉，暴露 74 处失败用例，全部分布在与本分支完全无关的子系统（`skills/*`、`crestodian/*`、`context-engine/*`、`commitments/*`、`node-host/*` 等）；输出里 grep 不到任何 `safe-routing`/`model-routing`/`tasks/safety` 相关命中。未做完整 clean-base 对照跑（单次即耗时且未跑完，成本过高），按结构性证据（零主题重叠 + 完全不相干子系统 + 该分片本身有 stall 问题）判定为环境存量缺口，不视为本分支引入的回归。
+
+---
+
 ## 后续阶段入口门槛
 
 - **Phase 2（enforce 路由 + 可恢复 checkpoint）：** 至少完成一组经探针验证的低风险文本候选；shadow 与人工判定一致率、拒绝原因准确率达到预定门槛；live path 有一键关闭和对照测试。
