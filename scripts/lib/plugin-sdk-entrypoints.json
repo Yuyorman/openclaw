@@ -311,5 +311,6 @@
   "zod",
   "agent-core",
   "agent-sessions",
-  "llm"
+  "llm",
+  "safe-routing"
 ]

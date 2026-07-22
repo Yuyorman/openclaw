@@ -288,6 +288,10 @@ describe("opt-in extension package boundaries", () => {
       "./dist/src/plugin-sdk/text-runtime.d.ts",
     );
     expect(packageJson.exports?.["./zod"]?.types).toBe("./dist/src/plugin-sdk/zod.d.ts");
+    expect(packageJson.exports?.["./safe-routing"]?.types).toBe(
+      "./dist/src/plugin-sdk/safe-routing.d.ts",
+    );
+    expect(packageJson.exports?.["./safe-routing"]?.default).toBe("./src/safe-routing.ts");
     expect(fs.existsSync(resolve(REPO_ROOT, "packages/plugin-sdk/types/plugin-entry.d.ts"))).toBe(
       false,
     );

@@ -243,6 +243,10 @@
     "./zod": {
       "types": "./dist/src/plugin-sdk/zod.d.ts",
       "default": "./src/zod.ts"
+    },
+    "./safe-routing": {
+      "types": "./dist/src/plugin-sdk/safe-routing.d.ts",
+      "default": "./src/safe-routing.ts"
     }
   }
 }

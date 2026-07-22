@@ -1370,6 +1370,10 @@
     "./plugin-sdk/llm": {
       "default": "./dist/plugin-sdk/llm.js"
     },
+    "./plugin-sdk/safe-routing": {
+      "types": "./dist/plugin-sdk/safe-routing.d.ts",
+      "default": "./dist/plugin-sdk/safe-routing.js"
+    },
     "./cli-entry": "./openclaw.mjs"
   },
   "scripts": {
