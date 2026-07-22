@@ -724,6 +724,44 @@ export interface ModelCapabilityCache {
   updated_at_ms: number;
 }
 
+export interface ModelCapabilitySnapshots {
+  capabilities_json: string;
+  created_at: number;
+  evidence_json: string;
+  expires_at: number | null;
+  model: string;
+  provider: string;
+  runtime_id: string | null;
+  snapshot_digest: string;
+  snapshot_id: string;
+  verification_status: string;
+}
+
+export interface ModelRouteAttempts {
+  attempt_id: string;
+  auth_profile_ref: string | null;
+  call_id: string | null;
+  capability_snapshot_id: string;
+  checkpoint_id: string;
+  created_at: number;
+  eligibility: string;
+  endpoint_id: string | null;
+  evaluation_mode: string;
+  failure_domain_json: string | null;
+  model: string;
+  observation_completeness: string;
+  observation_coverage: string;
+  observer_error_code: string | null;
+  ordinal: number;
+  provider: string;
+  rejection_code: string | null;
+  rejection_reason: string | null;
+  run_id: string | null;
+  runtime_id: string | null;
+  task_id: string;
+  would_select: number;
+}
+
 export interface NativeHookRelayBridges {
   expires_at_ms: number;
   hostname: string;
@@ -991,6 +1029,43 @@ export interface SubagentRuns {
   workspace_dir: string | null;
 }
 
+export interface TaskCheckpoints {
+  bound_call_id: string | null;
+  bound_run_id: string | null;
+  candidate_chain_digest: string;
+  capability_snapshot_ids_json: string;
+  checkpoint_id: string;
+  config_digest: string;
+  contract_digest: string;
+  created_at: number;
+  input_digest: string;
+  lease_expires_at: number | null;
+  lease_state: string | null;
+  lease_token_digest: string | null;
+  manifest_json: string | null;
+  observation_lease_id: string | null;
+  plugin_registry_digest: string;
+  routing_policy_version: string;
+  row_version: Generated<number>;
+  sequence: number;
+  session_binding_digest: string | null;
+  task_id: string;
+  token_consumed_at: number | null;
+}
+
+export interface TaskContracts {
+  contract_digest: string;
+  contract_json: string;
+  created_at: number;
+  delivery_mode: string;
+  review_required: number;
+  risk_class: string;
+  routing_policy_version: string;
+  schema_version: number;
+  task_id: string;
+  updated_at: number;
+}
+
 export interface TaskDeliveryState {
   last_notified_event_at: number | null;
   requester_origin_json: string | null;
@@ -1227,6 +1302,8 @@ export interface DB {
   migration_runs: MigrationRuns;
   migration_sources: MigrationSources;
   model_capability_cache: ModelCapabilityCache;
+  model_capability_snapshots: ModelCapabilitySnapshots;
+  model_route_attempts: ModelRouteAttempts;
   native_hook_relay_bridges: NativeHookRelayBridges;
   node_host_config: NodeHostConfig;
   official_external_plugin_catalog_snapshots: OfficialExternalPluginCatalogSnapshots;
@@ -1246,6 +1323,8 @@ export interface DB {
   skill_usage: SkillUsage;
   state_leases: StateLeases;
   subagent_runs: SubagentRuns;
+  task_checkpoints: TaskCheckpoints;
+  task_contracts: TaskContracts;
   task_delivery_state: TaskDeliveryState;
   task_runs: TaskRuns;
   tui_last_sessions: TuiLastSessions;

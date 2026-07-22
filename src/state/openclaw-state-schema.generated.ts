@@ -1433,6 +1433,106 @@ CREATE TABLE IF NOT EXISTS task_delivery_state (
   FOREIGN KEY (task_id) REFERENCES task_runs(task_id) ON DELETE CASCADE
 );
 
+-- Phase 1 safe-routing shadow observation facts. Additive only: does not
+-- extend task_runs.status or its gateway/protocol/UI mappings.
+CREATE TABLE IF NOT EXISTS task_contracts (
+  task_id TEXT NOT NULL PRIMARY KEY,
+  schema_version INTEGER NOT NULL,
+  contract_json TEXT NOT NULL,
+  contract_digest TEXT NOT NULL,
+  risk_class TEXT NOT NULL,
+  review_required INTEGER NOT NULL,
+  delivery_mode TEXT NOT NULL,
+  routing_policy_version TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES task_runs(task_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_contracts_risk_class ON task_contracts(risk_class);
+
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+  checkpoint_id TEXT NOT NULL PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  contract_digest TEXT NOT NULL,
+  input_digest TEXT NOT NULL,
+  routing_policy_version TEXT NOT NULL,
+  config_digest TEXT NOT NULL,
+  plugin_registry_digest TEXT NOT NULL,
+  candidate_chain_digest TEXT NOT NULL,
+  capability_snapshot_ids_json TEXT NOT NULL,
+  manifest_json TEXT,
+  observation_lease_id TEXT,
+  lease_expires_at INTEGER,
+  lease_state TEXT,
+  session_binding_digest TEXT,
+  lease_token_digest TEXT,
+  token_consumed_at INTEGER,
+  bound_run_id TEXT,
+  bound_call_id TEXT,
+  row_version INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES task_runs(task_id) ON DELETE CASCADE,
+  UNIQUE (task_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task_id ON task_checkpoints(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_observation_lease_id
+  ON task_checkpoints(observation_lease_id);
+
+CREATE TABLE IF NOT EXISTS model_capability_snapshots (
+  snapshot_id TEXT NOT NULL PRIMARY KEY,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  runtime_id TEXT,
+  verification_status TEXT NOT NULL,
+  capabilities_json TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  snapshot_digest TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  UNIQUE (snapshot_digest)
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_capability_snapshots_provider_model
+  ON model_capability_snapshots(provider, model, created_at);
+
+CREATE TABLE IF NOT EXISTS model_route_attempts (
+  attempt_id TEXT NOT NULL PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  checkpoint_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  runtime_id TEXT,
+  run_id TEXT,
+  call_id TEXT,
+  capability_snapshot_id TEXT NOT NULL,
+  evaluation_mode TEXT NOT NULL,
+  eligibility TEXT NOT NULL,
+  rejection_code TEXT,
+  rejection_reason TEXT,
+  would_select INTEGER NOT NULL,
+  auth_profile_ref TEXT,
+  endpoint_id TEXT,
+  failure_domain_json TEXT,
+  observation_completeness TEXT NOT NULL,
+  observation_coverage TEXT NOT NULL,
+  observer_error_code TEXT,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (task_id) REFERENCES task_runs(task_id) ON DELETE CASCADE,
+  FOREIGN KEY (checkpoint_id) REFERENCES task_checkpoints(checkpoint_id) ON DELETE CASCADE,
+  FOREIGN KEY (capability_snapshot_id) REFERENCES model_capability_snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_route_attempts_task_checkpoint_ordinal
+  ON model_route_attempts(task_id, checkpoint_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_model_route_attempts_provider_model_created
+  ON model_route_attempts(provider, model, created_at);
+CREATE INDEX IF NOT EXISTS idx_model_route_attempts_run_call
+  ON model_route_attempts(run_id, call_id);
+
 CREATE TABLE IF NOT EXISTS flow_runs (
   flow_id TEXT NOT NULL PRIMARY KEY,
   shape TEXT,
