@@ -9607,6 +9607,78 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H2: Full reference
   - H2: Related docs
 
+## superpowers/plans/2026-07-19-openclaw-safe-routing-phase-0-1-implementation.md
+
+- Route: /superpowers/plans/2026-07-19-openclaw-safe-routing-phase-0-1-implementation
+- Headings:
+  - H1: OpenClaw Safe Routing Phase 0-1 Implementation Plan
+  - H2: 1. 实施包分解
+  - H2: 2. 实施基线和分支策略
+  - H3: Task 0: 建立干净 worktree 和可信测试基线
+  - H3: Task 1: 实现任务契约、规范化和 digest
+  - H3: Task 2: 接入网关内只读观测租约和 typed hook 关联
+  - H3: Task 3: 建立 Phase 1 SQLite 事实表和原子创建事务
+  - H3: Task 4: 生成不可变能力快照并执行候选准入判断
+  - H3: Task 5: 在活网关内评估理论准入并写入模型级审计
+  - H3: Task 6: 通过 Plugin SDK 暴露窄口径影子服务
+  - H3: Task 7: 新增显式、默认关闭的 safe-routing 扩展 CLI
+  - H3: Task 8: 完成 Phase 1 端到端验收和审计说明
+  - H2: Phase 1 启用、观察与回滚
+  - H3: 启用前
+  - H3: 小范围影子试点
+  - H3: 回滚
+  - H2: 完成定义
+  - H2: 实施期间已验证的偏差（Task 0-8 全部完成后补记）
+  - H2: 后续阶段入口门槛
+
+## superpowers/specs/2026-07-19-openclaw-safe-routing-design.md
+
+- Route: /superpowers/specs/2026-07-19-openclaw-safe-routing-design
+- Headings:
+  - H1: OpenClaw 安全模型路由与可审计交付设计
+  - H2: 1. 目标
+  - H2: 2. 非目标
+  - H2: 3. 架构和所有权
+  - H3: 3.1 Core
+  - H3: 3.2 任务策略插件
+  - H3: 3.3 Provider、Runtime、Tool 和 Channel
+  - H2: 4. 激活与兼容性
+  - H2: 5. 任务契约
+  - H2: 6. 数据和状态模型
+  - H3: 6.1 复用 taskruns
+  - H3: 6.2 tasksafetystate
+  - H3: 6.3 目标表
+  - H3: 6.4 状态不变式
+  - H3: 6.5 检查点
+  - H2: 7. 能力快照与真实路由目标
+  - H2: 8. 候选能力门
+  - H2: 9. fallback 重放熔断
+  - H2: 10. 工具副作用协议
+  - H2: 11. 复核和原子终结
+  - H2: 12. 结构化终止类型
+  - H2: 13. 错误路由矩阵
+  - H2: 14. 首个影子试点
+  - H2: 15. 能力探针
+  - H2: 16. 代码落点
+  - H2: 17. 完整执行链
+  - H2: 18. 测试设计
+  - H3: 18.1 单元测试
+  - H3: 18.2 Phase 1 影子集成测试
+  - H3: 18.3 Phase 2 fallback 集成测试
+  - H3: 18.4 Effect Ledger 故障注入
+  - H3: 18.5 Finalization 测试
+  - H2: 19. 分阶段实施
+  - H3: Phase 0：基线与能力快照
+  - H3: Phase 1：影子能力门
+  - H3: Phase 2：真实文本能力门与可续跑检查点
+  - H3: Phase 3：Effect Ledger
+  - H3: Phase 4：多维状态和独立复核
+  - H3: Phase 5：原子终结与交付
+  - H3: Phase 6：受控模型梯队
+  - H2: 20. 部署与回滚
+  - H2: 21. 观测、安全与上线红线
+  - H2: 22. 最终保证
+
 ## tools/acp-agents-setup.md
 
 - Route: /tools/acp-agents-setup
