@@ -7,8 +7,9 @@ import { closeOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import type { PersistedTaskContract } from "./contracts.js";
+import type { ObservationLeaseStore } from "./observation-lease.js";
 import { createSqliteObservationLeaseStore } from "./store.sqlite.js";
-import { resetTaskRegistryForTests } from "../task-registry.js";
+import { listTaskRecordsUnsorted, resetTaskRegistryForTests } from "../task-registry.js";
 import {
   createShadowObservationLease,
   evaluateShadowRouteInGateway,
@@ -142,6 +143,36 @@ describe("safety service", () => {
       expect(result).toEqual({ ok: false, code: "forbidden" });
       closeOpenClawStateDatabase();
     });
+  });
+
+  it("rolls back the task+checkpoint when the lease store fails to insert, leaving no orphaned task record", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-atomic-rollback-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const brokenLeaseStore: ObservationLeaseStore = {
+          insert: () => {
+            throw new Error("simulated lease insert failure");
+          },
+          findById: () => undefined,
+          findPendingBySessionBindingDigest: () => undefined,
+          findBoundByRunAndCall: () => undefined,
+          compareAndSwap: () => false,
+        };
+        const deps = createTestDeps({ leaseStore: brokenLeaseStore });
+        const before = listTaskRecordsUnsorted().length;
+
+        const result = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+
+        expect(result).toEqual({ ok: false, code: "invalid_contract" });
+        expect(listTaskRecordsUnsorted().length).toBe(before);
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("rejects a structurally invalid contract", async () => {

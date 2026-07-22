@@ -115,6 +115,19 @@ export function createManagedTaskWithCheckpoint(params: {
   task: Omit<Parameters<typeof createTaskRecord>[0], "persistOverride">;
   contract: CreateTaskContractInput;
   checkpoint: CreateTaskCheckpointInput;
+  /**
+   * Runs inside the same write transaction as the task/contract/checkpoint
+   * insert, after the checkpoint row exists but before persistOverride
+   * returns. Throwing here rolls the whole insert back and this function
+   * returns null, exactly like any other persistence failure — safe because
+   * createTaskRecord only updates its in-memory registry after
+   * persistOverride returns true, and that never happens if this throws.
+   * Do not open a transaction of your own caller-side and call this from
+   * inside it: createTaskRecord's in-memory update fires as soon as this
+   * function's own transaction reports success, so it must remain the
+   * outermost, truly-committing transaction for that update to stay safe.
+   */
+  afterCheckpoint?: (ids: { taskId: string; checkpointId: string }) => void;
 }): { task: TaskRecord; checkpointId: string } | null {
   let persistedCheckpointId: string | undefined;
 
@@ -129,6 +142,7 @@ export function createManagedTaskWithCheckpoint(params: {
           insertTaskContractRow(db, record.taskId, params.contract, now);
           const checkpointId = randomUUID();
           insertTaskCheckpointRow(db, record.taskId, checkpointId, params.checkpoint, now);
+          params.afterCheckpoint?.({ taskId: record.taskId, checkpointId });
           persistedCheckpointId = checkpointId;
           return true;
         });

@@ -262,6 +262,20 @@ export function createShadowObservationLease(
   const pluginRegistryDigest = deps.pluginRegistryDigest();
   const candidateChainDigest = digestCandidateChain(candidates);
 
+  const leaseId = deps.randomId();
+  const leaseToken = deps.randomId();
+
+  // afterCheckpoint runs inside createManagedTaskWithCheckpoint's own write
+  // transaction, before that transaction commits and before createTaskRecord
+  // updates its in-memory registry. A lease-insert failure there rolls the
+  // whole task+contract+checkpoint insert back too (via the same try/catch
+  // that already gates the in-memory update on persistence actually
+  // succeeding — see store.sqlite.ts), instead of leaving a task/checkpoint
+  // committed with no lease attached. Deliberately NOT a transaction opened
+  // here and passed down: createTaskRecord's in-memory cache update is only
+  // safe to run once its own transaction is the outermost, real commit — an
+  // outer transaction wrapped around it would let that cache update fire
+  // before the outer transaction is known to succeed.
   const managed = createManagedTaskWithCheckpoint({
     task: {
       runtime: "cli",
@@ -290,26 +304,25 @@ export function createShadowObservationLease(
       pluginRegistryDigest,
       candidateChainDigest,
     },
+    afterCheckpoint: ({ taskId, checkpointId }) => {
+      createObservationLease(deps.leaseStore, {
+        leaseId,
+        taskId,
+        checkpointId,
+        sessionBindingDigest: `sha256:${sha256Hex(input.sessionRef)}`,
+        leaseTokenDigest: `sha256:${sha256Hex(leaseToken)}`,
+        contractDigest,
+        configDigest,
+        pluginRegistryDigest,
+        candidateChainDigest,
+        ttlMs: deps.leaseTtlMs,
+        now,
+      });
+    },
   });
   if (!managed) {
     return { ok: false, code: "invalid_contract" };
   }
-
-  const leaseId = deps.randomId();
-  const leaseToken = deps.randomId();
-  createObservationLease(deps.leaseStore, {
-    leaseId,
-    taskId: managed.task.taskId,
-    checkpointId: managed.checkpointId,
-    sessionBindingDigest: `sha256:${sha256Hex(input.sessionRef)}`,
-    leaseTokenDigest: `sha256:${sha256Hex(leaseToken)}`,
-    contractDigest,
-    configDigest,
-    pluginRegistryDigest,
-    candidateChainDigest,
-    ttlMs: deps.leaseTtlMs,
-    now,
-  });
 
   return { ok: true, taskId: managed.task.taskId, leaseId, leaseToken };
 }
