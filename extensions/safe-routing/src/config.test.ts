@@ -14,7 +14,10 @@ describe("validateSafeRoutingConfig", () => {
   it("accepts mode=off even with no approvedProviders or allowedTaskKinds — installing alone must not take over any task", () => {
     const result = validateSafeRoutingConfig({ mode: "off" });
 
-    expect(result).toEqual({ ok: true, config: { mode: "off", allowedTaskKinds: [], approvedProviders: [] } });
+    expect(result).toEqual({
+      ok: true,
+      config: { mode: "off", allowedTaskKinds: [], approvedProviders: [] },
+    });
   });
 
   it("rejects any mode other than off or shadow — Phase 1 never exposes enforce", () => {

@@ -10,11 +10,11 @@
  * failure-path write is needed.
  */
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import type { ObservationLease, ObservationLeaseStore } from "../../tasks/safety/observation-lease.js";
-import {
-  correlateModelCallEvent,
-  type CorrelateModelCallEventInput,
-} from "./observed-attempt.js";
+import type {
+  ObservationLease,
+  ObservationLeaseStore,
+} from "../../tasks/safety/observation-lease.js";
+import { correlateModelCallEvent, type CorrelateModelCallEventInput } from "./observed-attempt.js";
 
 const log = createSubsystemLogger("agents.model-routing.route-attempt-observer");
 
@@ -70,7 +70,10 @@ export async function recordObservedModelAttempt(
 
     const attempt = deps
       .listRouteAttempts(lease.taskId, lease.checkpointId)
-      .find((candidate) => candidate.provider === observed.provider && candidate.model === observed.model);
+      .find(
+        (candidate) =>
+          candidate.provider === observed.provider && candidate.model === observed.model,
+      );
     if (!attempt) {
       // No theoretical route attempt row exists for this candidate: out of this observer's scope.
       return;
@@ -83,7 +86,9 @@ export async function recordObservedModelAttempt(
       observationCoverage: observed.observationCoverage,
     });
     if (!wrote) {
-      log.warn("Route attempt observation update affected no rows", { attemptId: attempt.attemptId });
+      log.warn("Route attempt observation update affected no rows", {
+        attemptId: attempt.attemptId,
+      });
     }
   } catch (error) {
     log.warn("Failed to record observed model attempt", { error });

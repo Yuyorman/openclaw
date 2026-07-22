@@ -9,7 +9,10 @@ import type {
   PluginHookModelCallEndedEvent,
   PluginHookModelCallStartedEvent,
 } from "../../plugins/hook-types.js";
-import type { ObservationLease, ObservationLeaseStore } from "../../tasks/safety/observation-lease.js";
+import type {
+  ObservationLease,
+  ObservationLeaseStore,
+} from "../../tasks/safety/observation-lease.js";
 
 export type ObservationCompleteness = "complete" | "partial" | "unavailable";
 export type ObservationCoverage = "hook-covered" | "out-of-scope";
@@ -50,7 +53,14 @@ function baseAttemptFields(
   event: PluginHookModelCallStartedEvent | PluginHookModelCallEndedEvent,
 ): Pick<
   ObservedModelAttempt,
-  "runId" | "callId" | "provider" | "model" | "api" | "transport" | "contextTokenBudget" | "contextWindowSource"
+  | "runId"
+  | "callId"
+  | "provider"
+  | "model"
+  | "api"
+  | "transport"
+  | "contextTokenBudget"
+  | "contextWindowSource"
 > {
   return {
     runId: event.runId,
@@ -59,7 +69,9 @@ function baseAttemptFields(
     model: event.model,
     ...(event.api !== undefined ? { api: event.api } : {}),
     ...(event.transport !== undefined ? { transport: event.transport } : {}),
-    ...(event.contextTokenBudget !== undefined ? { contextTokenBudget: event.contextTokenBudget } : {}),
+    ...(event.contextTokenBudget !== undefined
+      ? { contextTokenBudget: event.contextTokenBudget }
+      : {}),
     ...(event.contextWindowSource !== undefined
       ? { contextWindowSource: event.contextWindowSource }
       : {}),
@@ -78,13 +90,21 @@ function correlateStarted(
 
   if (input.now >= lease.expiresAt) {
     store.compareAndSwap(lease.leaseId, lease.rowVersion, { state: "partial" });
-    return { ...baseAttemptFields(input.event), observationCompleteness: "partial", observationCoverage: "hook-covered" };
+    return {
+      ...baseAttemptFields(input.event),
+      observationCompleteness: "partial",
+      observationCoverage: "hook-covered",
+    };
   }
 
   const digestsMatch = leaseDigestsMatch(lease, input);
   if (!digestsMatch) {
     store.compareAndSwap(lease.leaseId, lease.rowVersion, { state: "partial" });
-    return { ...baseAttemptFields(input.event), observationCompleteness: "partial", observationCoverage: "hook-covered" };
+    return {
+      ...baseAttemptFields(input.event),
+      observationCompleteness: "partial",
+      observationCoverage: "hook-covered",
+    };
   }
 
   // CAS-bind the first runId/callId. A losing CAS means a concurrent call already
@@ -119,7 +139,11 @@ function correlateEnded(
   }
 
   store.compareAndSwap(lease.leaseId, lease.rowVersion, { state: "complete" });
-  return { ...baseAttemptFields(input.event), observationCompleteness: "complete", observationCoverage: "hook-covered" };
+  return {
+    ...baseAttemptFields(input.event),
+    observationCompleteness: "complete",
+    observationCoverage: "hook-covered",
+  };
 }
 
 /**

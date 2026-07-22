@@ -6,9 +6,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { closeOpenClawStateDatabaseForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import plugin from "../index.js";
 
 type RespondCall = [ok: boolean, payload?: unknown, error?: { code?: unknown; message?: unknown }];
@@ -38,7 +38,9 @@ async function callMethod(
   if (!handler) {
     throw new Error(`gateway method not registered: ${name}`);
   }
-  let result: { ok: boolean; payload?: unknown; error?: { code?: unknown; message?: unknown } } | undefined;
+  let result:
+    | { ok: boolean; payload?: unknown; error?: { code?: unknown; message?: unknown } }
+    | undefined;
   await handler({
     params,
     client: sessionKey ? { internal: { agentRuntimeIdentity: { sessionKey } } } : null,
@@ -52,7 +54,10 @@ async function callMethod(
   return result;
 }
 
-type HookHandler = (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<void> | void;
+type HookHandler = (
+  event: Record<string, unknown>,
+  ctx: Record<string, unknown>,
+) => Promise<void> | void;
 
 function activatePlugin(pluginConfig: Record<string, unknown>) {
   const captured = captureGatewayMethods();
@@ -117,7 +122,10 @@ describe("extensions/safe-routing — gateway method handlers (mode gate + end-t
       { contract: CONTRACT, sessionRef: "session-1" },
       "session-1",
     );
-    const evaluated = await callMethod(methods, "safe-routing.evaluate", { leaseId: "x", leaseToken: "y" });
+    const evaluated = await callMethod(methods, "safe-routing.evaluate", {
+      leaseId: "x",
+      leaseToken: "y",
+    });
     const audited = await callMethod(methods, "safe-routing.audit", { taskId: "z" }, "session-1");
 
     expect(created).toMatchObject({ ok: false, error: { code: "disabled" } });
@@ -195,13 +203,25 @@ describe("extensions/safe-routing — gateway method handlers (mode gate + end-t
     expect(hooks.has("model_call_ended")).toBe(true);
     await expect(
       hooks.get("model_call_started")!(
-        { runId: "run-1", callId: "call-1", sessionKey: "session-1", provider: "openai", model: "gpt-5.4" },
+        {
+          runId: "run-1",
+          callId: "call-1",
+          sessionKey: "session-1",
+          provider: "openai",
+          model: "gpt-5.4",
+        },
         { sessionKey: "session-1" },
       ),
     ).resolves.toBeUndefined();
     await expect(
       hooks.get("model_call_ended")!(
-        { runId: "run-1", callId: "call-1", sessionKey: "session-1", provider: "openai", model: "gpt-5.4" },
+        {
+          runId: "run-1",
+          callId: "call-1",
+          sessionKey: "session-1",
+          provider: "openai",
+          model: "gpt-5.4",
+        },
         { sessionKey: "session-1" },
       ),
     ).resolves.toBeUndefined();
@@ -216,13 +236,25 @@ describe("extensions/safe-routing — gateway method handlers (mode gate + end-t
 
     await expect(
       hooks.get("model_call_started")!(
-        { runId: "run-1", callId: "call-1", sessionKey: "unrelated-session", provider: "openai", model: "gpt-5.4" },
+        {
+          runId: "run-1",
+          callId: "call-1",
+          sessionKey: "unrelated-session",
+          provider: "openai",
+          model: "gpt-5.4",
+        },
         { sessionKey: "unrelated-session" },
       ),
     ).resolves.toBeUndefined();
     await expect(
       hooks.get("model_call_ended")!(
-        { runId: "run-1", callId: "call-1", sessionKey: "unrelated-session", provider: "openai", model: "gpt-5.4" },
+        {
+          runId: "run-1",
+          callId: "call-1",
+          sessionKey: "unrelated-session",
+          provider: "openai",
+          model: "gpt-5.4",
+        },
         { sessionKey: "unrelated-session" },
       ),
     ).resolves.toBeUndefined();

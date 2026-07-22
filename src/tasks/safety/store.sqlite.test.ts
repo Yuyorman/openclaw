@@ -3,7 +3,10 @@ import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-
 import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
 import { loggingState } from "../../logging/state.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../../state/openclaw-state-db.generated.js";
-import { closeOpenClawStateDatabase, openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import {
+  closeOpenClawStateDatabase,
+  openOpenClawStateDatabase,
+} from "../../state/openclaw-state-db.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
@@ -11,7 +14,6 @@ import {
   listTaskRecordsUnsorted,
   resetTaskRegistryForTests,
 } from "../task-registry.js";
-import type { CreateTaskCheckpointInput, CreateTaskContractInput } from "./store.types.js";
 import {
   appendRouteAttempts,
   createManagedTaskWithCheckpoint,
@@ -21,6 +23,7 @@ import {
   putCapabilitySnapshot,
   updateRouteAttemptObservation,
 } from "./store.sqlite.js";
+import type { CreateTaskCheckpointInput, CreateTaskContractInput } from "./store.types.js";
 
 const ORIGINAL_ENV = captureEnv(["OPENCLAW_STATE_DIR"]);
 
@@ -29,7 +32,9 @@ type SafetyTestDatabase = Pick<
   "task_runs" | "task_contracts" | "task_checkpoints" | "model_route_attempts"
 >;
 
-function buildContractInput(overrides: Partial<CreateTaskContractInput> = {}): CreateTaskContractInput {
+function buildContractInput(
+  overrides: Partial<CreateTaskContractInput> = {},
+): CreateTaskContractInput {
   return {
     schemaVersion: 1,
     contractJson: '{"schemaVersion":1}',
@@ -42,7 +47,9 @@ function buildContractInput(overrides: Partial<CreateTaskContractInput> = {}): C
   };
 }
 
-function buildCheckpointInput(overrides: Partial<CreateTaskCheckpointInput> = {}): CreateTaskCheckpointInput {
+function buildCheckpointInput(
+  overrides: Partial<CreateTaskCheckpointInput> = {},
+): CreateTaskCheckpointInput {
   return {
     sequence: 0,
     contractDigest: "sha256:contract-digest",
@@ -55,10 +62,12 @@ function buildCheckpointInput(overrides: Partial<CreateTaskCheckpointInput> = {}
   };
 }
 
-function createManagedTask(overrides: {
-  contract?: Partial<CreateTaskContractInput>;
-  checkpoint?: Partial<CreateTaskCheckpointInput>;
-} = {}) {
+function createManagedTask(
+  overrides: {
+    contract?: Partial<CreateTaskContractInput>;
+    checkpoint?: Partial<CreateTaskCheckpointInput>;
+  } = {},
+) {
   const result = createManagedTaskWithCheckpoint({
     task: {
       runtime: "cli",
@@ -109,7 +118,10 @@ describe("safety store sqlite", () => {
         const kysely = getNodeSqliteKysely<SafetyTestDatabase>(db);
         const checkpointRow = executeSqliteQuerySync(
           db,
-          kysely.selectFrom("task_checkpoints").selectAll().where("checkpoint_id", "=", checkpointId),
+          kysely
+            .selectFrom("task_checkpoints")
+            .selectAll()
+            .where("checkpoint_id", "=", checkpointId),
         ).rows[0];
         expect(checkpointRow).toMatchObject({
           task_id: task.taskId,
@@ -131,8 +143,10 @@ describe("safety store sqlite", () => {
         const { db } = openOpenClawStateDatabase();
         const kysely = getNodeSqliteKysely<SafetyTestDatabase>(db);
         const countTaskRuns = () =>
-          executeSqliteQuerySync(db, kysely.selectFrom("task_runs").select((eb) => eb.fn.countAll().as("n")))
-            .rows[0]?.n;
+          executeSqliteQuerySync(
+            db,
+            kysely.selectFrom("task_runs").select((eb) => eb.fn.countAll().as("n")),
+          ).rows[0]?.n;
         const beforeTaskRuns = countTaskRuns();
 
         const circular: Record<string, unknown> = {};
@@ -296,7 +310,12 @@ describe("safety store sqlite", () => {
         });
 
         const byId = leaseStore.findById("lease-1");
-        expect(byId).toMatchObject({ taskId: task.taskId, checkpointId, state: "pending", rowVersion: 1 });
+        expect(byId).toMatchObject({
+          taskId: task.taskId,
+          checkpointId,
+          state: "pending",
+          rowVersion: 1,
+        });
 
         const byPending = leaseStore.findPendingBySessionBindingDigest("sha256:session-digest");
         expect(byPending?.leaseId).toBe("lease-1");
@@ -308,7 +327,9 @@ describe("safety store sqlite", () => {
         });
         expect(casApplied).toBe(true);
 
-        expect(leaseStore.findPendingBySessionBindingDigest("sha256:session-digest")).toBeUndefined();
+        expect(
+          leaseStore.findPendingBySessionBindingDigest("sha256:session-digest"),
+        ).toBeUndefined();
         const byBound = leaseStore.findBoundByRunAndCall("run-1", "call-1");
         expect(byBound).toMatchObject({ leaseId: "lease-1", state: "bound", rowVersion: 2 });
 
@@ -358,7 +379,9 @@ describe("safety store sqlite", () => {
 
         expect(leaseStore.findById("lease-1")).toMatchObject({ state: "superseded" });
         expect(leaseStore.findById("lease-2")).toMatchObject({ state: "pending" });
-        expect(leaseStore.findPendingBySessionBindingDigest("sha256:session-digest")?.leaseId).toBe("lease-2");
+        expect(leaseStore.findPendingBySessionBindingDigest("sha256:session-digest")?.leaseId).toBe(
+          "lease-2",
+        );
 
         closeOpenClawStateDatabase();
       },

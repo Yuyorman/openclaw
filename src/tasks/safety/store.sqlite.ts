@@ -6,8 +6,11 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import { openOpenClawStateDatabase, runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../../state/openclaw-state-db.generated.js";
+import {
+  openOpenClawStateDatabase,
+  runOpenClawStateWriteTransaction,
+} from "../../state/openclaw-state-db.js";
 import { createTaskRecord } from "../task-registry.js";
 import { upsertTaskRegistryRecordToSqlite } from "../task-registry.store.sqlite.js";
 import type { TaskRecord } from "../task-registry.types.js";
@@ -53,10 +56,17 @@ function parseJsonRecord(value: string | null): Record<string, unknown> | undefi
 
 function parseJsonStringArray(value: string): string[] {
   const parsed = JSON.parse(value) as unknown;
-  return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+  return Array.isArray(parsed)
+    ? parsed.filter((entry): entry is string => typeof entry === "string")
+    : [];
 }
 
-function insertTaskContractRow(db: DatabaseSync, taskId: string, input: CreateTaskContractInput, now: number): void {
+function insertTaskContractRow(
+  db: DatabaseSync,
+  taskId: string,
+  input: CreateTaskContractInput,
+  now: number,
+): void {
   executeSqliteQuerySync(
     db,
     getSafetyKysely(db)
@@ -222,7 +232,10 @@ export function putCapabilitySnapshot(input: PutCapabilitySnapshotInput): Capabi
     const kysely = getSafetyKysely(db);
     const existing = executeSqliteQuerySync(
       db,
-      kysely.selectFrom("model_capability_snapshots").selectAll().where("snapshot_digest", "=", input.snapshotDigest),
+      kysely
+        .selectFrom("model_capability_snapshots")
+        .selectAll()
+        .where("snapshot_digest", "=", input.snapshotDigest),
     ).rows[0];
     if (existing) {
       return rowToCapabilitySnapshot(existing);
@@ -249,10 +262,15 @@ export function putCapabilitySnapshot(input: PutCapabilitySnapshotInput): Capabi
     );
     const row = executeSqliteQuerySync(
       db,
-      kysely.selectFrom("model_capability_snapshots").selectAll().where("snapshot_digest", "=", input.snapshotDigest),
+      kysely
+        .selectFrom("model_capability_snapshots")
+        .selectAll()
+        .where("snapshot_digest", "=", input.snapshotDigest),
     ).rows[0];
     if (!row) {
-      throw new Error(`Failed to persist or find capability snapshot for digest ${input.snapshotDigest}`);
+      throw new Error(
+        `Failed to persist or find capability snapshot for digest ${input.snapshotDigest}`,
+      );
     }
     return rowToCapabilitySnapshot(row);
   });
@@ -271,7 +289,13 @@ export function appendRouteAttempts(
     const { db } = openOpenClawStateDatabase();
     const kysely = getSafetyKysely(db);
     const now = Date.now();
-    const rows: RouteAttemptRow[] = attempts.map((attempt) => ({ ...attempt, attemptId: randomUUID(), taskId, checkpointId, createdAt: now }));
+    const rows: RouteAttemptRow[] = attempts.map((attempt) => ({
+      ...attempt,
+      attemptId: randomUUID(),
+      taskId,
+      checkpointId,
+      createdAt: now,
+    }));
     for (const row of rows) {
       executeSqliteQuerySync(
         db,
@@ -293,7 +317,8 @@ export function appendRouteAttempts(
           would_select: row.wouldSelect ? 1 : 0,
           auth_profile_ref: row.authProfileRef ?? null,
           endpoint_id: row.endpointId ?? null,
-          failure_domain_json: row.failureDomain !== undefined ? serializeJson(row.failureDomain) : null,
+          failure_domain_json:
+            row.failureDomain !== undefined ? serializeJson(row.failureDomain) : null,
           observation_completeness: row.observationCompleteness,
           observation_coverage: row.observationCoverage,
           observer_error_code: row.observerErrorCode ?? null,
@@ -383,7 +408,9 @@ function rowToTaskCheckpoint(row: {
     ...(row.observation_lease_id !== null ? { observationLeaseId: row.observation_lease_id } : {}),
     ...(row.lease_expires_at !== null ? { leaseExpiresAt: row.lease_expires_at } : {}),
     ...(row.lease_state !== null ? { leaseState: row.lease_state } : {}),
-    ...(row.session_binding_digest !== null ? { sessionBindingDigest: row.session_binding_digest } : {}),
+    ...(row.session_binding_digest !== null
+      ? { sessionBindingDigest: row.session_binding_digest }
+      : {}),
     ...(row.lease_token_digest !== null ? { leaseTokenDigest: row.lease_token_digest } : {}),
     ...(row.token_consumed_at !== null ? { tokenConsumedAt: row.token_consumed_at } : {}),
     ...(row.bound_run_id !== null ? { boundRunId: row.bound_run_id } : {}),
@@ -397,7 +424,10 @@ export function getTaskCheckpoint(checkpointId: string): TaskCheckpointRow | und
   const { db } = openOpenClawStateDatabase();
   const row = executeSqliteQuerySync(
     db,
-    getSafetyKysely(db).selectFrom("task_checkpoints").selectAll().where("checkpoint_id", "=", checkpointId),
+    getSafetyKysely(db)
+      .selectFrom("task_checkpoints")
+      .selectAll()
+      .where("checkpoint_id", "=", checkpointId),
   ).rows[0];
   return row ? rowToTaskCheckpoint(row) : undefined;
 }
@@ -439,7 +469,9 @@ function checkpointToObservationLease(checkpoint: TaskCheckpointRow): Observatio
     candidateChainDigest: checkpoint.candidateChainDigest,
     expiresAt: checkpoint.leaseExpiresAt,
     state: checkpoint.leaseState as ObservationLeaseState,
-    ...(checkpoint.tokenConsumedAt !== undefined ? { tokenConsumedAt: checkpoint.tokenConsumedAt } : {}),
+    ...(checkpoint.tokenConsumedAt !== undefined
+      ? { tokenConsumedAt: checkpoint.tokenConsumedAt }
+      : {}),
     ...(checkpoint.boundRunId !== undefined ? { boundRunId: checkpoint.boundRunId } : {}),
     ...(checkpoint.boundCallId !== undefined ? { boundCallId: checkpoint.boundCallId } : {}),
     rowVersion: checkpoint.rowVersion,
@@ -498,7 +530,10 @@ export function createSqliteObservationLeaseStore(): ObservationLeaseStore {
       const { db } = openOpenClawStateDatabase();
       const row = executeSqliteQuerySync(
         db,
-        getSafetyKysely(db).selectFrom("task_checkpoints").selectAll().where("observation_lease_id", "=", leaseId),
+        getSafetyKysely(db)
+          .selectFrom("task_checkpoints")
+          .selectAll()
+          .where("observation_lease_id", "=", leaseId),
       ).rows[0];
       return row ? checkpointToObservationLease(rowToTaskCheckpoint(row)) : undefined;
     },
@@ -536,7 +571,9 @@ export function createSqliteObservationLeaseStore(): ObservationLeaseStore {
             .updateTable("task_checkpoints")
             .set({
               ...(patch.state !== undefined ? { lease_state: patch.state } : {}),
-              ...(patch.tokenConsumedAt !== undefined ? { token_consumed_at: patch.tokenConsumedAt } : {}),
+              ...(patch.tokenConsumedAt !== undefined
+                ? { token_consumed_at: patch.tokenConsumedAt }
+                : {}),
               ...(patch.boundRunId !== undefined ? { bound_run_id: patch.boundRunId } : {}),
               ...(patch.boundCallId !== undefined ? { bound_call_id: patch.boundCallId } : {}),
               row_version: expectedRowVersion + 1,

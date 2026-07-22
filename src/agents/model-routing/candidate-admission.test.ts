@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { normalizeTaskContract, type PersistedTaskContract } from "../../tasks/safety/contracts.js";
+import {
+  evaluateCandidateAdmission,
+  type ModelRoutingAdmissionPolicy,
+} from "./candidate-admission.js";
 import { buildCapabilitySnapshot, type ModelCapabilitySnapshot } from "./capability-snapshot.js";
-import { evaluateCandidateAdmission, type ModelRoutingAdmissionPolicy } from "./candidate-admission.js";
 
 function contract(overrides: Partial<PersistedTaskContract["requiredCapabilities"]> = {}) {
   return normalizeTaskContract({
@@ -25,7 +28,9 @@ function contract(overrides: Partial<PersistedTaskContract["requiredCapabilities
   });
 }
 
-function eligibleSnapshot(overrides: Partial<Parameters<typeof buildCapabilitySnapshot>[0]> = {}): ModelCapabilitySnapshot {
+function eligibleSnapshot(
+  overrides: Partial<Parameters<typeof buildCapabilitySnapshot>[0]> = {},
+): ModelCapabilitySnapshot {
   return buildCapabilitySnapshot({
     provider: "anthropic",
     model: "claude-sonnet-5",
@@ -65,7 +70,11 @@ describe("evaluateCandidateAdmission", () => {
   });
 
   it("rejects MODALITY when modalities are unverified", () => {
-    const decision = evaluateCandidateAdmission(contract(), eligibleSnapshot({ configured: {} }), APPROVED_POLICY);
+    const decision = evaluateCandidateAdmission(
+      contract(),
+      eligibleSnapshot({ configured: {} }),
+      APPROVED_POLICY,
+    );
 
     expect(decision).toMatchObject({ outcome: "ineligible", code: "MODALITY" });
   });
@@ -84,7 +93,11 @@ describe("evaluateCandidateAdmission", () => {
   });
 
   it("rejects CONTEXT when the context window is unverified", () => {
-    const decision = evaluateCandidateAdmission(contract(), eligibleSnapshot({ configured: { modalities: ["text"] } }), APPROVED_POLICY);
+    const decision = evaluateCandidateAdmission(
+      contract(),
+      eligibleSnapshot({ configured: { modalities: ["text"] } }),
+      APPROVED_POLICY,
+    );
 
     expect(decision).toMatchObject({ outcome: "ineligible", code: "CONTEXT" });
   });
@@ -115,7 +128,9 @@ describe("evaluateCandidateAdmission", () => {
   it("rejects OUTPUT when the verified output limit is below the required minimum", () => {
     const decision = evaluateCandidateAdmission(
       contract({ minOutputTokens: 100000 }),
-      eligibleSnapshot({ configured: { modalities: ["text"], contextWindowTokens: 200000, outputTokens: 8192 } }),
+      eligibleSnapshot({
+        configured: { modalities: ["text"], contextWindowTokens: 200000, outputTokens: 8192 },
+      }),
       APPROVED_POLICY,
     );
 
@@ -138,7 +153,12 @@ describe("evaluateCandidateAdmission", () => {
     const decision = evaluateCandidateAdmission(
       contract({ toolCalling: true }),
       eligibleSnapshot({
-        configured: { modalities: ["text"], contextWindowTokens: 200000, outputTokens: 8192, toolCalling: true },
+        configured: {
+          modalities: ["text"],
+          contextWindowTokens: 200000,
+          outputTokens: 8192,
+          toolCalling: true,
+        },
         observed: { toolCalling: false },
       }),
       APPROVED_POLICY,
@@ -178,15 +198,23 @@ describe("evaluateCandidateAdmission", () => {
   });
 
   it("rejects RUNTIME whenever the contract requires specific runtime ids, since Phase 1 cannot resolve one", () => {
-    const decision = evaluateCandidateAdmission(contract({ runtimeIds: ["node-primary"] }), eligibleSnapshot(), APPROVED_POLICY);
+    const decision = evaluateCandidateAdmission(
+      contract({ runtimeIds: ["node-primary"] }),
+      eligibleSnapshot(),
+      APPROVED_POLICY,
+    );
 
     expect(decision).toMatchObject({ outcome: "ineligible", code: "RUNTIME" });
   });
 
   it("rejects DATA_POLICY when approved-providers is required and the provider is not in the allowlist", () => {
-    const decision = evaluateCandidateAdmission(contract({ dataPolicy: "approved-providers" }), eligibleSnapshot(), {
-      approvedProviders: ["openai"],
-    });
+    const decision = evaluateCandidateAdmission(
+      contract({ dataPolicy: "approved-providers" }),
+      eligibleSnapshot(),
+      {
+        approvedProviders: ["openai"],
+      },
+    );
 
     expect(decision).toMatchObject({ outcome: "ineligible", code: "DATA_POLICY" });
   });
@@ -194,7 +222,15 @@ describe("evaluateCandidateAdmission", () => {
   it("admits a local-only requirement only for a candidate on a recognized local runtime api", () => {
     const decision = evaluateCandidateAdmission(
       contract({ dataPolicy: "local-only" }),
-      eligibleSnapshot({ provider: "ollama", configured: { modalities: ["text"], contextWindowTokens: 200000, outputTokens: 8192, api: "ollama" } }),
+      eligibleSnapshot({
+        provider: "ollama",
+        configured: {
+          modalities: ["text"],
+          contextWindowTokens: 200000,
+          outputTokens: 8192,
+          api: "ollama",
+        },
+      }),
       APPROVED_POLICY,
     );
 
@@ -202,7 +238,11 @@ describe("evaluateCandidateAdmission", () => {
   });
 
   it("rejects DATA_POLICY for a local-only requirement against a cloud api candidate", () => {
-    const decision = evaluateCandidateAdmission(contract({ dataPolicy: "local-only" }), eligibleSnapshot(), APPROVED_POLICY);
+    const decision = evaluateCandidateAdmission(
+      contract({ dataPolicy: "local-only" }),
+      eligibleSnapshot(),
+      APPROVED_POLICY,
+    );
 
     expect(decision).toMatchObject({ outcome: "ineligible", code: "DATA_POLICY" });
   });
@@ -212,7 +252,10 @@ describe("evaluateCandidateAdmission", () => {
       { ...contract(), minimumDecisionGrade: "final" },
       eligibleSnapshot({
         configured: { modalities: ["text"], contextWindowTokens: 200000, outputTokens: 8192 },
-        decisionGradeAuthorization: { maxAuthorizedDecisionGrade: "analysis", reason: "unverified provider capped" },
+        decisionGradeAuthorization: {
+          maxAuthorizedDecisionGrade: "analysis",
+          reason: "unverified provider capped",
+        },
       }),
       APPROVED_POLICY,
     );

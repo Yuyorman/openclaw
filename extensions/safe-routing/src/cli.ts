@@ -4,8 +4,8 @@
 import { readFileSync } from "node:fs";
 import type { Command } from "commander";
 import { addGatewayClientOptions, callGatewayFromCli } from "openclaw/plugin-sdk/gateway-runtime";
-import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { SAFE_ROUTING_SHADOW_TASK_KIND } from "openclaw/plugin-sdk/safe-routing";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 type JsonOptions = { json?: boolean };
 

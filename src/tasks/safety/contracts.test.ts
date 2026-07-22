@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { digestTaskContract, normalizeTaskContract, type PersistedTaskContract } from "./contracts.js";
+import {
+  digestTaskContract,
+  normalizeTaskContract,
+  type PersistedTaskContract,
+} from "./contracts.js";
 
 function buildContract(overrides: Partial<PersistedTaskContract> = {}): PersistedTaskContract {
   return {

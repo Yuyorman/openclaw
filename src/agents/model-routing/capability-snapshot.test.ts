@@ -4,7 +4,9 @@ import {
   type BuildCapabilitySnapshotInput,
 } from "./capability-snapshot.js";
 
-function baseInput(overrides: Partial<BuildCapabilitySnapshotInput> = {}): BuildCapabilitySnapshotInput {
+function baseInput(
+  overrides: Partial<BuildCapabilitySnapshotInput> = {},
+): BuildCapabilitySnapshotInput {
   return {
     provider: "anthropic",
     model: "claude-sonnet-5",
@@ -31,9 +33,15 @@ describe("buildCapabilitySnapshot", () => {
       }),
     );
 
-    expect(snapshot.contextWindowTokens).toMatchObject({ value: 200000, verification: "configured" });
+    expect(snapshot.contextWindowTokens).toMatchObject({
+      value: 200000,
+      verification: "configured",
+    });
     expect(snapshot.outputTokens).toMatchObject({ value: 8192, verification: "configured" });
-    expect(snapshot.modalities).toMatchObject({ value: ["image", "text"], verification: "configured" });
+    expect(snapshot.modalities).toMatchObject({
+      value: ["image", "text"],
+      verification: "configured",
+    });
     expect(snapshot.toolCalling).toMatchObject({ value: true, verification: "configured" });
     expect(snapshot.structuredOutput).toMatchObject({ value: true, verification: "configured" });
     expect(snapshot.api).toMatchObject({ value: "anthropic-messages", verification: "configured" });
@@ -47,7 +55,10 @@ describe("buildCapabilitySnapshot", () => {
       }),
     );
 
-    expect(snapshot.contextWindowTokens).toMatchObject({ value: 128000, verification: "configured" });
+    expect(snapshot.contextWindowTokens).toMatchObject({
+      value: 128000,
+      verification: "configured",
+    });
     expect(snapshot.outputTokens).toMatchObject({ value: 4096, verification: "configured" });
   });
 
@@ -141,7 +152,9 @@ describe("buildCapabilitySnapshot", () => {
     expect(snapshot.authorizedDecisionGrade.evidence).toEqual([
       { source: "policy", detail: "routing policy v1: unverified providers capped at analysis" },
     ]);
-    expect(snapshot.authorizedDecisionGrade.evidence.some((entry) => entry.source === "config")).toBe(false);
+    expect(
+      snapshot.authorizedDecisionGrade.evidence.some((entry) => entry.source === "config"),
+    ).toBe(false);
   });
 
   it("produces a stable digest for identical facts", () => {
@@ -157,8 +170,12 @@ describe("buildCapabilitySnapshot", () => {
   });
 
   it("changes the digest when a constraint changes", () => {
-    const first = buildCapabilitySnapshot(baseInput({ configured: { contextWindowTokens: 200000 } }));
-    const second = buildCapabilitySnapshot(baseInput({ configured: { contextWindowTokens: 128000 } }));
+    const first = buildCapabilitySnapshot(
+      baseInput({ configured: { contextWindowTokens: 200000 } }),
+    );
+    const second = buildCapabilitySnapshot(
+      baseInput({ configured: { contextWindowTokens: 128000 } }),
+    );
 
     expect(first.snapshotDigest).not.toBe(second.snapshotDigest);
   });

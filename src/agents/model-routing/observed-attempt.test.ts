@@ -17,7 +17,9 @@ const CONFIG_DIGEST = "sha256:config-digest";
 const REGISTRY_DIGEST = "sha256:registry-digest";
 const CANDIDATE_CHAIN_DIGEST = "sha256:candidate-digest";
 
-function buildLeaseInput(overrides: Partial<CreateObservationLeaseInput> = {}): CreateObservationLeaseInput {
+function buildLeaseInput(
+  overrides: Partial<CreateObservationLeaseInput> = {},
+): CreateObservationLeaseInput {
   return {
     leaseId: "lease-1",
     taskId: "task-1",
@@ -65,7 +67,9 @@ function buildEndedEvent(
 const CTX: PluginHookAgentContext = { sessionKey: "session-1" };
 
 function startedInput(
-  overrides: Partial<Extract<Parameters<typeof correlateModelCallEvent>[1], { phase: "started" }>> = {},
+  overrides: Partial<
+    Extract<Parameters<typeof correlateModelCallEvent>[1], { phase: "started" }>
+  > = {},
 ) {
   return {
     phase: "started" as const,
@@ -136,7 +140,10 @@ describe("correlateModelCallEvent — started", () => {
 
     const result = correlateModelCallEvent(store, startedInput({ now: 5_000 }));
 
-    expect(result).toMatchObject({ observationCompleteness: "partial", observationCoverage: "hook-covered" });
+    expect(result).toMatchObject({
+      observationCompleteness: "partial",
+      observationCoverage: "hook-covered",
+    });
     expect(store.findById("lease-1")?.state).toBe("partial");
   });
 
@@ -149,7 +156,10 @@ describe("correlateModelCallEvent — started", () => {
       startedInput({ candidateChainDigest: "sha256:different-candidate-digest" }),
     );
 
-    expect(result).toMatchObject({ observationCompleteness: "partial", observationCoverage: "hook-covered" });
+    expect(result).toMatchObject({
+      observationCompleteness: "partial",
+      observationCoverage: "hook-covered",
+    });
     expect(store.findById("lease-1")?.state).toBe("partial");
   });
 });

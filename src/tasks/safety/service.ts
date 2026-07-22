@@ -6,36 +6,45 @@
  * this module never assumes an upper caller already validated `callerScope`.
  */
 import { randomUUID } from "node:crypto";
+import { DEFAULT_PROVIDER } from "../../agents/defaults.js";
+import { resolveModelCandidateChain } from "../../agents/model-fallback.js";
+import type { ModelRoutingAdmissionPolicy } from "../../agents/model-routing/candidate-admission.js";
 import { buildCapabilitySnapshot } from "../../agents/model-routing/capability-snapshot.js";
 import type { ModelCapabilitySnapshot } from "../../agents/model-routing/capability-snapshot.js";
-import type { ModelRoutingAdmissionPolicy } from "../../agents/model-routing/candidate-admission.js";
+import {
+  recordObservedModelAttempt,
+  type RouteAttemptObserverDeps,
+} from "../../agents/model-routing/route-attempt-observer.js";
 import {
   evaluateShadowRoute,
   type ShadowRouteCandidate,
 } from "../../agents/model-routing/shadow-evaluator.js";
+import {
+  buildModelAliasIndex,
+  resolveModelRefFromString,
+} from "../../agents/model-selection-resolve.js";
 import { stableStringify } from "../../agents/stable-stringify.js";
-import { DEFAULT_PROVIDER } from "../../agents/defaults.js";
-import { resolveModelCandidateChain } from "../../agents/model-fallback.js";
-import { buildModelAliasIndex, resolveModelRefFromString } from "../../agents/model-selection-resolve.js";
 import { getRuntimeConfig } from "../../config/io.js";
 import { resolveAgentModelPrimaryValue } from "../../config/model-input.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { sha256Hex } from "../../infra/crypto-digest.js";
 import {
   READ_SCOPE,
   WRITE_SCOPE,
   authorizeOperatorScopesForRequiredScope,
 } from "../../gateway/method-scopes.js";
-import {
-  recordObservedModelAttempt,
-  type RouteAttemptObserverDeps,
-} from "../../agents/model-routing/route-attempt-observer.js";
+import { sha256Hex } from "../../infra/crypto-digest.js";
 import type {
   PluginHookAgentContext,
   PluginHookModelCallEndedEvent,
   PluginHookModelCallStartedEvent,
 } from "../../plugins/hook-types.js";
 import { getPluginRegistryState } from "../../plugins/runtime-state.js";
+import {
+  digestTaskContract,
+  normalizeTaskContract,
+  type NormalizedTaskContract,
+  type PersistedTaskContract,
+} from "./contracts.js";
 import {
   consumeObservationLease,
   createObservationLease,
@@ -51,8 +60,12 @@ import {
   putCapabilitySnapshot,
   updateRouteAttemptObservation,
 } from "./store.sqlite.js";
-import type { PutCapabilitySnapshotInput, RouteAttemptRow, TaskCheckpointRow, TaskContractRow } from "./store.types.js";
-import { digestTaskContract, normalizeTaskContract, type NormalizedTaskContract, type PersistedTaskContract } from "./contracts.js";
+import type {
+  PutCapabilitySnapshotInput,
+  RouteAttemptRow,
+  TaskCheckpointRow,
+  TaskContractRow,
+} from "./store.types.js";
 
 /** The fixed, only Phase 1 task kind — enforced by the Task 7 extension's allowedTaskKinds gate. */
 export const SAFE_ROUTING_SHADOW_TASK_KIND = "safe-routing-readonly-shadow";
@@ -97,14 +110,22 @@ function resolveLiveCandidates(cfg: OpenClawConfig): ShadowRouteCandidate[] {
   if (!resolved?.ref.provider || !resolved.ref.model) {
     return [];
   }
-  return resolveModelCandidateChain({ cfg, provider: resolved.ref.provider, model: resolved.ref.model });
+  return resolveModelCandidateChain({
+    cfg,
+    provider: resolved.ref.provider,
+    model: resolved.ref.model,
+  });
 }
 
-function buildLiveCapabilitySnapshot(cfg: OpenClawConfig, candidate: ShadowRouteCandidate): ModelCapabilitySnapshot {
+function buildLiveCapabilitySnapshot(
+  cfg: OpenClawConfig,
+  candidate: ShadowRouteCandidate,
+): ModelCapabilitySnapshot {
   const providerConfig = cfg.models?.providers?.[candidate.provider];
   const modelConfig = providerConfig?.models?.find((entry) => entry.id === candidate.model);
   const modalities = modelConfig?.input?.filter(
-    (value): value is "text" | "image" | "audio" => value === "text" || value === "image" || value === "audio",
+    (value): value is "text" | "image" | "audio" =>
+      value === "text" || value === "image" || value === "audio",
   );
   return buildCapabilitySnapshot({
     provider: candidate.provider,
@@ -159,7 +180,8 @@ export function createLiveSafeRoutingServiceDeps(
         }),
       )}`;
     },
-    buildSnapshotForCandidate: (candidate) => buildLiveCapabilitySnapshot(getRuntimeConfig(), candidate),
+    buildSnapshotForCandidate: (candidate) =>
+      buildLiveCapabilitySnapshot(getRuntimeConfig(), candidate),
     leaseStore: createSqliteObservationLeaseStore(),
   };
 }
@@ -339,7 +361,10 @@ export type EvaluateShadowRouteInGatewayResult =
       theoreticalChoice?: ShadowRouteCandidate;
       digestsConsistent: boolean;
     }
-  | { ok: false; code: "not_found" | "invalid_token" | "expired" | "already_consumed" | "superseded" };
+  | {
+      ok: false;
+      code: "not_found" | "invalid_token" | "expired" | "already_consumed" | "superseded";
+    };
 
 /**
  * Consumes the lease's one-time token, then runs the pure shadow evaluator
@@ -409,7 +434,9 @@ export function evaluateShadowRouteInGateway(
     policy: deps.admissionPolicy,
   });
 
-  const snapshotIdByKey = new Map(snapshots.map((s) => [`${s.built.provider} ${s.built.model}`, s.snapshotId]));
+  const snapshotIdByKey = new Map(
+    snapshots.map((s) => [`${s.built.provider} ${s.built.model}`, s.snapshotId]),
+  );
   appendRouteAttempts(
     lease.taskId,
     checkpoint.checkpointId,
@@ -417,7 +444,8 @@ export function evaluateShadowRouteInGateway(
       ordinal: attempt.ordinal,
       provider: attempt.provider,
       model: attempt.model,
-      capabilitySnapshotId: snapshotIdByKey.get(`${attempt.provider} ${attempt.model}`) ?? "unknown",
+      capabilitySnapshotId:
+        snapshotIdByKey.get(`${attempt.provider} ${attempt.model}`) ?? "unknown",
       evaluationMode: "shadow",
       eligibility: attempt.decision.outcome === "eligible" ? "eligible" : "rejected",
       ...(attempt.decision.outcome === "ineligible"
@@ -468,7 +496,10 @@ export function getShadowAudit(input: GetShadowAuditInput): GetShadowAuditResult
 
   const callerSessionBindingDigest = `sha256:${sha256Hex(input.callerScope.sessionKey)}`;
   const ownsSession = checkpoint.sessionBindingDigest === callerSessionBindingDigest;
-  const hasReadScope = authorizeOperatorScopesForRequiredScope(READ_SCOPE, input.callerScope.operatorScopes).allowed;
+  const hasReadScope = authorizeOperatorScopesForRequiredScope(
+    READ_SCOPE,
+    input.callerScope.operatorScopes,
+  ).allowed;
   if (!ownsSession && !hasReadScope) {
     return { ok: false, code: "not_found" };
   }
@@ -477,7 +508,9 @@ export function getShadowAudit(input: GetShadowAuditInput): GetShadowAuditResult
   // Derived guidance only — the shadow task itself still ends via the existing
   // lifecycle (task_runs.status is never rewritten to a Phase 2 `blocked` state).
   const suggestion: "CAPABLE_MODEL" | undefined =
-    attempts.length > 0 && !attempts.some((attempt) => attempt.wouldSelect) ? "CAPABLE_MODEL" : undefined;
+    attempts.length > 0 && !attempts.some((attempt) => attempt.wouldSelect)
+      ? "CAPABLE_MODEL"
+      : undefined;
 
   return {
     ok: true,
@@ -489,8 +522,18 @@ export function getShadowAudit(input: GetShadowAuditInput): GetShadowAuditResult
 }
 
 export type RecordObservedModelAttemptInGatewayInput =
-  | { phase: "started"; event: PluginHookModelCallStartedEvent; ctx: PluginHookAgentContext; now: number }
-  | { phase: "ended"; event: PluginHookModelCallEndedEvent; ctx: PluginHookAgentContext; now: number };
+  | {
+      phase: "started";
+      event: PluginHookModelCallStartedEvent;
+      ctx: PluginHookAgentContext;
+      now: number;
+    }
+  | {
+      phase: "ended";
+      event: PluginHookModelCallEndedEvent;
+      ctx: PluginHookAgentContext;
+      now: number;
+    };
 
 /**
  * The fourth narrow method: bridges a real `model_call_started`/
@@ -518,7 +561,8 @@ export async function recordObservedModelAttemptInGateway(
   const observerDeps: RouteAttemptObserverDeps = {
     leaseStore: deps.leaseStore,
     listRouteAttempts: (taskId, checkpointId) => listRouteAttempts(taskId, checkpointId),
-    updateRouteAttemptObservation: (attemptId, patch) => updateRouteAttemptObservation(attemptId, patch),
+    updateRouteAttemptObservation: (attemptId, patch) =>
+      updateRouteAttemptObservation(attemptId, patch),
   };
 
   if (input.phase === "ended") {

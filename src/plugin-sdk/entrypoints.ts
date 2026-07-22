@@ -56,7 +56,10 @@ export const supportedBundledFacadeSdkEntrypoints = [
 ] as const;
 
 /** Plugin-owned surfaces intentionally public and documented for third-party plugins. */
-export const publicPluginOwnedSdkEntrypoints = ["memory-core-host-engine-foundation"] as const;
+export const publicPluginOwnedSdkEntrypoints = [
+  "memory-core-host-engine-foundation",
+  "safe-routing",
+] as const;
 
 /** Map every SDK entrypoint name to its source file path inside the repo. */
 export function buildPluginSdkEntrySources(entries: readonly string[] = pluginSdkEntrypoints) {
