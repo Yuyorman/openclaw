@@ -26,6 +26,15 @@ import {
   WRITE_SCOPE,
   authorizeOperatorScopesForRequiredScope,
 } from "../../gateway/method-scopes.js";
+import {
+  recordObservedModelAttempt,
+  type RouteAttemptObserverDeps,
+} from "../../agents/model-routing/route-attempt-observer.js";
+import type {
+  PluginHookAgentContext,
+  PluginHookModelCallEndedEvent,
+  PluginHookModelCallStartedEvent,
+} from "../../plugins/hook-types.js";
 import { getPluginRegistryState } from "../../plugins/runtime-state.js";
 import {
   consumeObservationLease,
@@ -40,6 +49,7 @@ import {
   getTaskContract,
   listRouteAttempts,
   putCapabilitySnapshot,
+  updateRouteAttemptObservation,
 } from "./store.sqlite.js";
 import type { PutCapabilitySnapshotInput, RouteAttemptRow, TaskCheckpointRow, TaskContractRow } from "./store.types.js";
 import { digestTaskContract, normalizeTaskContract, type NormalizedTaskContract, type PersistedTaskContract } from "./contracts.js";
@@ -414,7 +424,14 @@ export type GetShadowAuditInput = {
 };
 
 export type GetShadowAuditResult =
-  | { ok: true; contract: TaskContractRow; checkpoint: TaskCheckpointRow; attempts: RouteAttemptRow[] }
+  | {
+      ok: true;
+      contract: TaskContractRow;
+      checkpoint: TaskCheckpointRow;
+      attempts: RouteAttemptRow[];
+      /** Derived suggestion, never a stored fact: set when at least one candidate was evaluated and none was eligible. */
+      suggestion?: "CAPABLE_MODEL";
+    }
   | { ok: false; code: "not_found" };
 
 /**
@@ -437,10 +454,64 @@ export function getShadowAudit(input: GetShadowAuditInput): GetShadowAuditResult
     return { ok: false, code: "not_found" };
   }
 
+  const attempts = listRouteAttempts(input.taskId, checkpoint.checkpointId);
+  // Derived guidance only — the shadow task itself still ends via the existing
+  // lifecycle (task_runs.status is never rewritten to a Phase 2 `blocked` state).
+  const suggestion: "CAPABLE_MODEL" | undefined =
+    attempts.length > 0 && !attempts.some((attempt) => attempt.wouldSelect) ? "CAPABLE_MODEL" : undefined;
+
   return {
     ok: true,
     contract,
     checkpoint,
-    attempts: listRouteAttempts(input.taskId, checkpoint.checkpointId),
+    attempts,
+    ...(suggestion ? { suggestion } : {}),
   };
+}
+
+export type RecordObservedModelAttemptInGatewayInput =
+  | { phase: "started"; event: PluginHookModelCallStartedEvent; ctx: PluginHookAgentContext; now: number }
+  | { phase: "ended"; event: PluginHookModelCallEndedEvent; ctx: PluginHookAgentContext; now: number };
+
+/**
+ * The fourth narrow method: bridges a real `model_call_started`/
+ * `model_call_ended` typed hook event (subscribed via `api.on(...)` in the
+ * Task 7 extension) into `route-attempt-observer.ts`'s pure correlation and
+ * persistence logic. Fire-and-forget by construction (never throws — see
+ * `recordObservedModelAttempt`'s own contract).
+ */
+export async function recordObservedModelAttemptInGateway(
+  deps: SafeRoutingServiceDeps,
+  input: RecordObservedModelAttemptInGatewayInput,
+): Promise<void> {
+  const observerDeps: RouteAttemptObserverDeps = {
+    leaseStore: deps.leaseStore,
+    listRouteAttempts: (taskId, checkpointId) => listRouteAttempts(taskId, checkpointId),
+    updateRouteAttemptObservation: (attemptId, patch) => updateRouteAttemptObservation(attemptId, patch),
+  };
+
+  if (input.phase === "ended") {
+    await recordObservedModelAttempt(observerDeps, {
+      phase: "ended",
+      event: input.event,
+      ctx: input.ctx,
+      now: input.now,
+    });
+    return;
+  }
+
+  const sessionKey = input.ctx.sessionKey;
+  if (!sessionKey) {
+    return;
+  }
+  await recordObservedModelAttempt(observerDeps, {
+    phase: "started",
+    event: input.event,
+    ctx: input.ctx,
+    sessionBindingDigest: `sha256:${sha256Hex(sessionKey)}`,
+    configDigest: deps.configDigest(),
+    pluginRegistryDigest: deps.pluginRegistryDigest(),
+    candidateChainDigest: digestCandidateChain(deps.resolveCandidates()),
+    now: input.now,
+  });
 }

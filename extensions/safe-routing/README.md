@@ -49,6 +49,19 @@ openclaw safe-routing shadow --contract ./contract.json --session-ref my-session
   `currentSelection` (the candidate a real hook-observed call has actually
   correlated to, if any yet).
 
+## Real-call observation
+
+Once a lease has been evaluated, the extension subscribes to the gateway's
+`model_call_started`/`model_call_ended` typed hooks (`api.on(...)`, the same
+public mechanism `extensions/workboard` uses for a different event — no Core
+changes were needed) so that if the real routing loop actually calls one of
+the evaluated candidates, the matching route attempt is updated from
+`observationCompleteness: "unavailable"` to `"complete"` and
+`observationCoverage: "hook-covered"`. `mode: "off"` skips this before
+touching anything; a `mode: "shadow"` session with no active lease also
+no-ops (see `src/agents/model-routing/observed-attempt.ts`). Verified end to
+end in `shadow-evaluator.integration.test.ts`.
+
 ## Querying an existing audit
 
 Re-running `safe-routing shadow` against the same contract/session does not
@@ -81,5 +94,24 @@ OpenClaw builds that do not recognize these tables simply ignore them.
   key only; it does not yet have a verified way to read `operator.write`/
   `operator.read` scopes off a plugin gateway method's `client` object, so
   only session ownership (not the operator-scope fallback) is enforced today.
-- This extension never touches `primary`/`fallbacks` in `openclaw.json` and
-  never calls a model, tool, or auth resolver.
+
+## Phase 1 boundaries (by design, not just "not implemented yet")
+
+- Never changes `agents.defaults.model.primary`/`fallbacks` in `openclaw.json`,
+  and never mutates the real fallback candidate chain — it only calls the
+  unmodified `resolveModelCandidateChain` to *read* the current chain.
+- Never calls a model, a tool, `resolveAuthProfileOrder`, or anything that
+  mutates provider cooldown/health state.
+- No `enforce` mode, no state-transition API, no way to block or redirect a
+  real request — Phase 1 is report-only end to end.
+- Does not create the Phase 2 `task_safety_state` table or a `blocked` task
+  status; a shadow task with zero eligible candidates still ends via the
+  existing `succeeded` lifecycle, only surfacing a derived, non-persisted
+  `"CAPABLE_MODEL"` suggestion in the audit response.
+- Does not register a model tool and does not listen to ordinary chat traffic
+  — only the three gateway methods, the two observation-only typed hook
+  subscriptions above, and the explicit CLI exist.
+- `mode: "off"` (the default) means the extension's gateway methods refuse to
+  run at all — no lease, no checkpoint, no snapshot, no route attempt is ever
+  written, verified end to end in
+  `extensions/safe-routing/src/cli.integration.test.ts`.

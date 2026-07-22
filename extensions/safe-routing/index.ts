@@ -7,6 +7,7 @@ import {
   createShadowObservationLease,
   evaluateShadowRouteInGateway,
   getShadowAudit,
+  recordObservedModelAttemptInGateway,
   type SafeRoutingCallerScope,
 } from "openclaw/plugin-sdk/safe-routing";
 import { registerSafeRoutingCli } from "./src/cli.js";
@@ -104,6 +105,31 @@ export default definePluginEntry({
       const typed = params as { taskId?: unknown };
       const result = getShadowAudit({ taskId: String(typed.taskId ?? ""), callerScope });
       respond(result.ok, result.ok ? result : undefined, result.ok ? undefined : { code: result.code, message: result.code });
+    });
+
+    // Real-call observation: silently no-ops for any session without an active
+    // lease (see observed-attempt.ts), and mode=off skips before touching the
+    // store at all — ordinary chat sessions only ever pay for this empty check.
+    api.on("model_call_started", async (event, ctx) => {
+      const config = readExtensionConfig(api);
+      if (config.mode !== "shadow") {
+        return;
+      }
+      const deps = createLiveSafeRoutingServiceDeps({
+        admissionPolicy: { approvedProviders: config.approvedProviders },
+      });
+      await recordObservedModelAttemptInGateway(deps, { phase: "started", event, ctx, now: Date.now() });
+    });
+
+    api.on("model_call_ended", async (event, ctx) => {
+      const config = readExtensionConfig(api);
+      if (config.mode !== "shadow") {
+        return;
+      }
+      const deps = createLiveSafeRoutingServiceDeps({
+        admissionPolicy: { approvedProviders: config.approvedProviders },
+      });
+      await recordObservedModelAttemptInGateway(deps, { phase: "ended", event, ctx, now: Date.now() });
     });
 
     api.registerCli(
