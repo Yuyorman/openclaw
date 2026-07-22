@@ -46,6 +46,9 @@ export type CorrelateModelCallEventInput =
       phase: "ended";
       event: PluginHookModelCallEndedEvent;
       ctx: PluginHookAgentContext;
+      configDigest: string;
+      pluginRegistryDigest: string;
+      candidateChainDigest: string;
       now: number;
     };
 
@@ -117,10 +120,12 @@ function correlateStarted(
   return undefined;
 }
 
-function leaseDigestsMatch(
-  lease: ObservationLease,
-  input: Extract<CorrelateModelCallEventInput, { phase: "started" }>,
-): boolean {
+type LeaseDigests = Pick<
+  ObservationLease,
+  "configDigest" | "pluginRegistryDigest" | "candidateChainDigest"
+>;
+
+function leaseDigestsMatch(lease: ObservationLease, input: LeaseDigests): boolean {
   return (
     input.configDigest === lease.configDigest &&
     input.pluginRegistryDigest === lease.pluginRegistryDigest &&
@@ -128,6 +133,13 @@ function leaseDigestsMatch(
   );
 }
 
+/**
+ * A bound lease's `ended` pairing must recheck live digests: the call may
+ * have run long enough for config/plugins/candidates to drift after `started`
+ * verified them, and a stale-but-since-reverted live state must not launder
+ * the attempt back to `complete` (see module docs on the two independent
+ * digest checkpoints).
+ */
 function correlateEnded(
   store: ObservationLeaseStore,
   input: Extract<CorrelateModelCallEventInput, { phase: "ended" }>,
@@ -138,10 +150,14 @@ function correlateEnded(
     return undefined;
   }
 
-  store.compareAndSwap(lease.leaseId, lease.rowVersion, { state: "complete" });
+  const digestsMatch = leaseDigestsMatch(lease, input);
+  const completeness: ObservationCompleteness = digestsMatch ? "complete" : "partial";
+  store.compareAndSwap(lease.leaseId, lease.rowVersion, {
+    state: digestsMatch ? "complete" : "partial",
+  });
   return {
     ...baseAttemptFields(input.event),
-    observationCompleteness: "complete",
+    observationCompleteness: completeness,
     observationCoverage: "hook-covered",
   };
 }

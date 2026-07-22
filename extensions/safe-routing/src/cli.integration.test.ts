@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { closeOpenClawStateDatabaseForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import plugin from "../index.js";
 
 type RespondCall = [ok: boolean, payload?: unknown, error?: { code?: unknown; message?: unknown }];
@@ -59,7 +59,10 @@ type HookHandler = (
   ctx: Record<string, unknown>,
 ) => Promise<void> | void;
 
-function activatePlugin(pluginConfig: Record<string, unknown>) {
+function activatePlugin(
+  pluginConfig: Record<string, unknown>,
+  loggerOverride?: { warn: (message: string) => void },
+) {
   const captured = captureGatewayMethods();
   const hooks = new Map<string, HookHandler>();
   const api = createTestPluginApi({
@@ -69,6 +72,9 @@ function activatePlugin(pluginConfig: Record<string, unknown>) {
     on: ((hookName: string, handler: unknown) => {
       hooks.set(hookName, handler as HookHandler);
     }) as never,
+    ...(loggerOverride
+      ? { logger: { info() {}, warn: loggerOverride.warn, error() {}, debug() {} } }
+      : {}),
   });
   (plugin as unknown as { register(api: unknown): void }).register(api);
   return { methods: captured.methods, hooks };
@@ -133,6 +139,18 @@ describe("extensions/safe-routing — gateway method handlers (mode gate + end-t
     expect(audited).toMatchObject({ ok: false, error: { code: "disabled" } });
   });
 
+  it("warns once for an invalid shadow config instead of silently running as mode=off on every call", async () => {
+    const warn = vi.fn();
+    // mode=shadow with neither approvedProviders nor allowedTaskKinds set.
+    const { methods } = activatePlugin({ mode: "shadow" }, { warn });
+
+    await callMethod(methods, "safe-routing.audit", { taskId: "z" }, "session-1");
+    await callMethod(methods, "safe-routing.audit", { taskId: "z" }, "session-1");
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("missing_approved_providers");
+  });
+
   it("mode=shadow runs the full createLease -> evaluate -> audit flow and the session owner can read it back", async () => {
     const { methods } = activatePlugin({
       mode: "shadow",
@@ -167,6 +185,37 @@ describe("extensions/safe-routing — gateway method handlers (mode gate + end-t
     expect(repeated).toEqual(audited);
   });
 
+  it("mode=shadow runs the full createLease -> evaluate -> audit flow for the real external CLI connection shape (no agentRuntimeIdentity)", async () => {
+    const { methods } = activatePlugin({
+      mode: "shadow",
+      allowedTaskKinds: ["safe-routing-readonly-shadow"],
+      approvedProviders: ["anthropic", "openai"],
+    });
+
+    // No sessionKey passed: callMethod sends `client: null`, matching a real
+    // external `openclaw safe-routing shadow` CLI connection, which never
+    // carries agentRuntimeIdentity (only local embedded-agent-session
+    // connections do). Reaching these handlers at all already proves the
+    // connection cleared the implicit operator.admin gateway-method gate
+    // (see deriveCallerScope in index.ts).
+    const created = await callMethod(methods, "safe-routing.createLease", {
+      contract: CONTRACT,
+      sessionRef: "cli-invoker-supplied-ref",
+    });
+    expect(created.ok).toBe(true);
+    const { leaseId, leaseToken, taskId } = created.payload as {
+      leaseId: string;
+      leaseToken: string;
+      taskId: string;
+    };
+
+    const evaluated = await callMethod(methods, "safe-routing.evaluate", { leaseId, leaseToken });
+    expect(evaluated.ok).toBe(true);
+
+    const audited = await callMethod(methods, "safe-routing.audit", { taskId });
+    expect(audited.ok).toBe(true);
+  });
+
   it("rejects createLease for a caller whose session does not match sessionRef", async () => {
     const { methods } = activatePlugin({
       mode: "shadow",
@@ -184,13 +233,16 @@ describe("extensions/safe-routing — gateway method handlers (mode gate + end-t
     expect(result).toMatchObject({ ok: false, error: { code: "forbidden" } });
   });
 
-  it("returns not_found for audit when there is no verifiable caller session", async () => {
+  it("returns not_found auditing a nonexistent taskId, even for an operator caller with no session identity", async () => {
     const { methods } = activatePlugin({
       mode: "shadow",
       allowedTaskKinds: ["safe-routing-readonly-shadow"],
       approvedProviders: ["anthropic"],
     });
 
+    // No sessionKey: an admin-operator-scoped caller (see deriveCallerScope),
+    // not a rejected caller — the not_found here comes from the taskId itself
+    // not existing, not from a missing identity.
     const result = await callMethod(methods, "safe-routing.audit", { taskId: "whatever" });
 
     expect(result).toMatchObject({ ok: false, error: { code: "not_found" } });

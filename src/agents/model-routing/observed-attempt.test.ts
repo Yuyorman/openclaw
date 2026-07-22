@@ -84,12 +84,24 @@ function startedInput(
   };
 }
 
-function endedInput(overrides: Partial<PluginHookModelCallEndedEvent> = {}, now = 2_000) {
+function endedInput(
+  eventOverrides: Partial<PluginHookModelCallEndedEvent> = {},
+  now = 2_000,
+  digestOverrides: Partial<{
+    configDigest: string;
+    pluginRegistryDigest: string;
+    candidateChainDigest: string;
+  }> = {},
+) {
   return {
     phase: "ended" as const,
-    event: buildEndedEvent(overrides),
+    event: buildEndedEvent(eventOverrides),
     ctx: CTX,
+    configDigest: CONFIG_DIGEST,
+    pluginRegistryDigest: REGISTRY_DIGEST,
+    candidateChainDigest: CANDIDATE_CHAIN_DIGEST,
     now,
+    ...digestOverrides,
   };
 }
 
@@ -192,6 +204,22 @@ describe("correlateModelCallEvent — ended", () => {
     const result = correlateModelCallEvent(store, endedInput({ runId: "unrelated-run" }));
 
     expect(result).toBeUndefined();
+  });
+
+  it("marks partial instead of complete when the live digest has drifted since bind", () => {
+    const store = createInMemoryObservationLeaseStore();
+    setUpBoundLease(store);
+
+    const result = correlateModelCallEvent(
+      store,
+      endedInput({}, 2_000, { candidateChainDigest: "sha256:different-candidate-digest" }),
+    );
+
+    expect(result).toMatchObject({
+      observationCompleteness: "partial",
+      observationCoverage: "hook-covered",
+    });
+    expect(store.findById("lease-1")?.state).toBe("partial");
   });
 
   it("always reports hook-covered — out-of-scope classification is the caller's absence-of-event concern", () => {

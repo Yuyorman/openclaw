@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildCapabilitySnapshot } from "../../agents/model-routing/capability-snapshot.js";
 import type { ShadowRouteCandidate } from "../../agents/model-routing/shadow-evaluator.js";
 import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
@@ -13,6 +13,7 @@ import {
   createShadowObservationLease,
   evaluateShadowRouteInGateway,
   getShadowAudit,
+  recordObservedModelAttemptInGateway,
   type SafeRoutingCallerScope,
   type SafeRoutingServiceDeps,
 } from "./service.js";
@@ -488,5 +489,118 @@ describe("safety service", () => {
         closeOpenClawStateDatabase();
       },
     );
+  });
+
+  describe("recordObservedModelAttemptInGateway — fast path", () => {
+    it("skips live config/registry/candidate-chain digest computation for a started event with no pending lease", async () => {
+      await withOpenClawTestState(
+        { layout: "state-only", prefix: "openclaw-safety-service-observe-fastpath-started-" },
+        async () => {
+          resetTaskRegistryForTests();
+          const configDigest = vi.fn(() => "sha256:config-v1");
+          const pluginRegistryDigest = vi.fn(() => "sha256:registry-v1");
+          const resolveCandidates = vi.fn(() => [REAL_CANDIDATE, SHADOW_ELIGIBLE_CANDIDATE]);
+          const deps = createTestDeps({ configDigest, pluginRegistryDigest, resolveCandidates });
+
+          await recordObservedModelAttemptInGateway(deps, {
+            phase: "started",
+            event: {
+              runId: "run-1",
+              callId: "call-1",
+              sessionKey: "session-with-no-lease",
+              provider: "anthropic",
+              model: "claude-sonnet-5",
+            },
+            ctx: { sessionKey: "session-with-no-lease" },
+            now: deps.now(),
+          });
+
+          expect(configDigest).not.toHaveBeenCalled();
+          expect(pluginRegistryDigest).not.toHaveBeenCalled();
+          expect(resolveCandidates).not.toHaveBeenCalled();
+          closeOpenClawStateDatabase();
+        },
+      );
+    });
+
+    it("skips live digest computation for an ended event with no bound lease", async () => {
+      await withOpenClawTestState(
+        { layout: "state-only", prefix: "openclaw-safety-service-observe-fastpath-ended-" },
+        async () => {
+          resetTaskRegistryForTests();
+          const configDigest = vi.fn(() => "sha256:config-v1");
+          const pluginRegistryDigest = vi.fn(() => "sha256:registry-v1");
+          const resolveCandidates = vi.fn(() => [REAL_CANDIDATE, SHADOW_ELIGIBLE_CANDIDATE]);
+          const deps = createTestDeps({ configDigest, pluginRegistryDigest, resolveCandidates });
+
+          await recordObservedModelAttemptInGateway(deps, {
+            phase: "ended",
+            event: {
+              runId: "unrelated-run",
+              callId: "unrelated-call",
+              sessionKey: "session-with-no-lease",
+              provider: "anthropic",
+              model: "claude-sonnet-5",
+              durationMs: 1200,
+              outcome: "completed",
+            },
+            ctx: { sessionKey: "session-with-no-lease" },
+            now: deps.now(),
+          });
+
+          expect(configDigest).not.toHaveBeenCalled();
+          expect(pluginRegistryDigest).not.toHaveBeenCalled();
+          expect(resolveCandidates).not.toHaveBeenCalled();
+          closeOpenClawStateDatabase();
+        },
+      );
+    });
+
+    it("still computes live digests and records the observation when a lease is actually pending", async () => {
+      await withOpenClawTestState(
+        { layout: "state-only", prefix: "openclaw-safety-service-observe-fastpath-active-" },
+        async () => {
+          resetTaskRegistryForTests();
+          const configDigest = vi.fn(() => "sha256:config-v1");
+          const pluginRegistryDigest = vi.fn(() => "sha256:registry-v1");
+          const resolveCandidates = vi.fn(() => [REAL_CANDIDATE, SHADOW_ELIGIBLE_CANDIDATE]);
+          const deps = createTestDeps({ configDigest, pluginRegistryDigest, resolveCandidates });
+          const created = createShadowObservationLease(deps, {
+            contract: buildContract(),
+            sessionRef: "session-owner",
+            callerScope: OWNER,
+          });
+          if (!created.ok) {
+            throw new Error("unreachable");
+          }
+          configDigest.mockClear();
+          pluginRegistryDigest.mockClear();
+          resolveCandidates.mockClear();
+
+          await recordObservedModelAttemptInGateway(deps, {
+            phase: "started",
+            event: {
+              runId: "run-1",
+              callId: "call-1",
+              sessionKey: "session-owner",
+              provider: "anthropic",
+              model: "claude-sonnet-5",
+            },
+            ctx: { sessionKey: "session-owner" },
+            now: deps.now(),
+          });
+
+          expect(configDigest).toHaveBeenCalled();
+          expect(pluginRegistryDigest).toHaveBeenCalled();
+          expect(resolveCandidates).toHaveBeenCalled();
+          expect(deps.leaseStore.findById(created.leaseId)).toMatchObject({
+            state: "bound",
+            boundRunId: "run-1",
+            boundCallId: "call-1",
+          });
+          closeOpenClawStateDatabase();
+        },
+      );
+    });
   });
 });

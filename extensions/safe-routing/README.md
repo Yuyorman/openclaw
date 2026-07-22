@@ -95,10 +95,15 @@ OpenClaw builds that do not recognize these tables simply ignore them.
 - `decisionGrade` authorization has no real per-model policy source yet;
   Phase 1 defaults every candidate to `final`-authorized (unrestricted on this
   dimension), since shadow mode never actually executes a call.
-- The extension derives caller identity from the gateway connection's session
-  key only; it does not yet have a verified way to read `operator.write`/
-  `operator.read` scopes off a plugin gateway method's `client` object, so
-  only session ownership (not the operator-scope fallback) is enforced today.
+- The extension has no verified way to read a connection's granted
+  `operator.write`/`operator.read` scopes off a plugin gateway method's
+  `client` object. It derives caller identity from the connection's
+  embedded-agent session key when present; otherwise (the explicit CLI, which
+  never carries that identity) it treats the caller as an `operator.admin`
+  operator, since all three gateway methods register without a narrower
+  `{scope}` and so already require `operator.admin` for Core to dispatch the
+  call at all — reaching the handler is itself the proof. A future narrower
+  scope reader could downgrade this to the caller's actual granted scope.
 - `recordObservedModelAttemptInGateway` (the hook-bridge used for real-call
   observation) has no caller-identity check of its own — it trusts its
   `event`/`ctx` arguments verbatim, because its only intended caller is Core's
