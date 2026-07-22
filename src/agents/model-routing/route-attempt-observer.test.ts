@@ -78,7 +78,15 @@ function startedInput(overrides: Partial<PluginHookModelCallStartedEvent> = {}, 
 }
 
 function endedInput(overrides: Partial<PluginHookModelCallEndedEvent> = {}, now = 2_000) {
-  return { phase: "ended" as const, event: buildEndedEvent(overrides), ctx: CTX, now };
+  return {
+    phase: "ended" as const,
+    event: buildEndedEvent(overrides),
+    ctx: CTX,
+    configDigest: CONFIG_DIGEST,
+    pluginRegistryDigest: REGISTRY_DIGEST,
+    candidateChainDigest: CANDIDATE_CHAIN_DIGEST,
+    now,
+  };
 }
 
 type FakeAttempt = {

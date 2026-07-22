@@ -377,11 +377,77 @@ describe("safety store sqlite", () => {
           rowVersion: 1,
         });
 
-        expect(leaseStore.findById("lease-1")).toMatchObject({ state: "superseded" });
+        expect(leaseStore.findById("lease-1")).toMatchObject({
+          state: "superseded",
+          rowVersion: 2,
+        });
         expect(leaseStore.findById("lease-2")).toMatchObject({ state: "pending" });
         expect(leaseStore.findPendingBySessionBindingDigest("sha256:session-digest")?.leaseId).toBe(
           "lease-2",
         );
+
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
+  it("rejects a CAS against a superseded lease's pre-supersede rowVersion instead of resurrecting it", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-store-lease-supersede-cas-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const first = createManagedTask();
+        const second = createManagedTask();
+        const leaseStore = createSqliteObservationLeaseStore();
+
+        leaseStore.insert({
+          leaseId: "lease-1",
+          taskId: first.task.taskId,
+          checkpointId: first.checkpointId,
+          sessionBindingDigest: "sha256:session-digest",
+          leaseTokenDigest: "sha256:token-digest-1",
+          contractDigest: "sha256:contract-digest",
+          configDigest: "sha256:config-digest",
+          pluginRegistryDigest: "sha256:registry-digest",
+          candidateChainDigest: "sha256:candidate-digest",
+          expiresAt: Date.now() + 60_000,
+          state: "pending",
+          rowVersion: 1,
+        });
+
+        // A concurrent hook handler reads lease-1 here, capturing rowVersion=1,
+        // before the second createShadowObservationLease call below supersedes it.
+        const staleRead = leaseStore.findById("lease-1");
+        expect(staleRead?.rowVersion).toBe(1);
+
+        leaseStore.insert({
+          leaseId: "lease-2",
+          taskId: second.task.taskId,
+          checkpointId: second.checkpointId,
+          sessionBindingDigest: "sha256:session-digest",
+          leaseTokenDigest: "sha256:token-digest-2",
+          contractDigest: "sha256:contract-digest",
+          configDigest: "sha256:config-digest",
+          pluginRegistryDigest: "sha256:registry-digest",
+          candidateChainDigest: "sha256:candidate-digest",
+          expiresAt: Date.now() + 60_000,
+          state: "pending",
+          rowVersion: 1,
+        });
+
+        // The concurrent hook handler's CAS, using the rowVersion it read
+        // before the supersede, must lose the race rather than reviving
+        // lease-1 back to "bound".
+        const applied = leaseStore.compareAndSwap("lease-1", /* staleRead.rowVersion */ 1, {
+          state: "bound",
+          boundRunId: "run-1",
+          boundCallId: "call-1",
+        });
+        expect(applied).toBe(false);
+        expect(leaseStore.findById("lease-1")).toMatchObject({
+          state: "superseded",
+          rowVersion: 2,
+        });
 
         closeOpenClawStateDatabase();
       },
@@ -503,6 +569,65 @@ describe("safety store sqlite", () => {
 
         const [afterDuplicate] = listRouteAttempts(task.taskId, checkpointId);
         expect(afterDuplicate).toEqual(afterFirst);
+
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
+  it("never launders a partial observation back to complete (one-way ratchet)", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-store-observe-ratchet-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const { task, checkpointId } = createManagedTask();
+        const snapshot = putCapabilitySnapshot({
+          provider: "anthropic",
+          model: "claude-sonnet-5",
+          verificationStatus: "verified",
+          capabilities: {},
+          evidence: {},
+          snapshotDigest: "sha256:snapshot-digest",
+        });
+        const [attempt] = appendRouteAttempts(task.taskId, checkpointId, [
+          {
+            ordinal: 0,
+            provider: "anthropic",
+            model: "claude-sonnet-5",
+            capabilitySnapshotId: snapshot.snapshotId,
+            evaluationMode: "shadow",
+            eligibility: "eligible",
+            wouldSelect: true,
+            observationCompleteness: "unavailable",
+            observationCoverage: "out-of-scope",
+          },
+        ]);
+
+        // A digest-drift observed at bind time (or at evaluate time) marks the
+        // attempt partial before any run/call ids are known.
+        const markPartial = updateRouteAttemptObservation(attempt.attemptId, {
+          observationCompleteness: "partial",
+          observationCoverage: "hook-covered",
+        });
+        expect(markPartial).toBe(true);
+
+        // A later `ended` event whose own point-in-time digest happens to
+        // match must not launder the row back to "complete" — the taint from
+        // the earlier drift still applies to this attempt's eligibility verdict.
+        const laundered = updateRouteAttemptObservation(attempt.attemptId, {
+          runId: "run-1",
+          callId: "call-1",
+          observationCompleteness: "complete",
+          observationCoverage: "hook-covered",
+        });
+        expect(laundered).toBe(true);
+
+        const [afterLaunderAttempt] = listRouteAttempts(task.taskId, checkpointId);
+        expect(afterLaunderAttempt).toMatchObject({
+          observationCompleteness: "partial",
+          observationCoverage: "hook-covered",
+        });
+        expect(afterLaunderAttempt.runId).toBeUndefined();
 
         closeOpenClawStateDatabase();
       },

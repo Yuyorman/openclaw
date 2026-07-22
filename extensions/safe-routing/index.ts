@@ -12,32 +12,50 @@ import {
 } from "openclaw/plugin-sdk/safe-routing";
 import { asRecord, readStringField } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { registerSafeRoutingCli } from "./src/cli.js";
-import { validateSafeRoutingConfig, type SafeRoutingExtensionConfig } from "./src/config.js";
+import {
+  validateSafeRoutingConfig,
+  type SafeRoutingConfigValidationErrorCode,
+  type SafeRoutingExtensionConfig,
+} from "./src/config.js";
 
 type GatewayMethodHandlerParams = Parameters<
   Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1]
 >[0];
 
-function deriveCallerScope(
-  client: GatewayMethodHandlerParams["client"],
-): SafeRoutingCallerScope | undefined {
+function deriveCallerScope(client: GatewayMethodHandlerParams["client"]): SafeRoutingCallerScope {
   const sessionKey = client?.internal?.agentRuntimeIdentity?.sessionKey?.trim();
-  if (!sessionKey) {
-    return undefined;
+  if (sessionKey) {
+    return { sessionKey, operatorScopes: [] };
   }
-  // Phase 1 wiring: no verified way to read operator scopes off a bare plugin
-  // gateway method `client` was found; this always ships an empty scope list,
-  // so only session ownership (never the `operator.write`/`operator.read`
-  // fallback) can succeed through this extension today. Strictly more
-  // conservative than under-authorizing would be — never over-grants.
-  return { sessionKey, operatorScopes: [] };
+  // No embedded-agent session identity on this connection (e.g. the explicit
+  // CLI, which connects as a plain operator, never as an agent runtime). All
+  // three gateway methods below register without an explicit `{scope}`
+  // option, so Core's own dispatch (src/gateway/methods/registry.ts) defaults
+  // their required scope to "operator.admin" — reaching this handler at all
+  // already proves the caller cleared that gate. Treat it as a verified admin
+  // operator instead of rejecting; this is what makes the CLI's
+  // `safe-routing shadow` command work end to end (see README.md).
+  return { sessionKey: "", operatorScopes: ["operator.admin"] };
 }
+
+// Tracks the last-logged validation failure so a persistently broken config
+// (checked on every gateway call and every model_call_started/ended hook)
+// warns once per distinct problem instead of spamming on every model call.
+let lastLoggedConfigValidationErrorCode: SafeRoutingConfigValidationErrorCode | undefined;
 
 function readExtensionConfig(api: OpenClawPluginApi): SafeRoutingExtensionConfig {
   const result = validateSafeRoutingConfig(api.pluginConfig);
   if (!result.ok) {
+    if (result.code !== lastLoggedConfigValidationErrorCode) {
+      lastLoggedConfigValidationErrorCode = result.code;
+      api.logger.warn(
+        `safe-routing: config is invalid (${result.code}); running as mode=off until fixed. ` +
+          "See extensions/safe-routing/README.md for the required shape.",
+      );
+    }
     return { mode: "off", allowedTaskKinds: [], approvedProviders: [] };
   }
+  lastLoggedConfigValidationErrorCode = undefined;
   return result.config;
 }
 
@@ -46,8 +64,6 @@ export default definePluginEntry({
   name: "Safe Routing (Phase 1 shadow)",
   description: "Read-only shadow evaluation of theoretical model routing admission.",
   register(api) {
-    const respondNotFound = (respond: GatewayMethodHandlerParams["respond"]) =>
-      respond(false, undefined, { code: "not_found", message: "Not found." });
     const respondDisabled = (respond: GatewayMethodHandlerParams["respond"]) =>
       respond(false, undefined, {
         code: "disabled",
@@ -61,10 +77,6 @@ export default definePluginEntry({
         return;
       }
       const callerScope = deriveCallerScope(client);
-      if (!callerScope) {
-        respondNotFound(respond);
-        return;
-      }
       const record = asRecord(params);
       const deps = createLiveSafeRoutingServiceDeps({
         admissionPolicy: { approvedProviders: config.approvedProviders },
@@ -109,10 +121,6 @@ export default definePluginEntry({
         return;
       }
       const callerScope = deriveCallerScope(client);
-      if (!callerScope) {
-        respondNotFound(respond);
-        return;
-      }
       const record = asRecord(params);
       const result = getShadowAudit({
         taskId: readStringField(record, "taskId") ?? "",
@@ -127,7 +135,10 @@ export default definePluginEntry({
 
     // Real-call observation: silently no-ops for any session without an active
     // lease (see observed-attempt.ts), and mode=off skips before touching the
-    // store at all — ordinary chat sessions only ever pay for this empty check.
+    // store at all. recordObservedModelAttemptInGateway itself does a cheap
+    // lease-existence lookup before computing any live config/registry/
+    // candidate-chain digest, so ordinary chat sessions only ever pay for that
+    // one indexed lookup, never the full digest computation.
     api.on("model_call_started", async (event, ctx) => {
       const config = readExtensionConfig(api);
       if (config.mode !== "shadow") {

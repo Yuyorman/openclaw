@@ -4,6 +4,7 @@
 // model_capability_snapshots/model_route_attempts.
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { sql } from "kysely";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../../state/openclaw-state-db.generated.js";
@@ -513,11 +514,21 @@ export function createSqliteObservationLeaseStore(): ObservationLeaseStore {
         // transaction, so a real hook event can never bind to a stale,
         // already-replaced lease (the new row's own session_binding_digest is
         // still NULL at this point, so it cannot match and supersede itself).
+        // row_version must be bumped here too (matching the in-memory store),
+        // otherwise a concurrent CAS still holding the pre-supersede
+        // row_version would match this row's unchanged row_version and
+        // resurrect the superseded lease back to bound/complete.
         executeSqliteQuerySync(
           db,
           getSafetyKysely(db)
             .updateTable("task_checkpoints")
-            .set({ lease_state: "superseded" })
+            .set({
+              lease_state: "superseded",
+              // kysely-allow-raw: increments in place; the exact prior value
+              // is irrelevant, only that any concurrent CAS's expected
+              // row_version can no longer match after this commits.
+              row_version: sql<number>`row_version + 1`,
+            })
             .where("session_binding_digest", "=", lease.sessionBindingDigest)
             .where("lease_state", "=", "pending"),
         );
@@ -610,7 +621,9 @@ export function createSqliteObservationLeaseStore(): ObservationLeaseStore {
  * Updates a previously-appended route attempt's observed-call fields once a
  * real model_call_started/model_call_ended event correlates to it. Idempotent:
  * a repeat update carrying the same runId/callId onto an already-"complete"
- * attempt is a no-op, so duplicate ended events never double-write.
+ * attempt is a no-op, so duplicate ended events never double-write. Also a
+ * one-way ratchet on "partial": once digest drift has been recorded, a later
+ * write cannot launder the row back to "complete" (see call site).
  */
 export function updateRouteAttemptObservation(
   attemptId: string,
@@ -630,6 +643,16 @@ export function updateRouteAttemptObservation(
       existing.observation_completeness === "complete" &&
       existing.run_id === (patch.runId ?? null) &&
       existing.call_id === (patch.callId ?? null)
+    ) {
+      return true;
+    }
+    // "partial" is a terminal, one-way ratchet: once digest drift has been
+    // recorded anywhere in this attempt's lifecycle (evaluate-time or
+    // hook-observation-time), a later hook event observing only its own
+    // point-in-time consistency must not launder the row back to "complete".
+    if (
+      existing.observation_completeness === "partial" &&
+      patch.observationCompleteness === "complete"
     ) {
       return true;
     }

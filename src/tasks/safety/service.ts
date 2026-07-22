@@ -566,10 +566,21 @@ export async function recordObservedModelAttemptInGateway(
   };
 
   if (input.phase === "ended") {
+    // Cheap existence check first: skip the live config/plugin-registry/
+    // candidate-chain digest computation below for the overwhelming common
+    // case of an ordinary call with no lease ever bound to it. The real
+    // correlator re-checks this from scratch, so this is a pure fast path,
+    // not a new source of truth.
+    if (!deps.leaseStore.findBoundByRunAndCall(input.event.runId, input.event.callId)) {
+      return;
+    }
     await recordObservedModelAttempt(observerDeps, {
       phase: "ended",
       event: input.event,
       ctx: input.ctx,
+      configDigest: deps.configDigest(),
+      pluginRegistryDigest: deps.pluginRegistryDigest(),
+      candidateChainDigest: digestCandidateChain(deps.resolveCandidates()),
       now: input.now,
     });
     return;
@@ -579,11 +590,17 @@ export async function recordObservedModelAttemptInGateway(
   if (!sessionKey) {
     return;
   }
+  const sessionBindingDigest = `sha256:${sha256Hex(sessionKey)}`;
+  // Same fast path for the started phase: ordinary chat sessions (no pending
+  // lease for this session) only ever pay for this one indexed lookup.
+  if (!deps.leaseStore.findPendingBySessionBindingDigest(sessionBindingDigest)) {
+    return;
+  }
   await recordObservedModelAttempt(observerDeps, {
     phase: "started",
     event: input.event,
     ctx: input.ctx,
-    sessionBindingDigest: `sha256:${sha256Hex(sessionKey)}`,
+    sessionBindingDigest,
     configDigest: deps.configDigest(),
     pluginRegistryDigest: deps.pluginRegistryDigest(),
     candidateChainDigest: digestCandidateChain(deps.resolveCandidates()),
