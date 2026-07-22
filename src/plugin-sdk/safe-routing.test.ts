@@ -43,7 +43,7 @@ function buildContract(overrides: Partial<PersistedTaskContract> = {}): Persiste
 }
 
 function createTestDeps(): SafeRoutingServiceDeps {
-  let clock = 1_000;
+  const clock = 1_000;
   let idCounter = 0;
   return {
     now: () => clock,
@@ -108,10 +108,14 @@ describe("plugin-sdk safe-routing facade", () => {
         });
 
         expect(result.ok).toBe(true);
-        if (!result.ok) throw new Error("unreachable");
+        if (!result.ok) {
+          throw new Error("unreachable");
+        }
         const lease = deps.leaseStore.findById(result.leaseId);
         const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
-        if (!audit.ok) throw new Error("unreachable");
+        if (!audit.ok) {
+          throw new Error("unreachable");
+        }
         expect(audit.contract.deliveryMode).toBe("none");
         closeOpenClawStateDatabase();
       },
@@ -148,7 +152,9 @@ describe("plugin-sdk safe-routing facade", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
 
         const result = evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
@@ -173,7 +179,9 @@ describe("plugin-sdk safe-routing facade", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
 
         evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
@@ -224,7 +232,9 @@ describe("plugin-sdk safe-routing facade", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         const lease = deps.leaseStore.findById(created.leaseId);
 
         const forbidden = getShadowAudit({ taskId: lease!.taskId, callerScope: OTHER_SESSION });
@@ -248,7 +258,9 @@ describe("plugin-sdk safe-routing facade", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         const lease = deps.leaseStore.findById(created.leaseId);
 
         const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });

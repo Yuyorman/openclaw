@@ -11,7 +11,7 @@ import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../../state/openclaw-state-db.js";
-import { createTaskRecord } from "../task-registry.js";
+import { createTaskRecord } from "../runtime-internal.js";
 import { upsertTaskRegistryRecordToSqlite } from "../task-registry.store.sqlite.js";
 import type { TaskRecord } from "../task-registry.types.js";
 import type {
@@ -143,22 +143,22 @@ export function createManagedTaskWithCheckpoint(params: {
 
   const record = createTaskRecord({
     ...params.task,
-    persistOverride: (record) => {
+    persistOverride: (pendingRecord) => {
       try {
         return runOpenClawStateWriteTransaction(() => {
           const { db } = openOpenClawStateDatabase();
-          upsertTaskRegistryRecordToSqlite(record);
+          upsertTaskRegistryRecordToSqlite(pendingRecord);
           const now = Date.now();
-          insertTaskContractRow(db, record.taskId, params.contract, now);
+          insertTaskContractRow(db, pendingRecord.taskId, params.contract, now);
           const checkpointId = randomUUID();
-          insertTaskCheckpointRow(db, record.taskId, checkpointId, params.checkpoint, now);
-          params.afterCheckpoint?.({ taskId: record.taskId, checkpointId });
+          insertTaskCheckpointRow(db, pendingRecord.taskId, checkpointId, params.checkpoint, now);
+          params.afterCheckpoint?.({ taskId: pendingRecord.taskId, checkpointId });
           persistedCheckpointId = checkpointId;
           return true;
         });
       } catch (error) {
         log.warn("Failed to persist managed task with checkpoint", {
-          taskId: record.taskId,
+          taskId: pendingRecord.taskId,
           error,
         });
         return false;
@@ -342,32 +342,51 @@ export function listRouteAttempts(taskId: string, checkpointId: string): RouteAt
       .where("checkpoint_id", "=", checkpointId)
       .orderBy("ordinal", "asc"),
   ).rows;
-  return rows.map((row) => ({
-    attemptId: row.attempt_id,
-    taskId: row.task_id,
-    checkpointId: row.checkpoint_id,
-    ordinal: row.ordinal,
-    provider: row.provider,
-    model: row.model,
-    ...(row.runtime_id !== null ? { runtimeId: row.runtime_id } : {}),
-    ...(row.run_id !== null ? { runId: row.run_id } : {}),
-    ...(row.call_id !== null ? { callId: row.call_id } : {}),
-    capabilitySnapshotId: row.capability_snapshot_id,
-    evaluationMode: row.evaluation_mode,
-    eligibility: row.eligibility,
-    ...(row.rejection_code !== null ? { rejectionCode: row.rejection_code } : {}),
-    ...(row.rejection_reason !== null ? { rejectionReason: row.rejection_reason } : {}),
-    wouldSelect: row.would_select === 1,
-    ...(row.auth_profile_ref !== null ? { authProfileRef: row.auth_profile_ref } : {}),
-    ...(row.endpoint_id !== null ? { endpointId: row.endpoint_id } : {}),
-    ...(row.failure_domain_json !== null
-      ? { failureDomain: parseJsonRecord(row.failure_domain_json) }
-      : {}),
-    observationCompleteness: row.observation_completeness,
-    observationCoverage: row.observation_coverage,
-    ...(row.observer_error_code !== null ? { observerErrorCode: row.observer_error_code } : {}),
-    createdAt: row.created_at,
-  }));
+  return rows.map((row) => {
+    const attempt: RouteAttemptRow = {
+      attemptId: row.attempt_id,
+      taskId: row.task_id,
+      checkpointId: row.checkpoint_id,
+      ordinal: row.ordinal,
+      provider: row.provider,
+      model: row.model,
+      capabilitySnapshotId: row.capability_snapshot_id,
+      evaluationMode: row.evaluation_mode,
+      eligibility: row.eligibility,
+      wouldSelect: row.would_select === 1,
+      observationCompleteness: row.observation_completeness,
+      observationCoverage: row.observation_coverage,
+      createdAt: row.created_at,
+    };
+    if (row.runtime_id !== null) {
+      attempt.runtimeId = row.runtime_id;
+    }
+    if (row.run_id !== null) {
+      attempt.runId = row.run_id;
+    }
+    if (row.call_id !== null) {
+      attempt.callId = row.call_id;
+    }
+    if (row.rejection_code !== null) {
+      attempt.rejectionCode = row.rejection_code;
+    }
+    if (row.rejection_reason !== null) {
+      attempt.rejectionReason = row.rejection_reason;
+    }
+    if (row.auth_profile_ref !== null) {
+      attempt.authProfileRef = row.auth_profile_ref;
+    }
+    if (row.endpoint_id !== null) {
+      attempt.endpointId = row.endpoint_id;
+    }
+    if (row.failure_domain_json !== null) {
+      attempt.failureDomain = parseJsonRecord(row.failure_domain_json);
+    }
+    if (row.observer_error_code !== null) {
+      attempt.observerErrorCode = row.observer_error_code;
+    }
+    return attempt;
+  });
 }
 
 function rowToTaskCheckpoint(row: {

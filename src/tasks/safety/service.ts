@@ -198,7 +198,7 @@ function authorizesSessionOwnershipOrScope(
 }
 
 function summarizeVerificationStatus(snapshot: ModelCapabilitySnapshot): string {
-  const verifications = [
+  const verifications = new Set([
     snapshot.contextWindowTokens.verification,
     snapshot.outputTokens.verification,
     snapshot.modalities.verification,
@@ -207,11 +207,11 @@ function summarizeVerificationStatus(snapshot: ModelCapabilitySnapshot): string 
     snapshot.runtimeIds.verification,
     snapshot.api.verification,
     snapshot.authorizedDecisionGrade.verification,
-  ];
-  if (verifications.includes("contradicted")) {
+  ]);
+  if (verifications.has("contradicted")) {
     return "contradicted";
   }
-  if (verifications.includes("unverified")) {
+  if (verifications.has("unverified")) {
     return "unverified";
   }
   return "verified";

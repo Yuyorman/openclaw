@@ -103,7 +103,7 @@ function createDeps(
   cfg: OpenClawConfig,
   overrides: Partial<SafeRoutingServiceDeps> = {},
 ): SafeRoutingServiceDeps {
-  let clock = 1_000;
+  const clock = 1_000;
   let idCounter = 0;
   return {
     now: () => clock,
@@ -167,7 +167,9 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
           leaseToken: created.leaseToken,
@@ -199,12 +201,16 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
         sessionRef: "session-owner",
         callerScope: OWNER,
       });
-      if (!created.ok) throw new Error("unreachable");
+      if (!created.ok) {
+        throw new Error("unreachable");
+      }
       const evaluation = evaluateShadowRouteInGateway(deps, {
         leaseId: created.leaseId,
         leaseToken: created.leaseToken,
       });
-      if (!evaluation.ok) throw new Error("unreachable");
+      if (!evaluation.ok) {
+        throw new Error("unreachable");
+      }
 
       // Real routing (independent of anything shadow-related) still starts with A.
       const realChain = resolveModelCandidateChain({
@@ -221,7 +227,9 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
       });
 
       const audit = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
-      if (!audit.ok) throw new Error("unreachable");
+      if (!audit.ok) {
+        throw new Error("unreachable");
+      }
       expect(audit.attempts.find((a) => a.provider === "openai")).toMatchObject({
         eligibility: "rejected",
         wouldSelect: false,
@@ -256,14 +264,18 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
           leaseToken: created.leaseToken,
         });
 
         const audit = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
-        if (!audit.ok) throw new Error("unreachable");
+        if (!audit.ok) {
+          throw new Error("unreachable");
+        }
         expect(audit.attempts.every((a) => !a.wouldSelect)).toBe(true);
         expect(audit.suggestion).toBe("CAPABLE_MODEL");
 
@@ -286,14 +298,18 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
           leaseToken: created.leaseToken,
         });
 
         const audit = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
-        if (!audit.ok) throw new Error("unreachable");
+        if (!audit.ok) {
+          throw new Error("unreachable");
+        }
         expect(audit.attempts.find((a) => a.provider === "anthropic")).toMatchObject({
           eligibility: "rejected",
           rejectionCode: "DATA_POLICY",
@@ -315,7 +331,9 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
 
         // Simulate a second, independent process (e.g. a stale offline CLI snapshot)
         // whose live config digest no longer matches what the lease was bound to.
@@ -326,11 +344,15 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
           leaseId: created.leaseId,
           leaseToken: created.leaseToken,
         });
-        if (!evaluation.ok) throw new Error("unreachable");
+        if (!evaluation.ok) {
+          throw new Error("unreachable");
+        }
         expect(evaluation.digestsConsistent).toBe(false);
 
         const audit = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
-        if (!audit.ok) throw new Error("unreachable");
+        if (!audit.ok) {
+          throw new Error("unreachable");
+        }
         expect(audit.attempts.every((a) => a.observationCompleteness === "partial")).toBe(true);
 
         closeOpenClawStateDatabase();
@@ -356,14 +378,18 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
           leaseToken: created.leaseToken,
         });
 
         const audit = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
-        if (!audit.ok) throw new Error("unreachable");
+        if (!audit.ok) {
+          throw new Error("unreachable");
+        }
         expect(audit.attempts).toHaveLength(2);
 
         closeOpenClawStateDatabase();
@@ -382,7 +408,9 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
           leaseToken: created.leaseToken,
@@ -390,7 +418,9 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
 
         const first = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
         const second = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
-        if (!first.ok || !second.ok) throw new Error("unreachable");
+        if (!first.ok || !second.ok) {
+          throw new Error("unreachable");
+        }
 
         expect(second.attempts).toEqual(first.attempts);
 
@@ -430,14 +460,18 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
           sessionRef: "session-owner",
           callerScope: OWNER,
         });
-        if (!created.ok) throw new Error("unreachable");
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
         evaluateShadowRouteInGateway(deps, {
           leaseId: created.leaseId,
           leaseToken: created.leaseToken,
         });
 
         const before = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
-        if (!before.ok) throw new Error("unreachable");
+        if (!before.ok) {
+          throw new Error("unreachable");
+        }
         expect(
           before.attempts.find((a) => a.provider === "anthropic")?.observationCompleteness,
         ).toBe("unavailable");
@@ -470,7 +504,9 @@ describe("Phase 1 shadow routing — end-to-end acceptance", () => {
         });
 
         const after = getShadowAudit({ taskId: created.taskId, callerScope: OWNER });
-        if (!after.ok) throw new Error("unreachable");
+        if (!after.ok) {
+          throw new Error("unreachable");
+        }
         expect(after.attempts.find((a) => a.provider === "anthropic")).toMatchObject({
           runId: "run-1",
           callId: "call-1",

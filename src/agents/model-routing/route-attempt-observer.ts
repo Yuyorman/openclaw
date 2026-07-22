@@ -20,11 +20,11 @@ const log = createSubsystemLogger("agents.model-routing.route-attempt-observer")
 
 export type RouteAttemptObserverDeps = {
   leaseStore: ObservationLeaseStore;
-  listRouteAttempts(
+  listRouteAttempts: (
     taskId: string,
     checkpointId: string,
-  ): ReadonlyArray<{ attemptId: string; provider: string; model: string }>;
-  updateRouteAttemptObservation(
+  ) => ReadonlyArray<{ attemptId: string; provider: string; model: string }>;
+  updateRouteAttemptObservation: (
     attemptId: string,
     patch: {
       runId?: string;
@@ -32,7 +32,7 @@ export type RouteAttemptObserverDeps = {
       observationCompleteness: string;
       observationCoverage: string;
     },
-  ): boolean;
+  ) => boolean;
 };
 
 /**

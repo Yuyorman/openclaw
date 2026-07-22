@@ -141,20 +141,17 @@ export function normalizeTaskContract(input: PersistedTaskContract): NormalizedT
   if (!DATA_POLICIES.has(input.requiredCapabilities.dataPolicy)) {
     throw new TaskContractError(
       "invalid_data_policy",
-      `Unknown dataPolicy: ${String(input.requiredCapabilities.dataPolicy)}`,
+      `Unknown dataPolicy: ${input.requiredCapabilities.dataPolicy}`,
     );
   }
   if (!DECISION_GRADES.has(input.minimumDecisionGrade)) {
     throw new TaskContractError(
       "invalid_minimum_decision_grade",
-      `Unknown minimumDecisionGrade: ${String(input.minimumDecisionGrade)}`,
+      `Unknown minimumDecisionGrade: ${input.minimumDecisionGrade}`,
     );
   }
   if (!RISK_CLASSES.has(input.riskClass)) {
-    throw new TaskContractError(
-      "invalid_risk_class",
-      `Unknown riskClass: ${String(input.riskClass)}`,
-    );
+    throw new TaskContractError("invalid_risk_class", `Unknown riskClass: ${input.riskClass}`);
   }
   if (input.allowedToolPolicyId === "") {
     throw new TaskContractError(
@@ -165,7 +162,7 @@ export function normalizeTaskContract(input: PersistedTaskContract): NormalizedT
   if (!DELIVERY_MODES.has(input.deliveryMode)) {
     throw new TaskContractError(
       "invalid_delivery_mode",
-      `Unknown deliveryMode: ${String(input.deliveryMode)}`,
+      `Unknown deliveryMode: ${input.deliveryMode}`,
     );
   }
   if (input.routingPolicyVersion === "") {

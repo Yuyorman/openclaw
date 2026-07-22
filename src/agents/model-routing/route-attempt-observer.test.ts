@@ -10,7 +10,6 @@ import {
   type CreateObservationLeaseInput,
   type ObservationLeaseStore,
 } from "../../tasks/safety/observation-lease.js";
-import { correlateModelCallEvent } from "./observed-attempt.js";
 import {
   recordObservedModelAttempt,
   type RouteAttemptObserverDeps,
