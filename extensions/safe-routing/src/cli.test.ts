@@ -41,6 +41,7 @@ describe("registerSafeRoutingCli — safe-routing shadow", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+    process.exitCode = undefined;
   });
 
   function writeContract(overrides: Record<string, unknown> = {}): string {
@@ -151,6 +152,7 @@ describe("registerSafeRoutingCli — safe-routing shadow", () => {
       model: "claude-sonnet-5",
     });
     expect(printed.currentSelection).toMatchObject({ provider: "anthropic", runId: "run-1" });
+    expect(process.exitCode).toBeUndefined();
   });
 
   it("never prints the leaseToken in its output", async () => {
@@ -206,6 +208,39 @@ describe("registerSafeRoutingCli — safe-routing shadow", () => {
 
     expect(gatewayRuntime.callGatewayFromCli).toHaveBeenCalledTimes(1);
     expect(JSON.parse(stdout.output())).toEqual({ ok: false, code: "forbidden" });
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("stops and prints the error envelope without calling audit when evaluate is rejected", async () => {
+    const contractPath = writeContract();
+    gatewayRuntime.callGatewayFromCli
+      .mockResolvedValueOnce({
+        ok: true,
+        taskId: "task-1",
+        leaseId: "lease-1",
+        leaseToken: "secret-token",
+      })
+      .mockResolvedValueOnce({ ok: false, code: "expired" });
+    const program = createProgram();
+    const stdout = captureStdout();
+
+    await program.parseAsync(
+      [
+        "safe-routing",
+        "shadow",
+        "--contract",
+        contractPath,
+        "--session-ref",
+        "session-1",
+        "--json",
+      ],
+      { from: "user" },
+    );
+    stdout.restore();
+
+    expect(gatewayRuntime.callGatewayFromCli).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(stdout.output())).toEqual({ ok: false, code: "expired" });
+    expect(process.exitCode).toBe(1);
   });
 
   it("prints readable text output when --json is omitted", async () => {

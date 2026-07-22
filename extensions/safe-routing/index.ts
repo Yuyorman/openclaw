@@ -17,6 +17,7 @@ import {
   type SafeRoutingConfigValidationErrorCode,
   type SafeRoutingExtensionConfig,
 } from "./src/config.js";
+import { consumeShadowEvaluateBudget } from "./src/rate-limit.js";
 
 type GatewayMethodHandlerParams = Parameters<
   Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1]
@@ -93,10 +94,19 @@ export default definePluginEntry({
       );
     });
 
-    api.registerGatewayMethod("safe-routing.evaluate", async ({ params, respond }) => {
+    api.registerGatewayMethod("safe-routing.evaluate", async ({ params, client, respond }) => {
       const config = readExtensionConfig(api);
       if (config.mode !== "shadow") {
         respondDisabled(respond);
+        return;
+      }
+      const callerScope = deriveCallerScope(client);
+      const budget = consumeShadowEvaluateBudget(callerScope.sessionKey || "cli");
+      if (!budget.allowed) {
+        respond(false, undefined, {
+          code: "rate_limited",
+          message: `safe-routing.evaluate rate limit exceeded; retry after ${Math.ceil(budget.retryAfterMs / 1000)}s`,
+        });
         return;
       }
       const record = asRecord(params);

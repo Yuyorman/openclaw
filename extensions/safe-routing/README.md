@@ -53,6 +53,11 @@ openclaw safe-routing shadow --contract ./contract.json --session-ref my-session
   (in the same write transaction), so a real hook event can never bind to a
   stale, already-replaced lease. Evaluating a superseded lease's token returns
   `{ ok: false, code: "superseded" }`.
+- `safe-routing.evaluate` is rate-limited per caller (10 calls per 60s,
+  `src/rate-limit.ts`) — a small extension-local sliding window, not Core's
+  `control-plane-rate-limit.ts`, so this stays self-contained instead of
+  growing the plugin-sdk export surface. Exceeding it returns
+  `{ ok: false, code: "rate_limited" }`.
 
 ## Real-call observation
 

@@ -135,6 +135,65 @@ describe("normalizeTaskContract", () => {
     );
   });
 
+  it("rejects a non-object contract", () => {
+    expect(() => normalizeTaskContract(null as never)).toThrow(
+      expect.objectContaining({ code: "invalid_shape" }),
+    );
+    expect(() => normalizeTaskContract("not a contract" as never)).toThrow(
+      expect.objectContaining({ code: "invalid_shape" }),
+    );
+  });
+
+  it("rejects a non-string taskId", () => {
+    const contract = buildContract({ taskId: 123 as never });
+
+    expect(() => normalizeTaskContract(contract)).toThrow(
+      expect.objectContaining({ code: "invalid_task_id" }),
+    );
+  });
+
+  it("rejects a missing requiredCapabilities", () => {
+    const contract = { ...buildContract(), requiredCapabilities: undefined as never };
+
+    expect(() => normalizeTaskContract(contract)).toThrow(
+      expect.objectContaining({ code: "invalid_shape" }),
+    );
+  });
+
+  it("rejects a non-array modalities", () => {
+    const contract = buildContract({
+      requiredCapabilities: {
+        ...buildContract().requiredCapabilities,
+        modalities: "text" as never,
+      },
+    });
+
+    expect(() => normalizeTaskContract(contract)).toThrow(
+      expect.objectContaining({ code: "invalid_shape" }),
+    );
+  });
+
+  it("rejects a non-boolean toolCalling", () => {
+    const contract = buildContract({
+      requiredCapabilities: {
+        ...buildContract().requiredCapabilities,
+        toolCalling: "false" as never,
+      },
+    });
+
+    expect(() => normalizeTaskContract(contract)).toThrow(
+      expect.objectContaining({ code: "invalid_shape" }),
+    );
+  });
+
+  it("rejects a non-boolean reviewRequired", () => {
+    const contract = buildContract({ reviewRequired: "yes" as never });
+
+    expect(() => normalizeTaskContract(contract)).toThrow(
+      expect.objectContaining({ code: "invalid_shape" }),
+    );
+  });
+
   it.each([
     ["minContextWindowTokens", 0],
     ["minContextWindowTokens", -1],

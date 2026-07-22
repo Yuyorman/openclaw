@@ -16,6 +16,7 @@ import {
   type RouteAttemptObserverDeps,
 } from "../../agents/model-routing/route-attempt-observer.js";
 import {
+  candidateKey,
   evaluateShadowRoute,
   type ShadowRouteCandidate,
 } from "../../agents/model-routing/shadow-evaluator.js";
@@ -61,6 +62,7 @@ import {
   updateRouteAttemptObservation,
 } from "./store.sqlite.js";
 import type {
+  AppendRouteAttemptInput,
   PutCapabilitySnapshotInput,
   RouteAttemptRow,
   TaskCheckpointRow,
@@ -363,7 +365,13 @@ export type EvaluateShadowRouteInGatewayResult =
     }
   | {
       ok: false;
-      code: "not_found" | "invalid_token" | "expired" | "already_consumed" | "superseded";
+      code:
+        | "not_found"
+        | "invalid_token"
+        | "expired"
+        | "already_consumed"
+        | "superseded"
+        | "internal_error";
     };
 
 /**
@@ -414,7 +422,7 @@ export function evaluateShadowRouteInGateway(
 
   const seen = new Set<string>();
   const dedupedCandidates = candidates.filter((candidate) => {
-    const key = `${candidate.provider} ${candidate.model}`;
+    const key = candidateKey(candidate.provider, candidate.model);
     if (seen.has(key)) {
       return false;
     }
@@ -435,17 +443,23 @@ export function evaluateShadowRouteInGateway(
   });
 
   const snapshotIdByKey = new Map(
-    snapshots.map((s) => [`${s.built.provider} ${s.built.model}`, s.snapshotId]),
+    snapshots.map((s) => [candidateKey(s.built.provider, s.built.model), s.snapshotId]),
   );
-  appendRouteAttempts(
-    lease.taskId,
-    checkpoint.checkpointId,
-    evaluation.attempts.map((attempt) => ({
+  const routeAttempts: AppendRouteAttemptInput[] = [];
+  for (const attempt of evaluation.attempts) {
+    const capabilitySnapshotId = snapshotIdByKey.get(candidateKey(attempt.provider, attempt.model));
+    if (capabilitySnapshotId === undefined) {
+      // Every attempt above is evaluated against a snapshot built for that
+      // exact (provider, model) a few lines up, so a miss here means the
+      // evaluator and the snapshot map have desynced — a real bug, not a
+      // case to paper over with a fake id in the persisted audit trail.
+      return { ok: false, code: "internal_error" };
+    }
+    routeAttempts.push({
       ordinal: attempt.ordinal,
       provider: attempt.provider,
       model: attempt.model,
-      capabilitySnapshotId:
-        snapshotIdByKey.get(`${attempt.provider} ${attempt.model}`) ?? "unknown",
+      capabilitySnapshotId,
       evaluationMode: "shadow",
       eligibility: attempt.decision.outcome === "eligible" ? "eligible" : "rejected",
       ...(attempt.decision.outcome === "ineligible"
@@ -454,8 +468,9 @@ export function evaluateShadowRouteInGateway(
       wouldSelect: attempt.decision.outcome === "eligible",
       observationCompleteness: digestsConsistent ? "unavailable" : "partial",
       observationCoverage: "out-of-scope",
-    })),
-  );
+    });
+  }
+  appendRouteAttempts(lease.taskId, checkpoint.checkpointId, routeAttempts);
 
   return {
     ok: true,

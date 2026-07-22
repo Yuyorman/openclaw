@@ -265,6 +265,53 @@ describe("safety service", () => {
     );
   });
 
+  it("fails with internal_error instead of persisting a fake snapshot id when the snapshot map desyncs from the evaluated candidates", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-desync-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps({
+          resolveCandidates: () => [REAL_CANDIDATE],
+          // Deliberately returns a snapshot for a DIFFERENT (provider, model)
+          // than the candidate it was asked to build for, simulating the
+          // evaluator/snapshot-map desync this guard exists to catch.
+          buildSnapshotForCandidate: () =>
+            buildCapabilitySnapshot({
+              provider: "mismatched-provider",
+              model: "mismatched-model",
+              configured: {
+                contextWindowTokens: 200000,
+                outputTokens: 8192,
+                modalities: ["text"],
+                api: "mismatched-provider-api",
+              },
+              decisionGradeAuthorization: {
+                maxAuthorizedDecisionGrade: "final",
+                reason: "test policy",
+              },
+            }),
+        });
+        const created = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!created.ok) {
+          throw new Error("unreachable");
+        }
+
+        const result = evaluateShadowRouteInGateway(deps, {
+          leaseId: created.leaseId,
+          leaseToken: created.leaseToken,
+        });
+
+        expect(result).toEqual({ ok: false, code: "internal_error" });
+
+        closeOpenClawStateDatabase();
+      },
+    );
+  });
+
   it("marks every persisted attempt partial when the live digests have drifted from the lease's bound digests", async () => {
     await withOpenClawTestState(
       { layout: "state-only", prefix: "openclaw-safety-service-drift-" },

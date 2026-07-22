@@ -51,6 +51,7 @@ export type NormalizedTaskContract = {
 
 export type TaskContractErrorCode =
   | "unsupported_schema_version"
+  | "invalid_shape"
   | "invalid_task_id"
   | "invalid_modality"
   | "invalid_min_context_window_tokens"
@@ -107,14 +108,53 @@ function normalizeStringList(values: readonly string[] | undefined): string[] {
 
 /** Validates and canonicalizes a task contract so equivalent inputs digest identically. */
 export function normalizeTaskContract(input: PersistedTaskContract): NormalizedTaskContract {
+  if (typeof input !== "object" || input === null) {
+    throw new TaskContractError("invalid_shape", "Task contract must be a JSON object");
+  }
   if ((input.schemaVersion as number) !== 1) {
     throw new TaskContractError(
       "unsupported_schema_version",
       `Unsupported task contract schemaVersion: ${String(input.schemaVersion)}`,
     );
   }
-  if (input.taskId === "") {
-    throw new TaskContractError("invalid_task_id", "taskId must not be empty");
+  if (typeof input.taskId !== "string" || input.taskId === "") {
+    throw new TaskContractError("invalid_task_id", "taskId must be a non-empty string");
+  }
+  if (typeof input.requiredCapabilities !== "object" || input.requiredCapabilities === null) {
+    throw new TaskContractError("invalid_shape", "requiredCapabilities must be a JSON object");
+  }
+  if (
+    input.requiredCapabilities.modalities !== undefined &&
+    !Array.isArray(input.requiredCapabilities.modalities)
+  ) {
+    throw new TaskContractError(
+      "invalid_shape",
+      "requiredCapabilities.modalities must be an array",
+    );
+  }
+  if (
+    input.requiredCapabilities.runtimeIds !== undefined &&
+    !Array.isArray(input.requiredCapabilities.runtimeIds)
+  ) {
+    throw new TaskContractError(
+      "invalid_shape",
+      "requiredCapabilities.runtimeIds must be an array",
+    );
+  }
+  if (typeof input.requiredCapabilities.toolCalling !== "boolean") {
+    throw new TaskContractError(
+      "invalid_shape",
+      "requiredCapabilities.toolCalling must be a boolean",
+    );
+  }
+  if (typeof input.requiredCapabilities.structuredOutput !== "boolean") {
+    throw new TaskContractError(
+      "invalid_shape",
+      "requiredCapabilities.structuredOutput must be a boolean",
+    );
+  }
+  if (typeof input.reviewRequired !== "boolean") {
+    throw new TaskContractError("invalid_shape", "reviewRequired must be a boolean");
   }
 
   const modalities = normalizeStringList(
@@ -153,10 +193,10 @@ export function normalizeTaskContract(input: PersistedTaskContract): NormalizedT
   if (!RISK_CLASSES.has(input.riskClass)) {
     throw new TaskContractError("invalid_risk_class", `Unknown riskClass: ${input.riskClass}`);
   }
-  if (input.allowedToolPolicyId === "") {
+  if (typeof input.allowedToolPolicyId !== "string" || input.allowedToolPolicyId === "") {
     throw new TaskContractError(
       "invalid_allowed_tool_policy_id",
-      "allowedToolPolicyId must not be empty",
+      "allowedToolPolicyId must be a non-empty string",
     );
   }
   if (!DELIVERY_MODES.has(input.deliveryMode)) {
@@ -165,10 +205,10 @@ export function normalizeTaskContract(input: PersistedTaskContract): NormalizedT
       `Unknown deliveryMode: ${input.deliveryMode}`,
     );
   }
-  if (input.routingPolicyVersion === "") {
+  if (typeof input.routingPolicyVersion !== "string" || input.routingPolicyVersion === "") {
     throw new TaskContractError(
       "invalid_routing_policy_version",
-      "routingPolicyVersion must not be empty",
+      "routingPolicyVersion must be a non-empty string",
     );
   }
 

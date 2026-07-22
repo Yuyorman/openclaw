@@ -123,7 +123,11 @@ function insertTaskCheckpointRow(
  * completely unaffected since none of them pass this option.
  */
 export function createManagedTaskWithCheckpoint(params: {
-  task: Omit<Parameters<typeof createTaskRecord>[0], "persistOverride">;
+  // requesterOrigin is excluded: it drives createTaskRecord's deliveryState,
+  // but the persistOverride below only persists task/contract/checkpoint rows
+  // and has no delivery-state column to put it in, so a caller-supplied
+  // requesterOrigin would be silently dropped instead of persisted.
+  task: Omit<Parameters<typeof createTaskRecord>[0], "persistOverride" | "requesterOrigin">;
   contract: CreateTaskContractInput;
   checkpoint: CreateTaskCheckpointInput;
   /**

@@ -101,6 +101,7 @@ export function registerSafeRoutingCli(params: { program: Command }): void {
     });
     if (!isRecord(created) || created.ok !== true) {
       writeJson(created);
+      process.exitCode = 1;
       return;
     }
 
@@ -108,6 +109,11 @@ export function registerSafeRoutingCli(params: { program: Command }): void {
       leaseId: created.leaseId,
       leaseToken: created.leaseToken,
     });
+    if (!isRecord(evaluation) || evaluation.ok !== true) {
+      writeJson(evaluation);
+      process.exitCode = 1;
+      return;
+    }
 
     const audit = await callSafeRoutingGateway("safe-routing.audit", options, {
       taskId: created.taskId,
@@ -116,8 +122,8 @@ export function registerSafeRoutingCli(params: { program: Command }): void {
     const auditRecord = isRecord(audit) && audit.ok === true ? audit : undefined;
     const result = {
       taskId: created.taskId,
-      routingPolicyVersion: isRecord(evaluation) ? evaluation.routingPolicyVersion : undefined,
-      digestsConsistent: isRecord(evaluation) ? evaluation.digestsConsistent : undefined,
+      routingPolicyVersion: evaluation.routingPolicyVersion,
+      digestsConsistent: evaluation.digestsConsistent,
       // Each attempt's rejectionCode/rejectionReason (e.g. CAPABILITY_UNVERIFIED) carries the
       // per-candidate verification signal; see docs/superpowers/... for the full evidence trail.
       ...summarizeAttempts(auditRecord?.attempts),
