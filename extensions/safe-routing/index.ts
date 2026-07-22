@@ -17,7 +17,9 @@ type GatewayMethodHandlerParams = Parameters<
   Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1]
 >[0];
 
-function deriveCallerScope(client: GatewayMethodHandlerParams["client"]): SafeRoutingCallerScope | undefined {
+function deriveCallerScope(
+  client: GatewayMethodHandlerParams["client"],
+): SafeRoutingCallerScope | undefined {
   const sessionKey = client?.internal?.agentRuntimeIdentity?.sessionKey?.trim();
   if (!sessionKey) {
     return undefined;
@@ -71,7 +73,11 @@ export default definePluginEntry({
         sessionRef: String(typed.sessionRef ?? ""),
         callerScope,
       });
-      respond(result.ok, result.ok ? result : undefined, result.ok ? undefined : { code: result.code, message: result.code });
+      respond(
+        result.ok,
+        result.ok ? result : undefined,
+        result.ok ? undefined : { code: result.code, message: result.code },
+      );
     });
 
     api.registerGatewayMethod("safe-routing.evaluate", async ({ params, respond }) => {
@@ -88,7 +94,11 @@ export default definePluginEntry({
         leaseId: String(typed.leaseId ?? ""),
         leaseToken: String(typed.leaseToken ?? ""),
       });
-      respond(result.ok, result.ok ? result : undefined, result.ok ? undefined : { code: result.code, message: result.code });
+      respond(
+        result.ok,
+        result.ok ? result : undefined,
+        result.ok ? undefined : { code: result.code, message: result.code },
+      );
     });
 
     api.registerGatewayMethod("safe-routing.audit", async ({ params, client, respond }) => {
@@ -104,7 +114,11 @@ export default definePluginEntry({
       }
       const typed = params as { taskId?: unknown };
       const result = getShadowAudit({ taskId: String(typed.taskId ?? ""), callerScope });
-      respond(result.ok, result.ok ? result : undefined, result.ok ? undefined : { code: result.code, message: result.code });
+      respond(
+        result.ok,
+        result.ok ? result : undefined,
+        result.ok ? undefined : { code: result.code, message: result.code },
+      );
     });
 
     // Real-call observation: silently no-ops for any session without an active
@@ -118,7 +132,12 @@ export default definePluginEntry({
       const deps = createLiveSafeRoutingServiceDeps({
         admissionPolicy: { approvedProviders: config.approvedProviders },
       });
-      await recordObservedModelAttemptInGateway(deps, { phase: "started", event, ctx, now: Date.now() });
+      await recordObservedModelAttemptInGateway(deps, {
+        phase: "started",
+        event,
+        ctx,
+        now: Date.now(),
+      });
     });
 
     api.on("model_call_ended", async (event, ctx) => {
@@ -129,7 +148,12 @@ export default definePluginEntry({
       const deps = createLiveSafeRoutingServiceDeps({
         admissionPolicy: { approvedProviders: config.approvedProviders },
       });
-      await recordObservedModelAttemptInGateway(deps, { phase: "ended", event, ctx, now: Date.now() });
+      await recordObservedModelAttemptInGateway(deps, {
+        phase: "ended",
+        event,
+        ctx,
+        now: Date.now(),
+      });
     });
 
     api.registerCli(

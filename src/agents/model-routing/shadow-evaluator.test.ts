@@ -28,7 +28,12 @@ function snapshotFor(provider: string, model: string, contextWindowTokens: numbe
   return buildCapabilitySnapshot({
     provider,
     model,
-    configured: { contextWindowTokens, outputTokens: 8192, modalities: ["text"], api: `${provider}-api` },
+    configured: {
+      contextWindowTokens,
+      outputTokens: 8192,
+      modalities: ["text"],
+      api: `${provider}-api`,
+    },
     decisionGradeAuthorization: { maxAuthorizedDecisionGrade: "final", reason: "test policy" },
   });
 }
@@ -47,7 +52,12 @@ describe("evaluateShadowRoute", () => {
       snapshotFor("anthropic", "claude-sonnet-5", 200000),
     ];
 
-    const result = evaluateShadowRoute({ contract: CONTRACT, candidates, snapshots, policy: POLICY });
+    const result = evaluateShadowRoute({
+      contract: CONTRACT,
+      candidates,
+      snapshots,
+      policy: POLICY,
+    });
 
     expect(candidates).toEqual(frozenCandidates);
     expect(result.attempts.map((a) => `${a.provider}/${a.model}`)).toEqual([
@@ -62,7 +72,12 @@ describe("evaluateShadowRoute", () => {
   });
 
   it("echoes the contract's routingPolicyVersion", () => {
-    const result = evaluateShadowRoute({ contract: CONTRACT, candidates: [], snapshots: [], policy: POLICY });
+    const result = evaluateShadowRoute({
+      contract: CONTRACT,
+      candidates: [],
+      snapshots: [],
+      policy: POLICY,
+    });
 
     expect(result.routingPolicyVersion).toBe("v1");
   });
@@ -73,19 +88,36 @@ describe("evaluateShadowRoute", () => {
       { provider: "anthropic", model: "claude-sonnet-5" },
       { provider: "openai", model: "gpt-5.4" },
     ];
-    const snapshots = [snapshotFor("anthropic", "claude-sonnet-5", 200000), snapshotFor("openai", "gpt-5.4", 200000)];
+    const snapshots = [
+      snapshotFor("anthropic", "claude-sonnet-5", 200000),
+      snapshotFor("openai", "gpt-5.4", 200000),
+    ];
 
-    const result = evaluateShadowRoute({ contract: CONTRACT, candidates, snapshots, policy: POLICY });
+    const result = evaluateShadowRoute({
+      contract: CONTRACT,
+      candidates,
+      snapshots,
+      policy: POLICY,
+    });
 
     expect(result.attempts).toHaveLength(2);
-    expect(result.attempts[0]).toMatchObject({ ordinal: 0, provider: "anthropic", model: "claude-sonnet-5" });
+    expect(result.attempts[0]).toMatchObject({
+      ordinal: 0,
+      provider: "anthropic",
+      model: "claude-sonnet-5",
+    });
     expect(result.attempts[1]).toMatchObject({ ordinal: 1, provider: "openai", model: "gpt-5.4" });
   });
 
   it("reports CAPABILITY_UNVERIFIED for a candidate with no capability snapshot, rather than skipping or throwing", () => {
     const candidates = [{ provider: "openai", model: "gpt-5.4" }];
 
-    const result = evaluateShadowRoute({ contract: CONTRACT, candidates, snapshots: [], policy: POLICY });
+    const result = evaluateShadowRoute({
+      contract: CONTRACT,
+      candidates,
+      snapshots: [],
+      policy: POLICY,
+    });
 
     expect(result.attempts).toEqual([
       {
@@ -106,7 +138,12 @@ describe("evaluateShadowRoute", () => {
     const candidates = [{ provider: "openai", model: "gpt-5.4" }];
     const snapshots = [snapshotFor("openai", "gpt-5.4", 1000)];
 
-    const result = evaluateShadowRoute({ contract: CONTRACT, candidates, snapshots, policy: POLICY });
+    const result = evaluateShadowRoute({
+      contract: CONTRACT,
+      candidates,
+      snapshots,
+      policy: POLICY,
+    });
 
     expect(result.theoreticalChoice).toBeUndefined();
     expect(result.attempts[0].decision.outcome).toBe("ineligible");

@@ -76,7 +76,15 @@ describe("registerSafeRoutingCli — safe-routing shadow", () => {
 
     await expect(
       program.parseAsync(
-        ["safe-routing", "shadow", "--contract", contractPath, "--session-ref", "session-1", "--json"],
+        [
+          "safe-routing",
+          "shadow",
+          "--contract",
+          contractPath,
+          "--session-ref",
+          "session-1",
+          "--json",
+        ],
         { from: "user" },
       ),
     ).rejects.toThrow(/deliveryMode/);
@@ -86,26 +94,47 @@ describe("registerSafeRoutingCli — safe-routing shadow", () => {
   it("dispatches createLease, evaluate, and audit in order and prints the audit as JSON", async () => {
     const contractPath = writeContract();
     gatewayRuntime.callGatewayFromCli
-      .mockResolvedValueOnce({ ok: true, taskId: "task-1", leaseId: "lease-1", leaseToken: "secret-token" })
+      .mockResolvedValueOnce({
+        ok: true,
+        taskId: "task-1",
+        leaseId: "lease-1",
+        leaseToken: "secret-token",
+      })
       .mockResolvedValueOnce({ ok: true, routingPolicyVersion: "v1", digestsConsistent: true })
       .mockResolvedValueOnce({
         ok: true,
         attempts: [
           { provider: "openai", model: "gpt-5.4", wouldSelect: false, eligibility: "rejected" },
-          { provider: "anthropic", model: "claude-sonnet-5", wouldSelect: true, eligibility: "eligible", runId: "run-1" },
+          {
+            provider: "anthropic",
+            model: "claude-sonnet-5",
+            wouldSelect: true,
+            eligibility: "eligible",
+            runId: "run-1",
+          },
         ],
       });
     const program = createProgram();
     const stdout = captureStdout();
 
     await program.parseAsync(
-      ["safe-routing", "shadow", "--contract", contractPath, "--session-ref", "session-1", "--json"],
+      [
+        "safe-routing",
+        "shadow",
+        "--contract",
+        contractPath,
+        "--session-ref",
+        "session-1",
+        "--json",
+      ],
       { from: "user" },
     );
     stdout.restore();
 
     expect(gatewayRuntime.callGatewayFromCli.mock.calls[0][0]).toBe("safe-routing.createLease");
-    expect(gatewayRuntime.callGatewayFromCli.mock.calls[0][2]).toMatchObject({ sessionRef: "session-1" });
+    expect(gatewayRuntime.callGatewayFromCli.mock.calls[0][2]).toMatchObject({
+      sessionRef: "session-1",
+    });
     expect(gatewayRuntime.callGatewayFromCli.mock.calls[1][0]).toBe("safe-routing.evaluate");
     expect(gatewayRuntime.callGatewayFromCli.mock.calls[1][2]).toEqual({
       leaseId: "lease-1",
@@ -117,21 +146,37 @@ describe("registerSafeRoutingCli — safe-routing shadow", () => {
     const printed = JSON.parse(stdout.output());
     expect(printed.taskId).toBe("task-1");
     expect(printed.routingPolicyVersion).toBe("v1");
-    expect(printed.theoreticalSelection).toMatchObject({ provider: "anthropic", model: "claude-sonnet-5" });
+    expect(printed.theoreticalSelection).toMatchObject({
+      provider: "anthropic",
+      model: "claude-sonnet-5",
+    });
     expect(printed.currentSelection).toMatchObject({ provider: "anthropic", runId: "run-1" });
   });
 
   it("never prints the leaseToken in its output", async () => {
     const contractPath = writeContract();
     gatewayRuntime.callGatewayFromCli
-      .mockResolvedValueOnce({ ok: true, taskId: "task-1", leaseId: "lease-1", leaseToken: "super-secret-token" })
+      .mockResolvedValueOnce({
+        ok: true,
+        taskId: "task-1",
+        leaseId: "lease-1",
+        leaseToken: "super-secret-token",
+      })
       .mockResolvedValueOnce({ ok: true, routingPolicyVersion: "v1", digestsConsistent: true })
       .mockResolvedValueOnce({ ok: true, attempts: [] });
     const program = createProgram();
     const stdout = captureStdout();
 
     await program.parseAsync(
-      ["safe-routing", "shadow", "--contract", contractPath, "--session-ref", "session-1", "--json"],
+      [
+        "safe-routing",
+        "shadow",
+        "--contract",
+        contractPath,
+        "--session-ref",
+        "session-1",
+        "--json",
+      ],
       { from: "user" },
     );
     stdout.restore();
@@ -146,7 +191,15 @@ describe("registerSafeRoutingCli — safe-routing shadow", () => {
     const stdout = captureStdout();
 
     await program.parseAsync(
-      ["safe-routing", "shadow", "--contract", contractPath, "--session-ref", "session-1", "--json"],
+      [
+        "safe-routing",
+        "shadow",
+        "--contract",
+        contractPath,
+        "--session-ref",
+        "session-1",
+        "--json",
+      ],
       { from: "user" },
     );
     stdout.restore();
@@ -158,7 +211,12 @@ describe("registerSafeRoutingCli — safe-routing shadow", () => {
   it("prints readable text output when --json is omitted", async () => {
     const contractPath = writeContract();
     gatewayRuntime.callGatewayFromCli
-      .mockResolvedValueOnce({ ok: true, taskId: "task-1", leaseId: "lease-1", leaseToken: "secret-token" })
+      .mockResolvedValueOnce({
+        ok: true,
+        taskId: "task-1",
+        leaseId: "lease-1",
+        leaseToken: "secret-token",
+      })
       .mockResolvedValueOnce({ ok: true, routingPolicyVersion: "v1", digestsConsistent: true })
       .mockResolvedValueOnce({ ok: true, attempts: [] });
     const program = createProgram();

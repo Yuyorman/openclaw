@@ -6,7 +6,9 @@ import {
   type CreateObservationLeaseInput,
 } from "./observation-lease.js";
 
-function buildLeaseInput(overrides: Partial<CreateObservationLeaseInput> = {}): CreateObservationLeaseInput {
+function buildLeaseInput(
+  overrides: Partial<CreateObservationLeaseInput> = {},
+): CreateObservationLeaseInput {
   return {
     leaseId: "lease-1",
     taskId: "task-1",
@@ -52,14 +54,22 @@ describe("ObservationLeaseStore.insert — supersede on create", () => {
 
     expect(store.findById("lease-1")).toMatchObject({ state: "superseded" });
     expect(store.findById("lease-2")).toMatchObject({ state: "pending" });
-    expect(store.findPendingBySessionBindingDigest("sha256:session-digest")?.leaseId).toBe("lease-2");
+    expect(store.findPendingBySessionBindingDigest("sha256:session-digest")?.leaseId).toBe(
+      "lease-2",
+    );
   });
 
   it("does not supersede a pending lease belonging to a different session", () => {
     const store = createInMemoryObservationLeaseStore();
-    createObservationLease(store, buildLeaseInput({ leaseId: "lease-1", sessionBindingDigest: "sha256:session-a" }));
+    createObservationLease(
+      store,
+      buildLeaseInput({ leaseId: "lease-1", sessionBindingDigest: "sha256:session-a" }),
+    );
 
-    createObservationLease(store, buildLeaseInput({ leaseId: "lease-2", sessionBindingDigest: "sha256:session-b" }));
+    createObservationLease(
+      store,
+      buildLeaseInput({ leaseId: "lease-2", sessionBindingDigest: "sha256:session-b" }),
+    );
 
     expect(store.findById("lease-1")).toMatchObject({ state: "pending" });
   });
@@ -67,7 +77,11 @@ describe("ObservationLeaseStore.insert — supersede on create", () => {
   it("does not disturb an already-bound lease for the same session", () => {
     const store = createInMemoryObservationLeaseStore();
     createObservationLease(store, buildLeaseInput({ leaseId: "lease-1" }));
-    store.compareAndSwap("lease-1", 1, { state: "bound", boundRunId: "run-1", boundCallId: "call-1" });
+    store.compareAndSwap("lease-1", 1, {
+      state: "bound",
+      boundRunId: "run-1",
+      boundCallId: "call-1",
+    });
 
     createObservationLease(store, buildLeaseInput({ leaseId: "lease-2" }));
 
@@ -135,7 +149,11 @@ describe("ObservationLeaseStore.compareAndSwap", () => {
     const applied = store.compareAndSwap("lease-1", 1, { state: "bound", boundRunId: "run-1" });
 
     expect(applied).toBe(true);
-    expect(store.findById("lease-1")).toMatchObject({ state: "bound", boundRunId: "run-1", rowVersion: 2 });
+    expect(store.findById("lease-1")).toMatchObject({
+      state: "bound",
+      boundRunId: "run-1",
+      rowVersion: 2,
+    });
   });
 
   it("rejects a stale rowVersion without mutating the stored lease", () => {
@@ -143,7 +161,10 @@ describe("ObservationLeaseStore.compareAndSwap", () => {
     createObservationLease(store, buildLeaseInput());
     store.compareAndSwap("lease-1", 1, { state: "bound", boundRunId: "run-1" });
 
-    const staleApplied = store.compareAndSwap("lease-1", 1, { state: "bound", boundRunId: "run-2" });
+    const staleApplied = store.compareAndSwap("lease-1", 1, {
+      state: "bound",
+      boundRunId: "run-2",
+    });
 
     expect(staleApplied).toBe(false);
     expect(store.findById("lease-1")).toMatchObject({ boundRunId: "run-1", rowVersion: 2 });

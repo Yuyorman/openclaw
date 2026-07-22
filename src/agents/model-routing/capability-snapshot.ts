@@ -4,7 +4,10 @@
  * or provider calls here (see Task 3 for persistence, Task 5 for live wiring).
  */
 import { sha256Hex } from "../../infra/crypto-digest.js";
-import type { TaskContractDecisionGrade, TaskContractModality } from "../../tasks/safety/contracts.js";
+import type {
+  TaskContractDecisionGrade,
+  TaskContractModality,
+} from "../../tasks/safety/contracts.js";
 import { stableStringify } from "../stable-stringify.js";
 
 export type CapabilityVerification = "configured" | "observed" | "unverified" | "contradicted";
@@ -77,7 +80,10 @@ function resolveNumericCapability(params: {
 }): CapabilityValue<number> {
   const evidence: CapabilityEvidence[] = [];
   if (params.configured !== undefined) {
-    evidence.push({ source: "config", detail: `configured ${params.fieldName}=${params.configured}` });
+    evidence.push({
+      source: "config",
+      detail: `configured ${params.fieldName}=${params.configured}`,
+    });
   }
   if (params.runtimeLimit !== undefined) {
     evidence.push({
@@ -91,7 +97,10 @@ function resolveNumericCapability(params: {
   const staticMin = staticValues.length > 0 ? Math.min(...staticValues) : undefined;
 
   if (params.observed !== undefined) {
-    evidence.push({ source: "observed", detail: `observed ${params.fieldName}=${params.observed}` });
+    evidence.push({
+      source: "observed",
+      detail: `observed ${params.fieldName}=${params.observed}`,
+    });
     if (staticMin !== undefined && params.observed > staticMin) {
       // Observed evidence claims more capacity than declared/runtime-capped: keep the conservative ceiling.
       return { value: staticMin, verification: "contradicted", evidence };
@@ -111,10 +120,16 @@ function resolveBooleanCapability(params: {
 }): CapabilityValue<boolean> {
   const evidence: CapabilityEvidence[] = [];
   if (params.configured !== undefined) {
-    evidence.push({ source: "config", detail: `configured ${params.fieldName}=${params.configured}` });
+    evidence.push({
+      source: "config",
+      detail: `configured ${params.fieldName}=${params.configured}`,
+    });
   }
   if (params.observed !== undefined) {
-    evidence.push({ source: "observed", detail: `observed ${params.fieldName}=${params.observed}` });
+    evidence.push({
+      source: "observed",
+      detail: `observed ${params.fieldName}=${params.observed}`,
+    });
     if (params.configured !== undefined && params.configured !== params.observed) {
       // Conservative: never trust an unexpected boolean claim over a conflicting one.
       return { value: false, verification: "contradicted", evidence };
@@ -147,7 +162,8 @@ function resolveModalitiesCapability(params: {
       const configuredSet = new Set(params.configured);
       const observedSet = new Set(params.observed);
       const same =
-        configuredSet.size === observedSet.size && [...configuredSet].every((m) => observedSet.has(m));
+        configuredSet.size === observedSet.size &&
+        [...configuredSet].every((m) => observedSet.has(m));
       if (!same) {
         const intersection = [...configuredSet].filter((m) => observedSet.has(m)).toSorted();
         return { value: intersection, verification: "contradicted", evidence };
@@ -173,7 +189,9 @@ function resolveApiCapability(configuredApi?: string): CapabilityValue<string> {
 }
 
 /** Aggregates config declaration, runtime limits, and observed evidence into one immutable, content-addressed snapshot. */
-export function buildCapabilitySnapshot(input: BuildCapabilitySnapshotInput): ModelCapabilitySnapshot {
+export function buildCapabilitySnapshot(
+  input: BuildCapabilitySnapshotInput,
+): ModelCapabilitySnapshot {
   const contextWindowTokens = resolveNumericCapability({
     fieldName: "contextWindowTokens",
     configured: input.configured?.contextWindowTokens,
@@ -203,7 +221,9 @@ export function buildCapabilitySnapshot(input: BuildCapabilitySnapshotInput): Mo
   const api = resolveApiCapability(input.configured?.api);
   const runtimeIds: CapabilityValue<string[]> = {
     verification: "unverified",
-    evidence: [{ source: "policy", detail: "Phase 1 does not resolve a verified resolvedRuntimeId" }],
+    evidence: [
+      { source: "policy", detail: "Phase 1 does not resolve a verified resolvedRuntimeId" },
+    ],
   };
   const authorizedDecisionGrade: CapabilityValue<TaskContractDecisionGrade> = {
     value: input.decisionGradeAuthorization.maxAuthorizedDecisionGrade,

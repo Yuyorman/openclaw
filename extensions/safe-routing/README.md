@@ -1,7 +1,7 @@
 # safe-routing (Phase 1 shadow)
 
 Read-only shadow evaluation of theoretical model routing admission. Reports
-what *would* be selected under a task contract, without ever changing which
+what _would_ be selected under a task contract, without ever changing which
 model a real session actually calls.
 
 ## Status
@@ -115,7 +115,7 @@ OpenClaw builds that do not recognize these tables simply ignore them.
 
 - Never changes `agents.defaults.model.primary`/`fallbacks` in `openclaw.json`,
   and never mutates the real fallback candidate chain — it only calls the
-  unmodified `resolveModelCandidateChain` to *read* the current chain.
+  unmodified `resolveModelCandidateChain` to _read_ the current chain.
 - Never calls a model, a tool, `resolveAuthProfileOrder`, or anything that
   mutates provider cooldown/health state.
 - No `enforce` mode, no state-transition API, no way to block or redirect a

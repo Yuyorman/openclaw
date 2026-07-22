@@ -34,9 +34,7 @@ export type ObservationLeaseStore = {
   insert(lease: ObservationLease): void;
   findById(leaseId: string): ObservationLease | undefined;
   /** Only ever matches leases still awaiting their first bind. */
-  findPendingBySessionBindingDigest(
-    sessionBindingDigest: string,
-  ): ObservationLease | undefined;
+  findPendingBySessionBindingDigest(sessionBindingDigest: string): ObservationLease | undefined;
   findBoundByRunAndCall(runId: string, callId: string): ObservationLease | undefined;
   /** Applies `patch` and bumps rowVersion iff the stored rowVersion still equals `expectedRowVersion`. */
   compareAndSwap(
@@ -60,7 +58,11 @@ export function createInMemoryObservationLeaseStore(): ObservationLeaseStore {
           existing.state === "pending" &&
           existing.sessionBindingDigest === lease.sessionBindingDigest
         ) {
-          leasesById.set(leaseId, { ...existing, state: "superseded", rowVersion: existing.rowVersion + 1 });
+          leasesById.set(leaseId, {
+            ...existing,
+            state: "superseded",
+            rowVersion: existing.rowVersion + 1,
+          });
         }
       }
       leasesById.set(lease.leaseId, { ...lease });

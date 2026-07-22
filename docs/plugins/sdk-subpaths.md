@@ -352,6 +352,7 @@ usage endpoint failed or returned no usable usage data.
     | `plugin-sdk/text-chunking` | Outbound text and markdown chunking/render helpers, markdown table conversion, directive-tag stripping, and safe-text utilities |
     | `plugin-sdk/speech` | Speech provider types plus provider-facing directive, registry, validation, OpenAI-compatible TTS builder, and speech helper exports |
     | `plugin-sdk/speech-core` | Shared speech provider types, registry, directive, normalization, and speech helper exports |
+    | `plugin-sdk/safe-routing` | Phase 1 safe-routing shadow service: create/evaluate a read-only observation lease against a task contract, read its audit trail, and bridge real model-call hook events into it. Used only by `extensions/safe-routing` |
     | `plugin-sdk/realtime-transcription` | Realtime transcription provider types, registry helpers, and shared WebSocket session helper |
     | `plugin-sdk/realtime-bootstrap-context` | Realtime profile bootstrap helper for bounded `IDENTITY.md`, `USER.md`, and `SOUL.md` context injection |
     | `plugin-sdk/realtime-voice` | Realtime voice provider types, registry helpers, and shared realtime voice behavior helpers, including output activity tracking |

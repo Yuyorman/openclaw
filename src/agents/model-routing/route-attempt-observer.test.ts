@@ -11,14 +11,19 @@ import {
   type ObservationLeaseStore,
 } from "../../tasks/safety/observation-lease.js";
 import { correlateModelCallEvent } from "./observed-attempt.js";
-import { recordObservedModelAttempt, type RouteAttemptObserverDeps } from "./route-attempt-observer.js";
+import {
+  recordObservedModelAttempt,
+  type RouteAttemptObserverDeps,
+} from "./route-attempt-observer.js";
 
 const SESSION_DIGEST = "sha256:session-digest";
 const CONFIG_DIGEST = "sha256:config-digest";
 const REGISTRY_DIGEST = "sha256:registry-digest";
 const CANDIDATE_CHAIN_DIGEST = "sha256:candidate-digest";
 
-function buildLeaseInput(overrides: Partial<CreateObservationLeaseInput> = {}): CreateObservationLeaseInput {
+function buildLeaseInput(
+  overrides: Partial<CreateObservationLeaseInput> = {},
+): CreateObservationLeaseInput {
   return {
     leaseId: "lease-1",
     taskId: "task-1",
@@ -159,7 +164,12 @@ describe("recordObservedModelAttempt", () => {
 
     expect(updateCalls[0]).toEqual({
       attemptId: "attempt-1",
-      patch: { runId: "run-1", callId: "call-1", observationCompleteness: "complete", observationCoverage: "hook-covered" },
+      patch: {
+        runId: "run-1",
+        callId: "call-1",
+        observationCompleteness: "complete",
+        observationCoverage: "hook-covered",
+      },
     });
   });
 
@@ -170,7 +180,10 @@ describe("recordObservedModelAttempt", () => {
 
     await recordObservedModelAttempt(deps, startedInput({}, 5_000));
 
-    expect(attempts.get("attempt-1")).toMatchObject({ observationCompleteness: "partial", observationCoverage: "hook-covered" });
+    expect(attempts.get("attempt-1")).toMatchObject({
+      observationCompleteness: "partial",
+      observationCoverage: "hook-covered",
+    });
   });
 
   it("marks the attempt partial when the started event's digests have drifted from the lease", async () => {
@@ -183,7 +196,10 @@ describe("recordObservedModelAttempt", () => {
       candidateChainDigest: "sha256:different-candidate-digest",
     });
 
-    expect(attempts.get("attempt-1")).toMatchObject({ observationCompleteness: "partial", observationCoverage: "hook-covered" });
+    expect(attempts.get("attempt-1")).toMatchObject({
+      observationCompleteness: "partial",
+      observationCoverage: "hook-covered",
+    });
   });
 
   it("does not double-write for a duplicate ended event (idempotent: the second event's lease lookup already misses)", async () => {

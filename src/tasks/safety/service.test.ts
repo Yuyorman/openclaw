@@ -6,10 +6,9 @@ import { loggingState } from "../../logging/state.js";
 import { closeOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { listTaskRecordsUnsorted, resetTaskRegistryForTests } from "../task-registry.js";
 import type { PersistedTaskContract } from "./contracts.js";
 import type { ObservationLeaseStore } from "./observation-lease.js";
-import { createSqliteObservationLeaseStore } from "./store.sqlite.js";
-import { listTaskRecordsUnsorted, resetTaskRegistryForTests } from "../task-registry.js";
 import {
   createShadowObservationLease,
   evaluateShadowRouteInGateway,
@@ -17,11 +16,15 @@ import {
   type SafeRoutingCallerScope,
   type SafeRoutingServiceDeps,
 } from "./service.js";
+import { createSqliteObservationLeaseStore } from "./store.sqlite.js";
 
 const ORIGINAL_ENV = captureEnv(["OPENCLAW_STATE_DIR"]);
 
 const REAL_CANDIDATE: ShadowRouteCandidate = { provider: "openai", model: "gpt-5.4" };
-const SHADOW_ELIGIBLE_CANDIDATE: ShadowRouteCandidate = { provider: "anthropic", model: "claude-sonnet-5" };
+const SHADOW_ELIGIBLE_CANDIDATE: ShadowRouteCandidate = {
+  provider: "anthropic",
+  model: "claude-sonnet-5",
+};
 
 function buildContract(overrides: Partial<PersistedTaskContract> = {}): PersistedTaskContract {
   return {
@@ -76,8 +79,14 @@ function createTestDeps(overrides: Partial<SafeRoutingServiceDeps> = {}): SafeRo
 
 const OWNER: SafeRoutingCallerScope = { sessionKey: "session-owner", operatorScopes: [] };
 const OTHER_SESSION: SafeRoutingCallerScope = { sessionKey: "session-other", operatorScopes: [] };
-const OPERATOR_READ: SafeRoutingCallerScope = { sessionKey: "session-operator", operatorScopes: ["operator.read"] };
-const OPERATOR_WRITE: SafeRoutingCallerScope = { sessionKey: "session-operator", operatorScopes: ["operator.write"] };
+const OPERATOR_READ: SafeRoutingCallerScope = {
+  sessionKey: "session-operator",
+  operatorScopes: ["operator.read"],
+};
+const OPERATOR_WRITE: SafeRoutingCallerScope = {
+  sessionKey: "session-operator",
+  operatorScopes: ["operator.write"],
+};
 
 describe("safety service", () => {
   afterEach(() => {
@@ -89,60 +98,69 @@ describe("safety service", () => {
   });
 
   it("creates a lease for the owning session and forces deliveryMode=none regardless of the input contract", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-create-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-create-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
 
-      const result = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
+        const result = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
 
-      expect(result.ok).toBe(true);
-      if (!result.ok) throw new Error("unreachable");
-      const lease = deps.leaseStore.findById(result.leaseId);
-      expect(lease).toMatchObject({ state: "pending" });
+        expect(result.ok).toBe(true);
+        if (!result.ok) throw new Error("unreachable");
+        const lease = deps.leaseStore.findById(result.leaseId);
+        expect(lease).toMatchObject({ state: "pending" });
 
-      const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
-      expect(audit.ok).toBe(true);
-      if (!audit.ok) throw new Error("unreachable");
-      expect(audit.contract.deliveryMode).toBe("none");
+        const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
+        expect(audit.ok).toBe(true);
+        if (!audit.ok) throw new Error("unreachable");
+        expect(audit.contract.deliveryMode).toBe("none");
 
-      closeOpenClawStateDatabase();
-    });
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("creates a lease for an operator acting with write scope on someone else's session", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-op-write-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-op-write-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
 
-      const result = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OPERATOR_WRITE,
-      });
+        const result = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OPERATOR_WRITE,
+        });
 
-      expect(result.ok).toBe(true);
-      closeOpenClawStateDatabase();
-    });
+        expect(result.ok).toBe(true);
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("forbids creating a lease for another session without write scope", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-forbid-create-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-forbid-create-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
 
-      const result = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OTHER_SESSION,
-      });
+        const result = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OTHER_SESSION,
+        });
 
-      expect(result).toEqual({ ok: false, code: "forbidden" });
-      closeOpenClawStateDatabase();
-    });
+        expect(result).toEqual({ ok: false, code: "forbidden" });
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("rolls back the task+checkpoint when the lease store fails to insert, leaving no orphaned task record", async () => {
@@ -176,231 +194,273 @@ describe("safety service", () => {
   });
 
   it("rejects a structurally invalid contract", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-invalid-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-invalid-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
 
-      const result = createShadowObservationLease(deps, {
-        contract: buildContract({ minimumDecisionGrade: "not-a-real-grade" as never }),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
+        const result = createShadowObservationLease(deps, {
+          contract: buildContract({ minimumDecisionGrade: "not-a-real-grade" as never }),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
 
-      expect(result).toEqual({ ok: false, code: "invalid_contract" });
-      closeOpenClawStateDatabase();
-    });
+        expect(result).toEqual({ ok: false, code: "invalid_contract" });
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("evaluates and persists candidate judgments, reporting the shadow-eligible candidate as the theoretical choice", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-evaluate-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
-      const created = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!created.ok) throw new Error("unreachable");
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-evaluate-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
+        const created = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!created.ok) throw new Error("unreachable");
 
-      const result = evaluateShadowRouteInGateway(deps, {
-        leaseId: created.leaseId,
-        leaseToken: created.leaseToken,
-      });
+        const result = evaluateShadowRouteInGateway(deps, {
+          leaseId: created.leaseId,
+          leaseToken: created.leaseToken,
+        });
 
-      expect(result).toMatchObject({
-        ok: true,
-        theoreticalChoice: { provider: "anthropic", model: "claude-sonnet-5" },
-        digestsConsistent: true,
-      });
+        expect(result).toMatchObject({
+          ok: true,
+          theoreticalChoice: { provider: "anthropic", model: "claude-sonnet-5" },
+          digestsConsistent: true,
+        });
 
-      const lease = deps.leaseStore.findById(created.leaseId);
-      const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
-      if (!audit.ok) throw new Error("unreachable");
-      expect(audit.attempts).toHaveLength(2);
-      expect(audit.attempts.find((a) => a.provider === "openai")).toMatchObject({
-        eligibility: "rejected",
-        wouldSelect: false,
-        observationCompleteness: "unavailable",
-      });
-      expect(audit.attempts.find((a) => a.provider === "anthropic")).toMatchObject({
-        eligibility: "eligible",
-        wouldSelect: true,
-        observationCompleteness: "unavailable",
-      });
+        const lease = deps.leaseStore.findById(created.leaseId);
+        const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
+        if (!audit.ok) throw new Error("unreachable");
+        expect(audit.attempts).toHaveLength(2);
+        expect(audit.attempts.find((a) => a.provider === "openai")).toMatchObject({
+          eligibility: "rejected",
+          wouldSelect: false,
+          observationCompleteness: "unavailable",
+        });
+        expect(audit.attempts.find((a) => a.provider === "anthropic")).toMatchObject({
+          eligibility: "eligible",
+          wouldSelect: true,
+          observationCompleteness: "unavailable",
+        });
 
-      closeOpenClawStateDatabase();
-    });
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("marks every persisted attempt partial when the live digests have drifted from the lease's bound digests", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-drift-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
-      const created = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!created.ok) throw new Error("unreachable");
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-drift-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
+        const created = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!created.ok) throw new Error("unreachable");
 
-      const driftedDeps: SafeRoutingServiceDeps = { ...deps, configDigest: () => "sha256:config-v2-drifted" };
-      const result = evaluateShadowRouteInGateway(driftedDeps, {
-        leaseId: created.leaseId,
-        leaseToken: created.leaseToken,
-      });
+        const driftedDeps: SafeRoutingServiceDeps = {
+          ...deps,
+          configDigest: () => "sha256:config-v2-drifted",
+        };
+        const result = evaluateShadowRouteInGateway(driftedDeps, {
+          leaseId: created.leaseId,
+          leaseToken: created.leaseToken,
+        });
 
-      expect(result).toMatchObject({ ok: true, digestsConsistent: false });
-      const lease = deps.leaseStore.findById(created.leaseId);
-      const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
-      if (!audit.ok) throw new Error("unreachable");
-      expect(audit.attempts.every((a) => a.observationCompleteness === "partial")).toBe(true);
+        expect(result).toMatchObject({ ok: true, digestsConsistent: false });
+        const lease = deps.leaseStore.findById(created.leaseId);
+        const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
+        if (!audit.ok) throw new Error("unreachable");
+        expect(audit.attempts.every((a) => a.observationCompleteness === "partial")).toBe(true);
 
-      closeOpenClawStateDatabase();
-    });
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("rejects evaluation with a wrong leaseToken without consuming the lease", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-bad-token-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
-      const created = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!created.ok) throw new Error("unreachable");
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-bad-token-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
+        const created = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!created.ok) throw new Error("unreachable");
 
-      const result = evaluateShadowRouteInGateway(deps, { leaseId: created.leaseId, leaseToken: "wrong-token" });
+        const result = evaluateShadowRouteInGateway(deps, {
+          leaseId: created.leaseId,
+          leaseToken: "wrong-token",
+        });
 
-      expect(result).toEqual({ ok: false, code: "invalid_token" });
-      expect(deps.leaseStore.findById(created.leaseId)?.tokenConsumedAt).toBeUndefined();
-      closeOpenClawStateDatabase();
-    });
+        expect(result).toEqual({ ok: false, code: "invalid_token" });
+        expect(deps.leaseStore.findById(created.leaseId)?.tokenConsumedAt).toBeUndefined();
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("rejects a second presentation of an already-consumed leaseToken", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-reused-token-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
-      const created = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!created.ok) throw new Error("unreachable");
-      evaluateShadowRouteInGateway(deps, { leaseId: created.leaseId, leaseToken: created.leaseToken });
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-reused-token-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
+        const created = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!created.ok) throw new Error("unreachable");
+        evaluateShadowRouteInGateway(deps, {
+          leaseId: created.leaseId,
+          leaseToken: created.leaseToken,
+        });
 
-      const second = evaluateShadowRouteInGateway(deps, {
-        leaseId: created.leaseId,
-        leaseToken: created.leaseToken,
-      });
+        const second = evaluateShadowRouteInGateway(deps, {
+          leaseId: created.leaseId,
+          leaseToken: created.leaseToken,
+        });
 
-      expect(second).toEqual({ ok: false, code: "already_consumed" });
-      closeOpenClawStateDatabase();
-    });
+        expect(second).toEqual({ ok: false, code: "already_consumed" });
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("supersedes an earlier pending lease when a second is created for the same session; the superseded lease can never be evaluated", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-supersede-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
-      const first = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!first.ok) throw new Error("unreachable");
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-supersede-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
+        const first = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!first.ok) throw new Error("unreachable");
 
-      const second = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!second.ok) throw new Error("unreachable");
+        const second = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!second.ok) throw new Error("unreachable");
 
-      const evaluatedFirst = evaluateShadowRouteInGateway(deps, {
-        leaseId: first.leaseId,
-        leaseToken: first.leaseToken,
-      });
-      expect(evaluatedFirst).toEqual({ ok: false, code: "superseded" });
+        const evaluatedFirst = evaluateShadowRouteInGateway(deps, {
+          leaseId: first.leaseId,
+          leaseToken: first.leaseToken,
+        });
+        expect(evaluatedFirst).toEqual({ ok: false, code: "superseded" });
 
-      const evaluatedSecond = evaluateShadowRouteInGateway(deps, {
-        leaseId: second.leaseId,
-        leaseToken: second.leaseToken,
-      });
-      expect(evaluatedSecond.ok).toBe(true);
-      closeOpenClawStateDatabase();
-    });
+        const evaluatedSecond = evaluateShadowRouteInGateway(deps, {
+          leaseId: second.leaseId,
+          leaseToken: second.leaseToken,
+        });
+        expect(evaluatedSecond.ok).toBe(true);
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("returns not_found for evaluation against an unknown leaseId", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-unknown-lease-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-unknown-lease-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
 
-      const result = evaluateShadowRouteInGateway(deps, { leaseId: "no-such-lease", leaseToken: "anything" });
+        const result = evaluateShadowRouteInGateway(deps, {
+          leaseId: "no-such-lease",
+          leaseToken: "anything",
+        });
 
-      expect(result).toEqual({ ok: false, code: "not_found" });
-      closeOpenClawStateDatabase();
-    });
+        expect(result).toEqual({ ok: false, code: "not_found" });
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("lets the owning session read its own shadow audit", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-audit-owner-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
-      const created = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!created.ok) throw new Error("unreachable");
-      const lease = deps.leaseStore.findById(created.leaseId);
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-audit-owner-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
+        const created = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!created.ok) throw new Error("unreachable");
+        const lease = deps.leaseStore.findById(created.leaseId);
 
-      const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
+        const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OWNER });
 
-      expect(audit.ok).toBe(true);
-      closeOpenClawStateDatabase();
-    });
+        expect(audit.ok).toBe(true);
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("returns not_found (not a distinct forbidden code) for a different session with no operator.read", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-audit-forbid-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
-      const created = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!created.ok) throw new Error("unreachable");
-      const lease = deps.leaseStore.findById(created.leaseId);
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-audit-forbid-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
+        const created = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!created.ok) throw new Error("unreachable");
+        const lease = deps.leaseStore.findById(created.leaseId);
 
-      const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OTHER_SESSION });
-      const missing = getShadowAudit({ taskId: "no-such-task", callerScope: OTHER_SESSION });
+        const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OTHER_SESSION });
+        const missing = getShadowAudit({ taskId: "no-such-task", callerScope: OTHER_SESSION });
 
-      expect(audit).toEqual({ ok: false, code: "not_found" });
-      expect(missing).toEqual({ ok: false, code: "not_found" });
-      closeOpenClawStateDatabase();
-    });
+        expect(audit).toEqual({ ok: false, code: "not_found" });
+        expect(missing).toEqual({ ok: false, code: "not_found" });
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 
   it("lets an operator with operator.read read any session's shadow audit", async () => {
-    await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-safety-service-audit-op-read-" }, async () => {
-      resetTaskRegistryForTests();
-      const deps = createTestDeps();
-      const created = createShadowObservationLease(deps, {
-        contract: buildContract(),
-        sessionRef: "session-owner",
-        callerScope: OWNER,
-      });
-      if (!created.ok) throw new Error("unreachable");
-      const lease = deps.leaseStore.findById(created.leaseId);
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-safety-service-audit-op-read-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const deps = createTestDeps();
+        const created = createShadowObservationLease(deps, {
+          contract: buildContract(),
+          sessionRef: "session-owner",
+          callerScope: OWNER,
+        });
+        if (!created.ok) throw new Error("unreachable");
+        const lease = deps.leaseStore.findById(created.leaseId);
 
-      const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OPERATOR_READ });
+        const audit = getShadowAudit({ taskId: lease!.taskId, callerScope: OPERATOR_READ });
 
-      expect(audit.ok).toBe(true);
-      closeOpenClawStateDatabase();
-    });
+        expect(audit.ok).toBe(true);
+        closeOpenClawStateDatabase();
+      },
+    );
   });
 });

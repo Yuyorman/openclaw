@@ -73,16 +73,22 @@ export class TaskContractError extends Error {
 }
 
 const MODALITIES = new Set<string>(["text", "image", "audio"] satisfies TaskContractModality[]);
-const DECISION_GRADES = new Set<string>(
-  ["draft", "analysis", "decision", "final"] satisfies TaskContractDecisionGrade[],
-);
+const DECISION_GRADES = new Set<string>([
+  "draft",
+  "analysis",
+  "decision",
+  "final",
+] satisfies TaskContractDecisionGrade[]);
 const RISK_CLASSES = new Set<string>(["low", "medium", "high"] satisfies TaskContractRiskClass[]);
-const DELIVERY_MODES = new Set<string>(
-  ["none", "internal", "formal"] satisfies TaskContractDeliveryMode[],
-);
-const DATA_POLICIES = new Set<string>(
-  ["local-only", "approved-providers"] satisfies TaskContractDataPolicy[],
-);
+const DELIVERY_MODES = new Set<string>([
+  "none",
+  "internal",
+  "formal",
+] satisfies TaskContractDeliveryMode[]);
+const DATA_POLICIES = new Set<string>([
+  "local-only",
+  "approved-providers",
+] satisfies TaskContractDataPolicy[]);
 
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
@@ -145,7 +151,10 @@ export function normalizeTaskContract(input: PersistedTaskContract): NormalizedT
     );
   }
   if (!RISK_CLASSES.has(input.riskClass)) {
-    throw new TaskContractError("invalid_risk_class", `Unknown riskClass: ${String(input.riskClass)}`);
+    throw new TaskContractError(
+      "invalid_risk_class",
+      `Unknown riskClass: ${String(input.riskClass)}`,
+    );
   }
   if (input.allowedToolPolicyId === "") {
     throw new TaskContractError(

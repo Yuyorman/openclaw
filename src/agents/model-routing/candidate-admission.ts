@@ -2,7 +2,10 @@
  * Evaluates whether a model candidate's capability snapshot admits it for a
  * task contract's required capabilities. Pure, no I/O, no model/tool calls.
  */
-import type { NormalizedTaskContract, TaskContractDecisionGrade } from "../../tasks/safety/contracts.js";
+import type {
+  NormalizedTaskContract,
+  TaskContractDecisionGrade,
+} from "../../tasks/safety/contracts.js";
 import type { ModelCapabilitySnapshot } from "./capability-snapshot.js";
 
 export type CandidateAdmissionIneligibleCode =
@@ -34,7 +37,10 @@ const DECISION_GRADE_ORDER: Record<TaskContractDecisionGrade, number> = {
   final: 3,
 };
 
-function ineligible(code: CandidateAdmissionIneligibleCode, reason: string): CandidateAdmissionDecision {
+function ineligible(
+  code: CandidateAdmissionIneligibleCode,
+  reason: string,
+): CandidateAdmissionDecision {
   return { outcome: "ineligible", code, reason };
 }
 
@@ -53,13 +59,19 @@ export function evaluateCandidateAdmission(
         "Candidate modalities are contradicted between configuration and observed evidence",
       );
     }
-    if (snapshot.modalities.verification === "unverified" || snapshot.modalities.value === undefined) {
+    if (
+      snapshot.modalities.verification === "unverified" ||
+      snapshot.modalities.value === undefined
+    ) {
       return ineligible("MODALITY", "Candidate modalities are unverified");
     }
     const supported = new Set(snapshot.modalities.value);
     const missing = required.modalities.filter((modality) => !supported.has(modality));
     if (missing.length > 0) {
-      return ineligible("MODALITY", `Candidate does not support required modalities: ${missing.join(", ")}`);
+      return ineligible(
+        "MODALITY",
+        `Candidate does not support required modalities: ${missing.join(", ")}`,
+      );
     }
   }
 
