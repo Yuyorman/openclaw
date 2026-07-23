@@ -138,7 +138,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
     publicEntrypoints: readPluginSdkSurfaceBudgetEnv(
       "OPENCLAW_PLUGIN_SDK_MAX_PUBLIC_ENTRYPOINTS",
       // +1: session-discussion binds one external discussion provider to sessions.
-      140,
+      // +1: safe-routing Phase 1 shadow service entrypoint.
+      141,
       env,
     ),
     publicExports: readPluginSdkSurfaceBudgetEnv(
@@ -149,7 +150,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // +1: channel-owned setup contract factory.
       // +18: generic schema primitives needed by plugin-owned channel config schemas.
       // +2: shared Teams reply-style and TTS schema leaves.
-      4698,
+      // +16: safe-routing shadow-service lease/evaluate/audit contracts and types.
+      4714,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
@@ -160,7 +162,8 @@ export function readPluginSdkSurfaceBudgets(env = process.env) {
       // +1: channel-owned setup contract factory.
       // +4: generic channel schema shape builders.
       // +1: plugin-owned sensitive-schema registration.
-      2847,
+      // +5: safe-routing shadow-service lease/evaluate/audit functions.
+      2852,
       env,
     ),
     publicDeprecatedExports: readPluginSdkSurfaceBudgetEnv(
