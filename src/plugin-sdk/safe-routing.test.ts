@@ -6,7 +6,7 @@ import { loggingState } from "../logging/state.js";
 import { closeOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import type { PersistedTaskContract } from "../tasks/safety/contracts.js";
 import { createSqliteObservationLeaseStore } from "../tasks/safety/store.sqlite.js";
-import { resetTaskRegistryForTests } from "../tasks/task-registry.js";
+import { resetTaskRegistryForTests } from "../tasks/task-registry.test-support.js";
 import { captureEnv } from "../test-utils/env.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import * as safeRoutingSdk from "./safe-routing.js";

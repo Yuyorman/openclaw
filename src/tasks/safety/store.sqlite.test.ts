@@ -9,11 +9,8 @@ import {
 } from "../../state/openclaw-state-db.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import {
-  createTaskRecord,
-  listTaskRecordsUnsorted,
-  resetTaskRegistryForTests,
-} from "../task-registry.js";
+import { createTaskRecord, listTaskRecordsUnsorted } from "../task-registry.js";
+import { resetTaskRegistryForTests } from "../task-registry.test-support.js";
 import {
   appendRouteAttempts,
   createManagedTaskWithCheckpoint,

@@ -19,7 +19,7 @@ import {
   type SafeRoutingServiceDeps,
 } from "../../tasks/safety/service.js";
 import { createSqliteObservationLeaseStore } from "../../tasks/safety/store.sqlite.js";
-import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
+import { resetTaskRegistryForTests } from "../../tasks/task-registry.test-support.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { resolveModelCandidateChain } from "../model-fallback.js";

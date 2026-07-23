@@ -6,7 +6,8 @@ import { loggingState } from "../../logging/state.js";
 import { closeOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { captureEnv } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { listTaskRecordsUnsorted, resetTaskRegistryForTests } from "../task-registry.js";
+import { listTaskRecordsUnsorted } from "../task-registry.js";
+import { resetTaskRegistryForTests } from "../task-registry.test-support.js";
 import type { PersistedTaskContract } from "./contracts.js";
 import type { ObservationLeaseStore } from "./observation-lease.js";
 import {
