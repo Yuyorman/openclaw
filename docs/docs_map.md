@@ -8884,6 +8884,14 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H3: 7.3 Glossary
   - H2: Related
 
+## security/dependency-debt-security-fast.md
+
+- Route: /security/dependency-debt-security-fast
+- Headings:
+  - H1: security-fast dependency advisories (tracked, not yet remediated)
+  - H2: Advisories (from the security-fast job output)
+  - H2: Next step
+
 ## security/formal-verification.md
 
 - Route: /security/formal-verification
