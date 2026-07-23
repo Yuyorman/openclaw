@@ -1562,7 +1562,7 @@ CREATE TABLE IF NOT EXISTS task_contracts (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   FOREIGN KEY (task_id) REFERENCES task_runs(task_id) ON DELETE CASCADE
-);
+) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_task_contracts_risk_class ON task_contracts(risk_class);
 
@@ -1590,7 +1590,7 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
   created_at INTEGER NOT NULL,
   FOREIGN KEY (task_id) REFERENCES task_runs(task_id) ON DELETE CASCADE,
   UNIQUE (task_id, sequence)
-);
+) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_task_checkpoints_task_id ON task_checkpoints(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_checkpoints_observation_lease_id
@@ -1608,7 +1608,7 @@ CREATE TABLE IF NOT EXISTS model_capability_snapshots (
   created_at INTEGER NOT NULL,
   expires_at INTEGER,
   UNIQUE (snapshot_digest)
-);
+) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_model_capability_snapshots_provider_model
   ON model_capability_snapshots(provider, model, created_at);
@@ -1639,7 +1639,7 @@ CREATE TABLE IF NOT EXISTS model_route_attempts (
   FOREIGN KEY (task_id) REFERENCES task_runs(task_id) ON DELETE CASCADE,
   FOREIGN KEY (checkpoint_id) REFERENCES task_checkpoints(checkpoint_id) ON DELETE CASCADE,
   FOREIGN KEY (capability_snapshot_id) REFERENCES model_capability_snapshots(snapshot_id)
-);
+) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_model_route_attempts_task_checkpoint_ordinal
   ON model_route_attempts(task_id, checkpoint_id, ordinal);
