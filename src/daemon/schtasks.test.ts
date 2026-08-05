@@ -103,6 +103,28 @@ describe("scheduled task runtime derivation", () => {
     });
   });
 
+  it("treats a signed 32-bit result code as a present non-running code", async () => {
+    await expect(
+      readRuntimeFromQueryOutput(
+        taskQueryOutput(["Status: Running", "Last Run Result: -2147020576"]),
+      ),
+    ).resolves.toMatchObject({
+      status: "stopped",
+      detail: "Task Last Run Result=-2147020576; treating as not running.",
+    });
+  });
+
+  it("ignores a negative result code outside signed 32-bit range", async () => {
+    await expect(
+      readRuntimeFromQueryOutput(
+        taskQueryOutput(["Status: Running", "Last Run Result: -5000000000"]),
+      ),
+    ).resolves.toMatchObject({
+      status: "unknown",
+      detail: "Task status is locale-dependent and no numeric Last Run Result was available.",
+    });
+  });
+
   it("detects running via result code when status is localized (German)", async () => {
     await expect(
       readRuntimeFromQueryOutput(

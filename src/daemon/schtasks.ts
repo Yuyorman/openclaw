@@ -346,6 +346,18 @@ function normalizeTaskResultCode(value?: string): string | null {
     }
   }
 
+  // Some Windows builds report Last Run Result as a signed 32-bit integer, so an
+  // HRESULT with the high bit set arrives negative (observed: -2147020576 for
+  // 0x800710E0). Without this branch a result code that IS present normalizes to
+  // null, and the caller then reports "no numeric Last Run Result was available"
+  // while hiding the actual code from the status detail.
+  if (/^-\d+$/.test(raw)) {
+    const numeric = Number.parseInt(raw, 10);
+    if (Number.isFinite(numeric) && numeric >= -2_147_483_648) {
+      return `0x${(numeric >>> 0).toString(16)}`;
+    }
+  }
+
   return null;
 }
 
