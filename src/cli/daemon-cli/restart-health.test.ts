@@ -736,6 +736,95 @@ describe("inspectGatewayRestart", () => {
     expect(sleep).toHaveBeenCalledTimes(185);
   });
 
+  // A gateway that binds the port but is not answering yet is indistinguishable from a
+  // stale listener while the Windows scheduled task reports "stopped" (its VBS launcher
+  // exits as soon as it has spawned gateway.cmd). Killing it turns one restart into a
+  // relaunch loop, so the wait must tell the two apart by when the listener appeared.
+  async function waitWithListenerAppearing(params: {
+    attempts: number;
+    firstSnapshotBusy: boolean;
+    reachableAfterPortCalls: number;
+  }) {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    classifyPortListener.mockReturnValue("gateway");
+    const service = makeGatewayService({ status: "stopped" });
+    const busy = {
+      port: 18789,
+      status: "busy",
+      listeners: [{ pid: 4242, commandLine: "openclaw-gateway" }],
+      hints: [],
+    };
+    let portCalls = 0;
+    inspectPortUsage.mockImplementation(async () => {
+      portCalls += 1;
+      return portCalls === 1 && !params.firstSnapshotBusy
+        ? { port: 18789, status: "free", listeners: [], hints: [] }
+        : busy;
+    });
+    probeGateway.mockImplementation(async () => ({
+      ok: portCalls >= params.reachableAfterPortCalls,
+      close: null,
+    }));
+
+    const { waitForGatewayHealthyRestart } = await import("./restart-health.js");
+    return waitForGatewayHealthyRestart({
+      service,
+      port: 18789,
+      attempts: params.attempts,
+      delayMs: 500,
+    });
+  }
+
+  it("kills stale pids without waiting when the listener predates the restart", async () => {
+    const snapshot = await waitWithListenerAppearing({
+      attempts: 360,
+      firstSnapshotBusy: true,
+      reachableAfterPortCalls: Number.POSITIVE_INFINITY,
+    });
+
+    expect(snapshot.waitOutcome).toBe("stale-pids");
+    expect(snapshot.staleGatewayPids).toEqual([4242]);
+    expect(snapshot.elapsedMs).toBe(0);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("does not kill a listener that appears mid-restart during the Windows grace", async () => {
+    const snapshot = await waitWithListenerAppearing({
+      attempts: 20,
+      firstSnapshotBusy: false,
+      reachableAfterPortCalls: Number.POSITIVE_INFINITY,
+    });
+
+    expect(snapshot.waitOutcome).toBe("timeout");
+    expect(snapshot.staleGatewayPids).toEqual([4242]);
+    expect(snapshot.elapsedMs).toBe(10_000);
+  });
+
+  it("reports stale pids once the mid-restart grace expires", async () => {
+    const snapshot = await waitWithListenerAppearing({
+      attempts: 360,
+      firstSnapshotBusy: false,
+      reachableAfterPortCalls: Number.POSITIVE_INFINITY,
+    });
+
+    expect(snapshot.waitOutcome).toBe("stale-pids");
+    expect(snapshot.staleGatewayPids).toEqual([4242]);
+    expect(snapshot.elapsedMs).toBe(90_000);
+  });
+
+  it("lets a listener that appears mid-restart finish booting instead of killing it", async () => {
+    const snapshot = await waitWithListenerAppearing({
+      attempts: 360,
+      firstSnapshotBusy: false,
+      reachableAfterPortCalls: 3,
+    });
+
+    expect(snapshot.waitOutcome).toBe("healthy");
+    expect(snapshot.healthy).toBe(true);
+    expect(snapshot.staleGatewayPids).toStrictEqual([]);
+    expect(snapshot.elapsedMs).toBe(1_000);
+  });
+
   it("keeps waiting when the expected gateway version is not available yet", async () => {
     const service = makeGatewayService({ status: "running", pid: 8000 });
     inspectPortUsage

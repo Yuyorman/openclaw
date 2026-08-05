@@ -26,6 +26,8 @@ export const DEFAULT_RESTART_HEALTH_ATTEMPTS = Math.ceil(
 );
 const STOPPED_FREE_EARLY_EXIT_GRACE_MS = 10_000;
 const WINDOWS_STOPPED_FREE_EARLY_EXIT_GRACE_MS = 90_000;
+const STALE_PIDS_GRACE_MS = 10_000;
+const WINDOWS_STALE_PIDS_GRACE_MS = 90_000;
 
 export type GatewayRestartWaitOutcome =
   | "healthy"
@@ -506,6 +508,10 @@ function stoppedFreeEarlyExitGraceMs(): number {
     : STOPPED_FREE_EARLY_EXIT_GRACE_MS;
 }
 
+function stalePidsGraceMs(): number {
+  return process.platform === "win32" ? WINDOWS_STALE_PIDS_GRACE_MS : STALE_PIDS_GRACE_MS;
+}
+
 function withWaitContext(
   snapshot: GatewayRestartSnapshot,
   waitOutcome: GatewayRestartWaitOutcome,
@@ -537,6 +543,17 @@ export async function waitForGatewayHealthyRestart(params: {
     probeAuth,
   });
 
+  // Stale pids already present in the first snapshot are leftovers that survived the
+  // stop, so acting on them right away is what makes restart self-healing. A listener
+  // that only shows up later in this wait is the gateway we just launched: the Windows
+  // scheduled-task launcher exits as soon as it has spawned gateway.cmd, so
+  // runtime.status reads "stopped"/"unknown" for the whole startup and a gateway that
+  // has bound the port but is not answering yet looks exactly like a stale one. Killing
+  // it restarts the cycle, so give the reachability probe the same grace the stopped-free
+  // early exit gets before acting on a verdict that terminates a process.
+  const preexistingStalePids = new Set(snapshot.staleGatewayPids);
+  const stalePidsGrace = stalePidsGraceMs();
+
   let consecutiveStoppedFreeCount = 0;
   const STOPPED_FREE_THRESHOLD = 6;
   const minAttemptForEarlyExit = Math.min(
@@ -560,7 +577,13 @@ export async function waitForGatewayHealthyRestart(params: {
       return withWaitContext(snapshot, "version-mismatch", attempt * delayMs);
     }
     if (snapshot.staleGatewayPids.length > 0 && snapshot.runtime.status !== "running") {
-      return withWaitContext(snapshot, "stale-pids", attempt * delayMs);
+      const staleElapsedMs = attempt * delayMs;
+      if (
+        staleElapsedMs >= stalePidsGrace ||
+        snapshot.staleGatewayPids.some((pid) => preexistingStalePids.has(pid))
+      ) {
+        return withWaitContext(snapshot, "stale-pids", staleElapsedMs);
+      }
     }
     if (shouldEarlyExitStoppedFree(snapshot, attempt, minAttemptForEarlyExit)) {
       consecutiveStoppedFreeCount += 1;
