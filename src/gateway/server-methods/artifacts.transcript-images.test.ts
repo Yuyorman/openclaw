@@ -154,6 +154,45 @@ describe("persisted chat image artifact recovery", () => {
     });
   });
 
+  it("does not publish recovery handles for malformed legacy image payloads", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const content = [
+        { type: "image", blob: "not-base64!", mimeType: "image/png" },
+        { type: "image", image_url: "data:image/png;base64,not-base64!" },
+      ];
+      await seedUnindexedTranscriptForTest({
+        ...scope,
+        entry: { sessionId: scope.sessionId, updatedAt: 1 },
+        events: [
+          {
+            session_id: scope.sessionId,
+            seq: 0,
+            created_at: 0,
+            event_json: JSON.stringify({
+              id: "malformed-legacy-image-fields",
+              message: { role: "toolResult", content },
+            }),
+          },
+        ],
+      });
+
+      const history = await invoke("chat.history", {}, null, await createHistoryReadContext());
+      const messages = asOptionalRecord(history.payload)?.messages;
+      const images = Array.isArray(messages)
+        ? messages.flatMap((message) => {
+            const blocks = asOptionalRecord(message)?.content;
+            return Array.isArray(blocks)
+              ? blocks.filter((block) => asOptionalRecord(block)?.type === "image")
+              : [];
+          })
+        : [];
+      expect(images).toHaveLength(2);
+      for (const image of images) {
+        expect(image).not.toHaveProperty("artifactId");
+      }
+    });
+  });
+
   it("downloads the exact image bytes referenced by history and committed live messages", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });

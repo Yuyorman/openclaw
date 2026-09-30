@@ -1,6 +1,7 @@
 import { asPositiveSafeInteger } from "@openclaw/normalization-core/number-coercion";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { readTranscriptDisplayPosition } from "../chat/transcript-display-position.js";
+import { resolveBlockDownload } from "../server-methods/artifacts-content.js";
 import { ASSISTANT_DISPLAY_CONTENT_FIELD } from "../shared/assistant-display-content.js";
 
 const PREFIX = "artifact_transcript_image_";
@@ -84,16 +85,9 @@ function displayContentField(message: Record<string, unknown>): string {
 }
 
 function hasInlineImagePayload(block: Record<string, unknown>): boolean {
-  const source = asOptionalRecord(block.source);
-  const imageUrl = block.image_url;
-  const imageUrlValue =
-    typeof imageUrl === "string" ? imageUrl : asOptionalRecord(imageUrl)?.url;
   return (
     block.type === "image" &&
-    ([block.data, source?.data, block.blob, source?.blob].some(
-      (value) => typeof value === "string" && value.length > 0,
-    ) ||
-      (typeof imageUrlValue === "string" && /^data:image\//i.test(imageUrlValue.trim())))
+    resolveBlockDownload(block, { includeData: false }).mode === "bytes"
   );
 }
 
