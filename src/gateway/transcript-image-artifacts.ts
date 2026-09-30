@@ -1,7 +1,7 @@
 import { asPositiveSafeInteger } from "@openclaw/normalization-core/number-coercion";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { readTranscriptDisplayPosition } from "../chat/transcript-display-position.js";
-import { resolveBlockDownload } from "../server-methods/artifacts-content.js";
+import { resolveBlockDownload } from "./server-methods/artifacts-content.js";
 import { ASSISTANT_DISPLAY_CONTENT_FIELD } from "../shared/assistant-display-content.js";
 
 const PREFIX = "artifact_transcript_image_";
