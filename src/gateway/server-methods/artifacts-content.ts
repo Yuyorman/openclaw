@@ -71,8 +71,17 @@ export function resolveBlockDownload(
   const blob = readStringValue(block.blob)?.trim();
   const sourceBlob = readStringValue(source?.blob)?.trim();
   const sourceUrl = asNonEmptyString(source?.url);
-  const dataUrl = [url, sourceUrl, imageUrl, audioUrl, data, content, sourceData, blob, sourceBlob]
-    .find((value) => typeof value === "string" && /^data:/i.test(value));
+  const dataUrl = [
+    url,
+    sourceUrl,
+    imageUrl,
+    audioUrl,
+    data,
+    content,
+    sourceData,
+    blob,
+    sourceBlob,
+  ].find((value) => typeof value === "string" && /^data:/i.test(value));
   const base64FromDetectedDataUrl = readArtifactBase64Payload(
     dataUrl ? base64FromDataUrl(dataUrl) : undefined,
     opts,
@@ -110,4 +119,3 @@ export function resolveBlockDownload(
   }
   return { mode: "unsupported", mimeType, sizeBytes };
 }
-

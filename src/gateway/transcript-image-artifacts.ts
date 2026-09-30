@@ -147,4 +147,3 @@ export function resolveTranscriptImageArtifactBlock(
     : undefined;
   return block && hasInlineImagePayload(block) ? block : undefined;
 }
-

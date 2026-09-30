@@ -119,7 +119,10 @@ describe("persisted chat image artifact recovery", () => {
       const images = ["dG9wLWxldmVs", "c291cmNlLWJsb2I=", "aW1hZ2UtdXJs"];
       const content = [
         { type: "image", blob: images[0], mimeType: "image/png" },
-        { type: "image", source: { type: "base64", blob: images[1], media_type: "image/png" } },
+        {
+          type: "image",
+          source: { type: "base64", blob: images[1], media_type: "image/png" },
+        },
         { type: "image", image_url: `data:image/png;base64,${images[2]}` },
       ];
       await seedUnindexedTranscriptForTest({
@@ -341,4 +344,3 @@ describe("persisted chat image artifact recovery", () => {
     });
   });
 });
-
