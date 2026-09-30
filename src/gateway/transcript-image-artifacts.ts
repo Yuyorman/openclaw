@@ -1,8 +1,9 @@
+import { sniffInlineImageMime } from "@openclaw/media-core/inline-image-data-url";
 import { asPositiveSafeInteger } from "@openclaw/normalization-core/number-coercion";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { readTranscriptDisplayPosition } from "../chat/transcript-display-position.js";
-import { resolveBlockDownload } from "./server-methods/artifacts-content.js";
 import { ASSISTANT_DISPLAY_CONTENT_FIELD } from "../shared/assistant-display-content.js";
+import { mediaUrlValue, resolveBlockDownload } from "./server-methods/artifacts-content.js";
 
 const PREFIX = "artifact_transcript_image_";
 
@@ -85,9 +86,28 @@ function displayContentField(message: Record<string, unknown>): string {
 }
 
 function hasInlineImagePayload(block: Record<string, unknown>): boolean {
+  if (
+    block.type !== "image" ||
+    resolveBlockDownload(block, { includeData: false }).mode !== "bytes"
+  ) {
+    return false;
+  }
+
+  const source = asOptionalRecord(block.source);
+  const imageUrl = mediaUrlValue(block.image_url);
+  const isLegacyInlineImage =
+    typeof block.blob === "string" ||
+    typeof source?.blob === "string" ||
+    (typeof imageUrl === "string" && /^data:/i.test(imageUrl));
+  if (!isLegacyInlineImage) {
+    return true;
+  }
+
+  const resolved = resolveBlockDownload(block, { includeData: true });
   return (
-    block.type === "image" &&
-    resolveBlockDownload(block, { includeData: false }).mode === "bytes"
+    resolved.mode === "bytes" &&
+    typeof resolved.data === "string" &&
+    sniffInlineImageMime(Buffer.from(resolved.data.slice(0, 128), "base64")) !== undefined
   );
 }
 

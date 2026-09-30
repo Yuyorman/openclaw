@@ -116,7 +116,13 @@ describe("persisted chat image artifact recovery", () => {
 
   it("recovers legacy blob fields and image_url data URLs from transcript history", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
-      const images = ["dG9wLWxldmVs", "c291cmNlLWJsb2I=", "aW1hZ2UtdXJs"];
+      const png = [
+        "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmElEQVR4nO3QMREAIBDAsHeE",
+        "RQyjAWRkoEP2Xmftc382OkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqAD",
+        "tAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBr",
+        "gA7QGqADtAboAK0BOkBrgA7QGqADtAboAO0B06OyaOxP7RwAAAAASUVORK5CYII=",
+      ].join("");
+      const images = [png, png, png];
       const content = [
         { type: "image", blob: images[0], mimeType: "image/png" },
         {
@@ -158,6 +164,10 @@ describe("persisted chat image artifact recovery", () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const content = [
         { type: "image", blob: "not-base64!", mimeType: "image/png" },
+        {
+          type: "image",
+          source: { type: "base64", blob: "not-base64!", media_type: "image/png" },
+        },
         { type: "image", image_url: "data:image/png;base64,not-base64!" },
       ];
       await seedUnindexedTranscriptForTest({
@@ -186,7 +196,50 @@ describe("persisted chat image artifact recovery", () => {
               : [];
           })
         : [];
-      expect(images).toHaveLength(2);
+      expect(images).toHaveLength(3);
+      for (const image of images) {
+        expect(image).not.toHaveProperty("artifactId");
+      }
+    });
+  });
+
+  it("does not publish recovery handles for valid base64 that is not image data", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const content = [
+        { type: "image", blob: "dG9wLWxldmVs", mimeType: "image/png" },
+        {
+          type: "image",
+          source: { type: "base64", blob: "c291cmNlLWJsb2I=", media_type: "image/png" },
+        },
+        { type: "image", image_url: "data:image/png;base64,aW1hZ2UtdXJs" },
+      ];
+      await seedUnindexedTranscriptForTest({
+        ...scope,
+        entry: { sessionId: scope.sessionId, updatedAt: 1 },
+        events: [
+          {
+            session_id: scope.sessionId,
+            seq: 0,
+            created_at: 0,
+            event_json: JSON.stringify({
+              id: "non-image-legacy-payloads",
+              message: { role: "toolResult", content },
+            }),
+          },
+        ],
+      });
+
+      const history = await invoke("chat.history", {}, null, await createHistoryReadContext());
+      const messages = asOptionalRecord(history.payload)?.messages;
+      const images = Array.isArray(messages)
+        ? messages.flatMap((message) => {
+            const blocks = asOptionalRecord(message)?.content;
+            return Array.isArray(blocks)
+              ? blocks.filter((block) => asOptionalRecord(block)?.type === "image")
+              : [];
+          })
+        : [];
+      expect(images).toHaveLength(3);
       for (const image of images) {
         expect(image).not.toHaveProperty("artifactId");
       }
