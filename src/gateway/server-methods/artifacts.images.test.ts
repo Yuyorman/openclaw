@@ -45,7 +45,7 @@ function oversizedPngBytes(): Buffer {
   const png = Buffer.from(PNG_BASE64, "base64");
   const iendOffset = png.length - 12;
   const text = Buffer.alloc(1.5 * 1024 * 1024 - png.length - 12, 0x78);
-  Buffer.from("Description\\0").copy(text);
+  Buffer.from("Description\0").copy(text);
   const textChunk = Buffer.alloc(text.length + 12);
   textChunk.writeUInt32BE(text.length, 0);
   textChunk.write("tEXt", 4, "ascii");
