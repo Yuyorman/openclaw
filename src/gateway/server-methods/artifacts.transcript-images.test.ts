@@ -212,6 +212,7 @@ describe("persisted chat image artifact recovery", () => {
           source: { type: "base64", blob: "c291cmNlLWJsb2I=", media_type: "image/png" },
         },
         { type: "image", image_url: "data:image/png;base64,aW1hZ2UtdXJs" },
+        { type: "image", url: "data:image/png;base64,aGVsbG8=" },
       ];
       await seedUnindexedTranscriptForTest({
         ...scope,
@@ -239,7 +240,7 @@ describe("persisted chat image artifact recovery", () => {
               : [];
           })
         : [];
-      expect(images).toHaveLength(3);
+      expect(images).toHaveLength(4);
       for (const image of images) {
         expect(image).not.toHaveProperty("artifactId");
       }

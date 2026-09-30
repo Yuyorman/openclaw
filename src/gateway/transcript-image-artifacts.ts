@@ -95,10 +95,14 @@ function hasInlineImagePayload(block: Record<string, unknown>): boolean {
 
   const source = asOptionalRecord(block.source);
   const imageUrl = mediaUrlValue(block.image_url);
+  const url = mediaUrlValue(block.url);
+  const sourceUrl = mediaUrlValue(source?.url);
   const isLegacyInlineImage =
     typeof block.blob === "string" ||
     typeof source?.blob === "string" ||
-    (typeof imageUrl === "string" && /^data:/i.test(imageUrl));
+    [imageUrl, url, sourceUrl].some(
+      (value) => typeof value === "string" && /^data:/i.test(value),
+    );
   if (!isLegacyInlineImage) {
     return true;
   }
