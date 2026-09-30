@@ -223,7 +223,7 @@ describe("bounded Activity image discovery", () => {
         type: "image",
         title: "inline",
         mimeType: "image/png",
-        sizeBytes: 5,
+        sizeBytes: Buffer.from(PNG_BASE64, "base64").byteLength,
         source: "session-transcript",
         download: { mode: "bytes" },
         image: { url: `data:image/png;base64,${PNG_BASE64}` },
