@@ -86,23 +86,8 @@ function displayContentField(message: Record<string, unknown>): string {
 }
 
 function hasInlineImagePayload(block: Record<string, unknown>): boolean {
-  if (
-    block.type !== "image" ||
-    resolveBlockDownload(block, { includeData: false }).mode !== "bytes"
-  ) {
+  if (block.type !== "image") {
     return false;
-  }
-
-  const source = asOptionalRecord(block.source);
-  const imageUrl = mediaUrlValue(block.image_url);
-  const url = mediaUrlValue(block.url);
-  const sourceUrl = mediaUrlValue(source?.url);
-  const isLegacyInlineImage =
-    typeof block.blob === "string" ||
-    typeof source?.blob === "string" ||
-    [imageUrl, url, sourceUrl].some((value) => typeof value === "string" && /^data:/i.test(value));
-  if (!isLegacyInlineImage) {
-    return true;
   }
 
   const resolved = resolveBlockDownload(block, { includeData: true });
@@ -127,10 +112,11 @@ export function projectTranscriptImageArtifacts(message: unknown): unknown {
   let projected: unknown[] | undefined;
   for (let index = 0; index < content.length; index++) {
     const block = asOptionalRecord(content[index]);
+    const blockUrl = mediaUrlValue(block?.url);
     if (
       !block ||
       !hasInlineImagePayload(block) ||
-      (typeof block.url === "string" && block.url.trim())
+      (typeof blockUrl === "string" && !/^data:/i.test(blockUrl))
     ) {
       continue;
     }
