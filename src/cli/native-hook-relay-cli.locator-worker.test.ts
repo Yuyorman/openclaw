@@ -6,7 +6,7 @@ import { PassThrough, Readable } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { writeNativeHookRelayBridgeRecord } from "../agents/harness/native-hook-relay-store.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db-cache.js";
 import { runNativeHookRelayCliFromArgv } from "./native-hook-relay-cli.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -51,7 +51,7 @@ describe("native hook relay locator worker", () => {
           expiresAtMs: Date.now() + 60_000,
         },
       });
-      closeOpenClawStateDatabaseForTest();
+      await closeOpenClawStateDatabaseAsync();
 
       const stdout = new PassThrough();
       const stderr = new PassThrough();
@@ -64,14 +64,14 @@ describe("native hook relay locator worker", () => {
         errorOutput += chunk.toString();
       });
       const gateway = vi.fn();
-      const sql = {
-        prepare: vi.spyOn(DatabaseSync.prototype, "prepare"),
-        exec: vi.spyOn(DatabaseSync.prototype, "exec"),
-        get: vi.spyOn(StatementSync.prototype, "get"),
-        all: vi.spyOn(StatementSync.prototype, "all"),
-        run: vi.spyOn(StatementSync.prototype, "run"),
-        iterate: vi.spyOn(StatementSync.prototype, "iterate"),
-      };
+      const sql = [
+        vi.spyOn(DatabaseSync.prototype, "prepare"),
+        vi.spyOn(DatabaseSync.prototype, "exec"),
+        vi.spyOn(StatementSync.prototype, "get"),
+        vi.spyOn(StatementSync.prototype, "all"),
+        vi.spyOn(StatementSync.prototype, "run"),
+        vi.spyOn(StatementSync.prototype, "iterate"),
+      ];
       try {
         const exitCode = await runNativeHookRelayCliFromArgv(
           [
@@ -109,25 +109,16 @@ describe("native hook relay locator worker", () => {
           rawPayload,
         });
         expect(gateway).not.toHaveBeenCalled();
-        expect(
-          Object.fromEntries(
-            Object.entries(sql).map(([name, spy]) => [name, spy.mock.calls.length]),
-          ),
-        ).toEqual({
-          prepare: 0,
-          exec: 0,
-          get: 0,
-          all: 0,
-          run: 0,
-          iterate: 0,
-        });
+        for (const spy of sql) {
+          expect(spy).not.toHaveBeenCalled();
+        }
       } finally {
-        for (const spy of Object.values(sql)) {
+        for (const spy of sql) {
           spy.mockRestore();
         }
       }
     } finally {
-      closeOpenClawStateDatabaseForTest();
+      await closeOpenClawStateDatabaseAsync();
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });

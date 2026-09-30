@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createQaEvidenceInvocation } from "./evidence-invocation.js";
 import {
   getEffectiveQaEvidenceEntries,
@@ -9,15 +9,13 @@ import {
   validateQaEvidenceSummaryJson,
   type QaEvidenceIdentity,
 } from "./evidence-summary.js";
+import { mockBunVersion } from "./runtime-version.test-support.js";
 import { createQaSuiteEvidenceInvocation, rebaseQaSuiteEvidence } from "./suite-evidence.js";
 import { makeQaSuiteTestScenario } from "./suite-test-helpers.js";
 import { createTempDirHarness } from "./temp-dir.test-helper.js";
 
 const tempDirs = createTempDirHarness();
-afterEach(async () => {
-  vi.unstubAllGlobals();
-  await tempDirs.cleanup();
-});
+afterEach(() => tempDirs.cleanup());
 const launch: QaEvidenceIdentity = {
   source: { ref: "fixture-source", integrity: "fixture-integrity" },
   runtime: { id: "node", version: "fixture-version" },
@@ -36,23 +34,24 @@ async function setup() {
     channel: "qa-channel",
     launch,
   });
+  const context: Parameters<typeof createQaSuiteEvidenceInvocation>[1] = {
+    outputDir,
+    repoRoot: outputDir,
+    selectedScenarios,
+    primaryModel: "mock-openai/test",
+    providerMode: "mock-openai",
+    transportId: "qa-channel",
+  };
   const evidence = await createQaSuiteEvidenceInvocation(
     { evidenceAnchors: parent.anchors },
-    {
-      outputDir,
-      repoRoot: outputDir,
-      selectedScenarios,
-      primaryModel: "mock-openai/test",
-      providerMode: "mock-openai",
-      transportId: "qa-channel",
-    },
+    context,
   );
-  return { outputDir, evidence };
+  return { outputDir, evidence, context };
 }
 
 describe("flow occurrence artifacts", () => {
-  it("carries simulated Bun capture into prepared receipts and preserves explicit anchors", async () => {
-    vi.stubGlobal("process", { ...process, versions: { ...process.versions, bun: "1.3.14" } });
+  it("carries simulated Bun capture into prepared receipts", async () => {
+    using _ = mockBunVersion("1.3.14");
     const outputDir = await tempDirs.makeTempDir("qa-captured-launch-");
     const evidence = await createQaSuiteEvidenceInvocation(undefined, {
       repoRoot: outputDir,
@@ -69,15 +68,6 @@ describe("flow occurrence artifacts", () => {
     expect(occurrence.receipts).toEqual([
       expect.objectContaining({ phase: "prepared", identity: occurrence.launch }),
     ]);
-
-    const supplied = await setup();
-    const explicitId = supplied.evidence.invocation.begin(0);
-    await supplied.evidence.record(0, explicitId, { name: "explicit", status: "pass", steps: [] });
-    const explicit = supplied.evidence
-      .snapshot()
-      .occurrences.find((item) => item.id === explicitId)!;
-    expect(explicit.launch).toEqual(launch);
-    expect(explicit.receipts[0]?.identity).toEqual(launch);
   });
 
   it.each(["full", "slim"] as const)(
@@ -121,6 +111,11 @@ describe("flow occurrence artifacts", () => {
       const childReceipts = child.occurrences.find((item) => item.id === id)!.receipts;
       expect(childReceipts[0]!.artifact.path).toBe(`../../${receipt.artifact.path}`);
       expect(childReceipts.slice(1).map((item) => item.artifact)).toEqual(preserved);
+      if (evidenceMode === "full") {
+        expect(child.entries[0]?.execution?.artifacts[0]?.path).toBe(
+          childReceipts[0]!.artifact.path,
+        );
+      }
       expect(rebaseQaSuiteEvidence(child, workerDir, outputDir)).toEqual(original);
       expect(JSON.stringify(original)).toBe(before);
       expect(child.entries[0]?.execution === undefined).toBe(evidenceMode === "slim");
@@ -130,7 +125,7 @@ describe("flow occurrence artifacts", () => {
   );
 
   it("returns the original failed result when a continued retry skips", async () => {
-    const { outputDir, evidence } = await setup();
+    const { evidence, context } = await setup();
     const first = evidence.invocation.begin(0);
     const failure = {
       name: "original",
@@ -139,17 +134,9 @@ describe("flow occurrence artifacts", () => {
       steps: [{ name: "original step", status: "fail" as const, details: "original detail" }],
     };
     const original = await evidence.record(0, first, failure);
-    const scenario = makeQaSuiteTestScenario("same-label");
     const continued = await createQaSuiteEvidenceInvocation(
       { evidenceAnchors: evidence.invocation.anchors, evidenceContinuation: evidence.snapshot() },
-      {
-        outputDir,
-        repoRoot: outputDir,
-        selectedScenarios: [scenario, scenario],
-        primaryModel: "mock-openai/test",
-        providerMode: "mock-openai",
-        transportId: "qa-channel",
-      },
+      context,
     );
     const retry = continued.invocation.begin(0);
     expect(await continued.record(0, retry, { name: "retry", status: "skip", steps: [] })).toEqual(
@@ -193,28 +180,6 @@ describe("flow occurrence artifacts", () => {
       evidence.record(0, first, { name: "overwrite", status: "fail", steps: [] }),
     ).rejects.toMatchObject({ code: "EEXIST" });
     expect(evidence.snapshot()).toMatchObject({ entries: summary.entries });
-  });
-
-  it("rebases raw and receipt artifacts together without changing their identity", async () => {
-    const { outputDir, evidence } = await setup();
-    const id = evidence.invocation.begin(0);
-    await evidence.record(0, id, { name: "child", status: "pass", steps: [] });
-    const summary = evidence.snapshot();
-    const parent = rebaseQaSuiteEvidence(summary, outputDir, path.dirname(outputDir));
-    expect(parent.schemaVersion).toBe(3);
-    if (parent.schemaVersion !== 3) {
-      throw new Error("expected occurrence evidence");
-    }
-    const before = summary.occurrences.find((occurrence) => occurrence.id === id)!.receipts[0]!;
-    const after = parent.occurrences.find((occurrence) => occurrence.id === id)!.receipts[0]!;
-    expect(after).toEqual({
-      ...before,
-      artifact: { ...before.artifact, path: `${path.basename(outputDir)}/${before.artifact.path}` },
-    });
-    expect(parent.entries[0]?.execution?.artifacts[0]?.path).toBe(after.artifact.path);
-    expect(summary.occurrences.find((occurrence) => occurrence.id === id)!.receipts[0]).toEqual(
-      before,
-    );
   });
 
   it.each(["pass", "fail"] as const)(

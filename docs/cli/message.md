@@ -25,6 +25,11 @@ openclaw message <subcommand> [flags]
 - Channel-prefixed targets (for example `discord:channel:123`) resolve the
   owning plugin without an explicit `--channel`.
 
+With an explicit channel, Gateway-owned actions such as `read --channel discord`
+validate config without running local state migrations. They require a reachable
+Gateway. Local actions, broadcasts, dry-runs, and commands that need local channel
+discovery retain local config and plugin preparation.
+
 ## Agent ownership
 
 `openclaw message` uses the configured
@@ -113,7 +118,7 @@ unresolved SecretRef on the selected channel/account fails the action closed.
 | `pin` / `unpin` | Discord, Matrix, Microsoft Teams, Slack                                                                         | `--message-id`, `--target`                                     | `unpin` also accepts `--pinned-message-id` (Microsoft Teams: the pin/list-pins resource id, not the chat message id).                                                                                                                                                                                  |
 | `pins` (list)   | Discord, Matrix, Microsoft Teams, Slack                                                                         | `--target`                                                     | `--limit`.                                                                                                                                                                                                                                                                                             |
 | `permissions`   | Discord, Matrix                                                                                                 | `--target`                                                     | Matrix: available only when encryption is enabled and verification actions are allowed.                                                                                                                                                                                                                |
-| `search`        | Discord                                                                                                         | `--guild-id`, `--query`                                        | `--channel-id`, `--channel-ids` (repeat), `--author-id`, `--author-ids` (repeat), `--limit`.                                                                                                                                                                                                           |
+| `search`        | Discord, Microsoft Teams                                                                                        | `--query`                                                      | `--guild-id` (Discord; resolved from `--channel-id` when omitted), `--channel-id` (required for Microsoft Teams as Graph `<team-id>/<channel-id>`), `--channel-ids` (repeat), `--author-id`, `--author-ids` (repeat), `--limit`.                                                                       |
 | `member info`   | Discord, Matrix, Microsoft Teams, Slack                                                                         | `--user-id`                                                    | `--channel-id` (required for Matrix and Microsoft Teams), `--guild-id` (Discord).                                                                                                                                                                                                                      |
 
 Reaction listings show labels, counts, and available users as plain terminal text.
@@ -144,7 +149,8 @@ openclaw message send --channel discord \
 ```
 
 - `--media <path-or-url>`: attach image/audio/video/document (local path or
-  URL).
+  URL). Repeat to send multiple files in order; Telegram groups consecutive
+  photos into [albums](/channels/telegram/media#photo-albums).
 - `--presentation <json>`: shared payload with `text`, `context`, `divider`,
   `chart`, `table`, `buttons`, and `select` blocks, rendered per channel
   capability. See [Message Presentation](/plugins/message-presentation).
@@ -202,6 +208,11 @@ openclaw message send --channel telegram --target 123456789 --message "Open app:
 ```bash
 openclaw message send --channel telegram --target @mychat \
   --media ./diagram.png --force-document
+```
+
+```bash
+openclaw message send --channel telegram --target @mychat \
+  --message "Trip photos" --media ./photo-1.jpg --media ./photo-2.jpg
 ```
 
 ```bash

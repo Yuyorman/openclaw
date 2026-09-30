@@ -61,17 +61,6 @@ async function resolveLoader(
   return loadPublishedPreparedModelCatalogOwnerSnapshot;
 }
 
-// Isolated gateway tests share process module state with lifecycle-owner tests.
-export async function resetPreparedModelCatalogStateForTest(): Promise<void> {
-  const [{ resetPreparedModelRuntimeSnapshotsForTest }, { resetModelCatalogBuilderCacheForTest }] =
-    await Promise.all([
-      import("../agents/prepared-model-runtime.test-support.js"),
-      import("../agents/model-catalog.js"),
-    ]);
-  await resetPreparedModelRuntimeSnapshotsForTest();
-  resetModelCatalogBuilderCacheForTest();
-}
-
 async function loadGatewayModelCatalogOwnerSnapshot(
   params?: LoadPreparedGatewayModelCatalogParams,
 ): Promise<{
@@ -125,22 +114,14 @@ export async function loadPreparedGatewayModelCatalogSnapshot(
 ): Promise<PreparedGatewayModelCatalogSnapshot> {
   for (;;) {
     let loaded: Awaited<ReturnType<typeof loadGatewayModelCatalogOwnerSnapshot>>;
-    try {
-      loaded = await loadGatewayModelCatalogOwnerSnapshot(params);
-    } catch (error) {
-      if (error instanceof PreparedModelRuntimePublicationSupersededError) {
-        continue;
-      }
-      throw error;
-    }
-    const { candidate, owner } = loaded;
     let refreshedAuth: Awaited<ReturnType<typeof loadPreparedModelRuntimeAuth>>;
     try {
+      loaded = await loadGatewayModelCatalogOwnerSnapshot(params);
       refreshedAuth = params?.refreshAuth
         ? await loadPreparedModelRuntimeAuth(
-            candidate,
+            loaded.candidate,
             params.authScope ?? {
-              providerIds: owner.modelCatalog.entries.map((entry) => entry.provider),
+              providerIds: loaded.owner.modelCatalog.entries.map((entry) => entry.provider),
             },
           )
         : undefined;
@@ -152,6 +133,7 @@ export async function loadPreparedGatewayModelCatalogSnapshot(
       }
       throw error;
     }
+    const { owner } = loaded;
     return {
       ...projectGatewayModelCatalogSnapshot(owner),
       authModes: refreshedAuth?.authModes ?? owner.authModes,
@@ -161,6 +143,7 @@ export async function loadPreparedGatewayModelCatalogSnapshot(
       pluginRegistry: owner.pluginRegistry,
       isCurrent: owner.isCurrent,
       observationConfig: owner.observationConfig,
+      accountCatalog: owner.accountCatalog,
     };
   }
 }
@@ -176,6 +159,7 @@ export async function loadGatewayModelCatalogSnapshot(
     pluginRegistry: _pluginRegistry,
     isCurrent: _isCurrent,
     observationConfig: _observationConfig,
+    accountCatalog: _accountCatalog,
     ...snapshot
   } = await loadPreparedGatewayModelCatalogSnapshot(params);
   return snapshot;
@@ -231,23 +215,29 @@ export async function readPreparedGatewayModelCatalogBatch(
   if (agentIds.length === 0) {
     return [];
   }
-  const { getPreparedModelCatalogOwnerSnapshot } =
+  const { getPreparedModelCatalogOwnerSnapshot, withPreparedModelRuntimeReadBatch } =
     await import("../agents/prepared-model-catalog.js");
   const config = (params?.getConfig ?? getRuntimeConfig)();
-  // Resolve all owners synchronously so roster facts cannot survive a yield or config change.
-  return withAgentRosterFactsBatch(config, () =>
-    agentIds.map((agentId): PreparedGatewayModelCatalogReadResult => {
-      try {
-        return {
-          status: "fulfilled",
-          value: readPreparedGatewayModelCatalogSync(getPreparedModelCatalogOwnerSnapshot, config, {
-            agentId,
-          }),
-        };
-      } catch (reason) {
-        return { status: "rejected", reason };
-      }
-    }),
+  // Both read scopes end before yielding, so publication cannot leave stale candidates behind.
+  return withPreparedModelRuntimeReadBatch(() =>
+    withAgentRosterFactsBatch(config, () =>
+      agentIds.map((agentId): PreparedGatewayModelCatalogReadResult => {
+        try {
+          return {
+            status: "fulfilled",
+            value: readPreparedGatewayModelCatalogSync(
+              getPreparedModelCatalogOwnerSnapshot,
+              config,
+              {
+                agentId,
+              },
+            ),
+          };
+        } catch (reason) {
+          return { status: "rejected", reason };
+        }
+      }),
+    ),
   );
 }
 
@@ -255,9 +245,17 @@ export async function readPreparedGatewayModelCatalogBatch(
 export async function readPreparedGatewayModelCatalogOwnerSnapshot(
   params?: LoadGatewayModelCatalogParams,
 ): Promise<PreparedGatewayModelCatalogSnapshot | undefined> {
-  const { getPublishedPreparedModelCatalogOwnerSnapshot, materializePreparedModelCatalogOwner } =
-    await import("../agents/prepared-model-catalog.js");
+  const {
+    getPublishedPreparedModelCatalogOwnerSnapshot,
+    getPendingPreparedModelRuntimeReplacement,
+    materializePreparedModelCatalogOwner,
+  } = await import("../agents/prepared-model-catalog.js");
   const config = (params?.getConfig ?? getRuntimeConfig)();
+  const replacement = getPendingPreparedModelRuntimeReplacement();
+  if (replacement) {
+    await replacement;
+    return readPreparedGatewayModelCatalogOwnerSnapshot(params);
+  }
   const candidate = getPublishedPreparedModelCatalogOwnerSnapshot({
     ...(params?.agentId ? { agentId: params.agentId } : {}),
     ...(params?.agentDir ? { agentDir: params.agentDir } : {}),
@@ -278,5 +276,6 @@ export async function readPreparedGatewayModelCatalogOwnerSnapshot(
     pluginRegistry: owner.pluginRegistry,
     isCurrent: owner.isCurrent,
     observationConfig: owner.observationConfig,
+    accountCatalog: owner.accountCatalog,
   };
 }

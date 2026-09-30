@@ -3,6 +3,7 @@ import { asRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   deleteCronJobRowInDatabase,
   fingerprintCronJobRows,
+  fingerprintCronRuntimeRows,
   loadedCronStoreFromRows,
   loadCronRows,
 } from "./row-codec.js";
@@ -11,7 +12,7 @@ import {
   repairCronRuntimeAuthorityRows,
 } from "./runtime-authority-store.js";
 import { tryParseJsonObject } from "./scalar-codec.js";
-import type { CronJobRow } from "./schema.js";
+import type { CronJobReadRow } from "./schema.js";
 import type { LoadedCronStore } from "./types.js";
 
 type CronLoadWriter = {
@@ -19,7 +20,7 @@ type CronLoadWriter = {
   committed(): void;
 };
 
-function isRetiredCollectionReview(row: CronJobRow): boolean {
+function isRetiredCollectionReview(row: CronJobReadRow): boolean {
   return (
     row.payload_kind === "skillCollectionReview" ||
     asRecord(tryParseJsonObject(row.job_json)?.payload).kind === "skillCollectionReview"
@@ -65,7 +66,13 @@ export function loadCronStoreFromDatabase(
       });
     }
   }
-  return !writer ? loaded : { ...loaded, jobsFingerprint: fingerprintCronJobRows(rows) };
+  return !writer
+    ? loaded
+    : {
+        ...loaded,
+        jobsFingerprint: fingerprintCronJobRows(rows),
+        runtimeFingerprint: fingerprintCronRuntimeRows(rows),
+      };
 }
 
 function repairLoadedCronRuntimeAuthority(

@@ -19,7 +19,7 @@ export class OpenClawAssistantPanelContent extends OpenClawLightDomElement {
   @property() destination: "home" | "custodian" = "custodian";
   @property() sessionKey = "";
   @property() agentId = "";
-  @property({ attribute: false }) context: ApplicationContext<RouteId> | undefined;
+  @property({ attribute: false }) context: ApplicationContext | undefined;
   @property() pageRouteId: RouteId = "chat";
   @property() pageSessionKey = "";
   @property() pageAgentId = "";
@@ -30,26 +30,14 @@ export class OpenClawAssistantPanelContent extends OpenClawLightDomElement {
   constructor() {
     super();
     void new SubscriptionsController(this)
-      .watch(
-        () => this.store ?? custodianSessionStore,
-        (store, notify) => store.subscribe(notify),
-      )
+      .watchStore(() => this.store ?? custodianSessionStore)
       .watch(
         () => this.context,
         (context, notify) => subscribeChatWorkContext(context, notify),
       )
-      .watch(
-        () => this.context?.sessions,
-        (sessions, notify) => sessions.subscribe(notify),
-      )
-      .watch(
-        () => this.context?.agents,
-        (agents, notify) => agents.subscribe(notify),
-      )
-      .watch(
-        () => this.context?.gateway,
-        (gateway, notify) => gateway.subscribe(notify),
-      );
+      .watchStore(() => this.context?.sessions)
+      .watchStore(() => this.context?.agents)
+      .watchStore(() => this.context?.gateway);
   }
 
   override connectedCallback(): void {

@@ -2,7 +2,6 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { expect, it } from "vitest";
 import { SKILL_RESOURCE_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/skill-resources.js";
-import { WORKER_SKILL_WORKSHOP_FEATURE } from "../../../packages/gateway-protocol/src/schema/worker-skill-workshop.js";
 import { installSessionPlacementAdmissionProvider } from "../../../src/agents/session-placement-admission.js";
 import { SessionManager } from "../../../src/agents/sessions/session-manager.js";
 import { makeAgentAssistantMessage } from "../../../src/agents/test-helpers/agent-message-fixtures.js";
@@ -26,6 +25,7 @@ import {
   ENVIRONMENT_ID,
   MANIFEST_REF,
   measureLaunchTurn,
+  readLaunchToolNames,
   OWNER_EPOCH,
   unusedEnvironments,
 } from "../../../src/gateway/worker-environments/worker-turn-launcher.test-support.js";
@@ -162,6 +162,7 @@ suite.define(() => {
             timeoutMs: 5000,
           }),
         measureLaunchTurn,
+        readLaunchToolNames,
         launchTurn: async (request) => {
           request.onDispatchReady?.();
           launched.push(request.turnClaim.runId);
@@ -203,6 +204,8 @@ suite.define(() => {
             changed: false,
             verifyStable: async () => {},
             verifyLocalStable: async () => {},
+            publishStagedResult: async () => {},
+            discardPreparedStagedResult: async () => {},
           };
         },
         stop: async () => {},
@@ -222,20 +225,22 @@ suite.define(() => {
                   protocolFeatures: [
                     ...environment.bootstrapReceipt!.protocolFeatures,
                     SKILL_RESOURCE_PROTOCOL_FEATURE,
-                    WORKER_SKILL_WORKSHOP_FEATURE,
                   ],
                 },
               };
             },
             acquireTurnCredential: async () => ({ ...credential(), sessionId }),
-            acknowledgeCredentialDelivery: () => true,
+            acknowledgeCredentialDelivery: async () => true,
             startTunnel: async () => tunnel,
           },
           resolveWorkspace: async () => ({ kind: "local", path: workspace }),
           reconcileActivePlacement: async () => {
             throw new Error("unexpected recovery");
           },
-          redispatchReclaimed: async () => {
+          waitForAdmissionNode: async () => {
+            throw new Error("unexpected runtime refresh");
+          },
+          redispatchPlacement: async () => {
             throw new Error("unexpected redispatch");
           },
           workspaceOperations: createWorkerWorkspaceOperationCoordinator(),

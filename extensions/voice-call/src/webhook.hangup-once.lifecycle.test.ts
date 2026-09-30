@@ -1,7 +1,7 @@
 // Voice Call tests cover webhook.hangup once.lifecycle plugin behavior.
 import crypto from "node:crypto";
 import fs from "node:fs";
-import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
+import type { OpenAsyncKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
   createPluginStateKeyedStoreForTests,
   resetPluginStateStoreForTests,
@@ -25,7 +25,7 @@ function installStateRuntime(): void {
   setVoiceCallStateRuntime({
     state: {
       resolveStateDir: () => "",
-      openKeyedStore: (options: OpenKeyedStoreOptions) =>
+      openKeyedStore: (options: OpenAsyncKeyedStoreOptions) =>
         createPluginStateKeyedStoreForTests("voice-call", options),
       openChannelIngressQueue: (() => {
         throw new Error(
@@ -53,29 +53,11 @@ const createConfig = (overrides: Partial<VoiceCallConfig> = {}): VoiceCallConfig
   return {
     ...base,
     ...overrides,
-    serve: {
-      ...base.serve,
-      ...overrides.serve,
-    },
   };
 };
 
-async function postWebhookForm(server: VoiceCallWebhookServer, baseUrl: string, body: string) {
-  const address = (
-    server as unknown as { server?: { address?: () => unknown } }
-  ).server?.address?.();
-  const requestUrl = new URL(baseUrl);
-  if (
-    !address ||
-    typeof address !== "object" ||
-    !("port" in address) ||
-    (typeof address.port !== "number" && typeof address.port !== "string") ||
-    !address.port
-  ) {
-    throw new Error("voice webhook server did not expose a bound port");
-  }
-  requestUrl.port = String(address.port);
-  return await fetch(requestUrl.toString(), {
+async function postWebhookForm(baseUrl: string, body: string) {
+  return await fetch(baseUrl, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -94,8 +76,8 @@ async function runDuplicateInboundReplayLifecycleTest(provider: FakeProvider) {
 
   try {
     const baseUrl = await server.start();
-    const first = await postWebhookForm(server, baseUrl, "CallSid=CA123&From=%2B15552222222");
-    const second = await postWebhookForm(server, baseUrl, "CallSid=CA123&From=%2B15552222222");
+    const first = await postWebhookForm(baseUrl, "CallSid=CA123&From=%2B15552222222");
+    const second = await postWebhookForm(baseUrl, "CallSid=CA123&From=%2B15552222222");
     return { first, second, manager };
   } finally {
     await server.stop();
@@ -244,7 +226,7 @@ describe("Voice-call webhook hangup-once lifecycle", () => {
       const openStore = state.openKeyedStore.bind(state);
       const fault = vi
         .spyOn(state, "openKeyedStore")
-        .mockImplementation(<T>(options: OpenKeyedStoreOptions) => {
+        .mockImplementation(<T>(options: OpenAsyncKeyedStoreOptions) => {
           const store = openStore<T>(options);
           store.entries = async () => {
             throw new Error("synthetic signed callback history failure");
@@ -296,11 +278,7 @@ describe("Voice-call webhook hangup-once lifecycle", () => {
 
     try {
       const baseUrl = await firstServer.start();
-      const first = await postWebhookForm(
-        firstServer,
-        baseUrl,
-        "CallSid=CA123&From=%2B15552222222",
-      );
+      const first = await postWebhookForm(baseUrl, "CallSid=CA123&From=%2B15552222222");
       expect(first.status).toBe(200);
     } finally {
       await firstServer.stop();
@@ -314,11 +292,7 @@ describe("Voice-call webhook hangup-once lifecycle", () => {
 
     try {
       const baseUrl = await secondServer.start();
-      const replay = await postWebhookForm(
-        secondServer,
-        baseUrl,
-        "CallSid=CA123&From=%2B15552222222",
-      );
+      const replay = await postWebhookForm(baseUrl, "CallSid=CA123&From=%2B15552222222");
       expect(replay.status).toBe(200);
     } finally {
       await secondServer.stop();

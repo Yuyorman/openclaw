@@ -1,5 +1,3 @@
-// Gateway plugin runtime adapter.
-// Loads plugin registries and builds fallback request context for non-WS paths.
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
@@ -8,7 +6,11 @@ import { allowsProcessHomeSessionScan } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
 import { extractPluginInstallRecordsFromInstalledPluginIndex } from "../plugins/installed-plugin-index-install-records.js";
-import type { ChannelPluginLoadIntent } from "../plugins/loader-types.js";
+import type {
+  ChannelPluginLoadIntent,
+  PluginLoadOptions,
+  PluginRuntimeRecovery,
+} from "../plugins/loader-types.js";
 import { loadOpenClawPlugins } from "../plugins/loader.js";
 import { loadPluginLookUpTable, type PluginLookUpTable } from "../plugins/plugin-lookup-table.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
@@ -32,9 +34,8 @@ import type {
   PluginRuntime,
   RuntimeGatewayRequestOptions,
 } from "../plugins/runtime/types.js";
-import type { PluginOrigin } from "../plugins/types.js";
 import { authorizeOperatorScopesForRequiredScope } from "./method-scopes.js";
-import { normalizeOperatorScopeList, type OperatorScope } from "./operator-scopes.js";
+import { normalizeOperatorScopeList } from "./operator-scopes.js";
 import type { GatewayNodeInvokeStream } from "./server-methods/shared-types.js";
 import type { GatewayContextResolver, GatewayRequestHandler } from "./server-methods/types.js";
 import {
@@ -64,18 +65,6 @@ export type { GatewayMethodDispatchResponse } from "./server-plugin-in-process-d
 export { runWithOperatorToolGatewayCleanupContext } from "./server-plugin-in-process-dispatch.js";
 export { hasInProcessGatewayContext } from "./server-plugins-node-runtime.js";
 export { createGatewaySubagentRuntime } from "./server-plugin-subagent-runtime.js";
-
-// ── Internal gateway dispatch for plugin runtime ────────────────────
-
-function resolveRuntimeNodeInvokeSyntheticScopes(params: {
-  pluginId?: string;
-  pluginOrigin?: PluginOrigin;
-  pluginTrustedOfficialInstall?: boolean;
-  requestedScopes?: OperatorScope[];
-}): OperatorScope[] | undefined {
-  // Requested scopes may replace caller scopes, so only bundled or trusted official plugins qualify.
-  return canTrustedOfficialPluginRequestScopes(params) ? params.requestedScopes : undefined;
-}
 
 export async function dispatchTrustedPluginGatewayMethod<T>(
   method: string,
@@ -116,12 +105,11 @@ export function createGatewayNodesRuntime(
   ) => {
     const scope = getPluginRuntimeGatewayRequestScope();
     const pluginId = scope?.pluginId?.trim() || undefined;
-    const requestedScopes = resolveRuntimeNodeInvokeSyntheticScopes({
-      pluginId,
-      pluginOrigin: scope?.pluginOrigin,
-      pluginTrustedOfficialInstall: scope?.pluginTrustedOfficialInstall,
-      requestedScopes: normalizeOperatorScopeList(params.scopes),
-    });
+    const normalizedScopes = normalizeOperatorScopeList(params.scopes);
+    // Requested scopes may replace caller scopes, so only trusted plugins qualify.
+    const requestedScopes = canTrustedOfficialPluginRequestScopes({ ...scope, pluginId })
+      ? normalizedScopes
+      : undefined;
     const callerScopes =
       stream && scope?.client
         ? (normalizeOperatorScopeList(scope.client.connect.scopes) ?? [])
@@ -236,8 +224,6 @@ function createGatewayPluginRuntimeBindings(
   };
 }
 
-// ── Plugin loading ──────────────────────────────────────────────────
-
 export function loadGatewayPlugins(params: {
   cfg: OpenClawConfig;
   activationSourceConfig?: OpenClawConfig;
@@ -267,6 +253,10 @@ export function loadGatewayPlugins(params: {
   previousRegistry?: import("../plugins/registry-types.js").PluginRegistry;
   replacePluginIds?: ReadonlySet<string>;
   expectedSourceDigests?: Readonly<Record<string, string>>;
+  /** Metadata-only replacement preflight; never executes plugin registration. */
+  loadModules?: boolean;
+  moduleRecoveries?: ReadonlyMap<string, PluginRuntimeRecovery>;
+  prepareRegistrationFailureCleanup?: PluginLoadOptions["prepareRegistrationFailureCleanup"];
   env?: NodeJS.ProcessEnv;
 }) {
   const started = performance.now();
@@ -333,6 +323,9 @@ export function loadGatewayPlugins(params: {
           throwOnLoadError: params.loadIntent === "replacement",
           previousRegistry: params.previousRegistry,
           replacePluginIds: params.replacePluginIds ? [...params.replacePluginIds] : undefined,
+          loadModules: params.loadModules,
+          moduleRecoveries: params.moduleRecoveries,
+          prepareRegistrationFailureCleanup: params.prepareRegistrationFailureCleanup,
           // Startup registration stays scoped; later capability loads use the complete bound generation.
           manifestRegistry:
             params.pluginLookUpTable?.manifestRegistry ?? loadContext.manifestRegistry,

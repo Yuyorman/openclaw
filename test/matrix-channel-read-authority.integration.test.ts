@@ -16,7 +16,7 @@ import { createMessageCliHelpers } from "../src/cli/program/message/helpers.js";
 import { registerMessageDiscordAdminCommands } from "../src/cli/program/message/register.discord-admin.js";
 import { messageCommand } from "../src/commands/message.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../src/config/config.js";
-import { createAgentRuntimeApprovalAuthorityValidator } from "../src/gateway/agent-runtime-identity-token.js";
+import { createAgentRuntimeApprovalAuthorityValidator } from "../src/gateway/agent-runtime-approval-authority.js";
 import {
   mintMessageActionTurnCapability,
   revokeMessageActionTurnCapability,
@@ -32,6 +32,7 @@ import { createPluginRegistry } from "../src/plugins/registry.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../src/plugins/runtime.js";
 import { createPluginRuntime } from "../src/plugins/runtime/index.js";
 import { createPluginRecord } from "../src/plugins/status.test-fixtures.js";
+import { closeOpenClawStateDatabaseAsync } from "../src/state/openclaw-state-db.js";
 import { useAutoCleanupTempDirTracker } from "./helpers/temp-dir.js";
 
 const originRoom = "!origin:example.org";
@@ -56,7 +57,12 @@ const toolContext = {
   currentChannelId: originRoom,
   currentChatType: "group" as const,
 };
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
+  afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
+    cleanup();
+  }),
+);
 
 beforeEach(() => {
   vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("openclaw-matrix-read-authority-"));

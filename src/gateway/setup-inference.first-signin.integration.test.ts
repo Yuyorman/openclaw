@@ -16,13 +16,70 @@ afterEach(() => {
 it(
   "activates the first device sign-in through openclaw.setup.auth.start and the embedded probe",
   { timeout: 90_000 },
-  async () => {
+  async ({ signal, onTestFinished }) => {
     const requests: string[] = [];
+    const startedAt = performance.now();
+    const requestPhases = new Map([
+      ["https://github.com/login/device/code", "device-code"],
+      ["https://github.com/login/oauth/access_token", "access-token"],
+      ["https://api.github.com/copilot_internal/user", "account"],
+      ["https://api.individual.githubcopilot.com/models", "models"],
+      ["https://api.individual.githubcopilot.com/v1/messages", "probe"],
+      ["https://catalog.openclaw.ai/models/v2/catalog.json", "catalog-refresh"],
+    ]);
+    let lastRequestPhase: string | undefined;
+    let lastRequestElapsedMs: number | undefined;
+    let phase = "fixture-setup";
+    const phaseTransitions = [{ phase, elapsedMs: 0 }];
+    const markPhase = (nextPhase: string) => {
+      phase = nextPhase;
+      phaseTransitions.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) });
+    };
+    let wizardSteps = 0;
+    let wizardStepType: string | undefined;
+    let wizardProgressPhase: "device-code" | "browser" | "testing" | "other" | undefined;
+    let wizardProgressElapsedMs: number | undefined;
+    const reportAbort = () => {
+      console.error("[setup-first-signin] test aborted", {
+        phase,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        phaseTransitions,
+        mockedRequests: requests.length,
+        lastRequestPhase,
+        lastRequestElapsedMs,
+        deviceCodeRequests: requests.filter((url) => url === "https://github.com/login/device/code")
+          .length,
+        tokenRequests: requests.filter(
+          (url) => url === "https://github.com/login/oauth/access_token",
+        ).length,
+        accountRequests: requests.filter(
+          (url) => url === "https://api.github.com/copilot_internal/user",
+        ).length,
+        modelRequests: requests.filter(
+          (url) => url === "https://api.individual.githubcopilot.com/models",
+        ).length,
+        probeRequests: requests.filter(
+          (url) => url === "https://api.individual.githubcopilot.com/v1/messages",
+        ).length,
+        catalogRequests: requests.filter(
+          (url) => url === "https://catalog.openclaw.ai/models/v2/catalog.json",
+        ).length,
+        wizardSteps,
+        wizardStepType,
+        wizardProgressPhase,
+        wizardProgressElapsedMs,
+      });
+    };
+    // Capture the deadline phase before teardown can advance the pending test.
+    signal.addEventListener("abort", reportAbort, { once: true });
+    onTestFinished(() => signal.removeEventListener("abort", reportAbort));
     // Inventory refresh runs in another thread; the setup probe owns this test's transport.
     vi.spyOn(catalogRefresh, "refreshCommittedProviderCatalogs").mockImplementation(() => {});
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = new URL(input instanceof Request ? input.url : input);
       requests.push(`${url.origin}${url.pathname}`);
+      lastRequestPhase = requestPhases.get(`${url.origin}${url.pathname}`) ?? "other";
+      lastRequestElapsedMs = Math.round(performance.now() - startedAt);
       switch (`${url.origin}${url.pathname}`) {
         case "https://github.com/login/device/code":
           return Response.json({
@@ -110,6 +167,7 @@ it(
         const recoveryRestart = vi.fn(() => {
           throw new Error("Setup must complete without a recovery restart");
         });
+        markPhase("gateway-start-and-connect");
         const { client, server } = await startGatewayWithClient({
           configPath: state.configPath,
           token: "synthetic-gateway-token",
@@ -122,6 +180,7 @@ it(
             },
             agents: { defaults: { workspace: state.workspaceDir, skipBootstrap: true } },
             plugins: {
+              allow: ["github-copilot"],
               slots: { memory: "none" },
               entries: { "github-copilot": { enabled: true } },
             },
@@ -130,25 +189,44 @@ it(
           },
         });
         try {
+          markPhase("gateway-startup-settlement");
           await server.startupSettled;
           const sessionId = "first-device-signin";
+          markPhase("setup-auth-start");
           await client.request("openclaw.setup.auth.start", {
             sessionId,
             agentId: "main",
             authChoice: "github-copilot",
             nativeSessionCatalogsEnabled: false,
           });
+          markPhase("wizard-next");
           let result = await client.request<WizardNextResult>("wizard.next", { sessionId });
           while (!result.done) {
             const step = result.step;
             if (!step) {
               throw new Error("Setup wizard did not return a step");
             }
+            wizardSteps += 1;
+            wizardStepType = step.type;
+            wizardProgressPhase = undefined;
+            wizardProgressElapsedMs = undefined;
+            if (step.type === "progress") {
+              // Later progress retains the device-code presentation as a prefix.
+              wizardProgressPhase = step.message?.endsWith("Testing your AI connection…")
+                ? "testing"
+                : step.message?.endsWith("Complete sign-in in your browser.")
+                  ? "browser"
+                  : step.deviceCode
+                    ? "device-code"
+                    : "other";
+              wizardProgressElapsedMs = Math.round(performance.now() - startedAt);
+            }
             result = await client.request<WizardNextResult>("wizard.next", {
               sessionId,
               answer: { stepId: step.id, value: step.type === "confirm" ? true : null },
             });
           }
+          markPhase("activation-assertions");
           expect(result, JSON.stringify(result)).toMatchObject({
             status: "done",
             modelActivation: { modelRef: "github-copilot/claude-sonnet-5" },
@@ -177,8 +255,11 @@ it(
             `github-copilot/claude-sonnet-5@${profileId}`,
           );
         } finally {
+          markPhase("client-disconnect");
           await disconnectGatewayClient(client);
+          markPhase("server-close");
           await server.close({ reason: "first sign-in test complete" });
+          markPhase("fixture-drain");
         }
       },
     );

@@ -1,4 +1,3 @@
-// Feishu plugin module implements post behavior.
 import {
   isRecord,
   normalizeLowercaseStringOrEmpty,
@@ -117,7 +116,7 @@ function renderElement(
     return escapeMarkdownText(toStringOrEmpty(element));
   }
 
-  const tag = normalizeLowercaseStringOrEmpty(toStringOrEmpty(element.tag));
+  const tag = normalizeLowercaseStringOrEmpty(element.tag);
   switch (tag) {
     case "text":
       return applyInlineStyles(escapeMarkdownText(toStringOrEmpty(element.text)), element.style);
@@ -196,29 +195,30 @@ function resolveLocalePayload(candidate: unknown): PostPayload | null {
 }
 
 function resolvePostPayload(parsed: unknown): PostPayload | null {
-  const direct = toPostPayload(parsed);
-  if (direct) {
-    return direct;
-  }
-
-  if (!isRecord(parsed)) {
-    return null;
-  }
-
-  const wrappedPost = resolveLocalePayload(parsed.post);
-  if (wrappedPost) {
-    return wrappedPost;
-  }
-
-  return resolveLocalePayload(parsed);
+  return (
+    toPostPayload(parsed) ??
+    (isRecord(parsed) ? (resolveLocalePayload(parsed.post) ?? resolveLocalePayload(parsed)) : null)
+  );
 }
 
-export function parsePostContent(
-  content: string,
-  options: { renderMediaPlaceholders?: boolean; emptyTextFallback?: string } = {},
+type PostParseOptions = {
+  renderMediaPlaceholders?: boolean;
+  emptyTextFallback?: string;
+};
+
+export function parsePostContent(content: string, options: PostParseOptions = {}): PostParseResult {
+  try {
+    return renderPostContent(JSON.parse(content), options);
+  } catch {
+    return { textContent: FALLBACK_POST_TEXT, attachments: [], mentionedOpenIds: [] };
+  }
+}
+
+export function renderPostContent(
+  parsed: unknown,
+  options: PostParseOptions = {},
 ): PostParseResult {
   try {
-    const parsed = JSON.parse(content);
     const payload = resolvePostPayload(parsed);
     if (!payload) {
       return {

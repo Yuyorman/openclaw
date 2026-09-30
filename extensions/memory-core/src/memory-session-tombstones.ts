@@ -3,7 +3,7 @@ import {
   executeSqliteQuerySync,
   getNodeSqliteKysely,
   tableExists,
-} from "openclaw/plugin-sdk/sqlite-runtime";
+} from "openclaw/plugin-sdk/sqlite-worker-runtime";
 
 type TombstoneDatabase = {
   memory_session_tombstones: { session_id: string; agent_id: string };
@@ -11,7 +11,7 @@ type TombstoneDatabase = {
 
 const ensuredDatabases = new WeakSet<DatabaseSync>();
 
-export function memorySessionTombstonesExist(db: DatabaseSync): boolean {
+function memorySessionTombstonesExist(db: DatabaseSync): boolean {
   return ensuredDatabases.has(db) || tableExists(db, "memory_session_tombstones");
 }
 

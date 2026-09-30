@@ -286,7 +286,7 @@ struct ChatGatewayRequestTests {
         #expect(request.params["verboseLevel"]?.value as? String == "full")
     }
 
-    @Test func `settings patch request encodes fast values and explicit resets`() {
+    @Test func `settings patch request encodes fast values and explicit resets`() throws {
         let reset = OpenClawChatGatewayRequests.patchSessionSettings(
             sessionKey: "main",
             agentID: nil,
@@ -302,6 +302,13 @@ struct ChatGatewayRequestTests {
         #expect(reset.params["fastMode"]?.value is NSNull)
         #expect(reset.params["verboseLevel"]?.value is NSNull)
         #expect(automatic.params["fastMode"]?.value as? String == "auto")
+        let ultrafast = try JSONDecoder().decode(OpenClawChatFastMode.self, from: Data(#""ultrafast""#.utf8))
+        #expect(ultrafast == .ultrafast)
+        #expect(ultrafast.isEnabled)
+        #expect(try JSONEncoder().encode(ultrafast) == Data(#""ultrafast""#.utf8))
+        let request = OpenClawChatGatewayRequests.patchSessionSettings(
+            sessionKey: "main", agentID: nil, fastMode: .some(ultrafast))
+        #expect(request.params["fastMode"]?.value as? String == "ultrafast")
     }
 
     @Test func `settings patch request preserves permission and sparse tool overrides`() throws {
@@ -803,6 +810,29 @@ struct ChatGatewayPayloadCodecTests {
         #expect(encoded["inputConsumptions"] as? [[String: String]] == consumptions)
     }
 
+    @Test(arguments: [nil, "running", "completed", "failed", "blocked"] as [String?])
+    func `history activity decodes quiet and optional terminal states`(status: String?) throws {
+        var item: [String: Any] = ["itemId": "tool:work", "kind": "tool", "phase": "end", "title": "Read"]
+        item["status"] = status
+        let object: [String: Any] = [
+            "sessionKey": "main", "messages": [],
+            "activity": [["messageId": "quiet", "items": []], ["messageId": "work", "items": [item]]],
+        ]
+        let payload = try JSONDecoder().decode(
+            OpenClawChatHistoryPayload.self,
+            from: JSONSerialization.data(withJSONObject: object))
+        #expect(payload.activity?.first?.items.isEmpty == true)
+        #expect(payload.activity?.last?.items.first?.status == status)
+        let roundTrip = try JSONDecoder().decode(
+            OpenClawChatHistoryPayload.self,
+            from: JSONEncoder().encode(payload))
+        #expect(roundTrip.activity?.last?.items == payload.activity?.last?.items)
+        let legacy = try JSONDecoder().decode(
+            OpenClawChatHistoryPayload.self,
+            from: Data(#"{"sessionKey":"main","messages":[]}"#.utf8))
+        #expect(legacy.activity == nil)
+    }
+
     @Test func `session row decodes permission and every tool override family`() throws {
         let row = try JSONDecoder().decode(OpenClawChatSessionEntry.self, from: Data(#"""
         {
@@ -987,34 +1017,6 @@ struct ChatGatewayPayloadCodecTests {
         #expect(digest.runid == "run-1")
         #expect(digest.revision == 2)
 
-        let task = EventFrame(
-            type: "event",
-            event: "task",
-            payload: AnyCodable([
-                "action": AnyCodable("upserted"),
-                "task": AnyCodable([
-                    "id": AnyCodable("task-1"),
-                    "runtime": AnyCodable("subagent"),
-                    "status": AnyCodable("running"),
-                    "sessionKey": AnyCodable("agent:main:main"),
-                    "lastActivity": AnyCodable("Editing ChatView.swift"),
-                    "diffStat": AnyCodable([
-                        "files": AnyCodable(1),
-                        "added": AnyCodable(8),
-                        "removed": AnyCodable(2),
-                    ]),
-                ]),
-            ]))
-        guard case let .task(.upserted(summary)) = OpenClawChatGatewayPayloadCodec.event(from: task)
-        else {
-            Issue.record("expected task upsert")
-            return
-        }
-        #expect(summary.id == "task-1")
-        #expect(summary.sessionkey == "agent:main:main")
-        #expect(summary.lastactivity == "Editing ChatView.swift")
-        #expect(summary.diffstat?["added"]?.intValue == 8)
-
         let progressCard = EventFrame(
             type: "event",
             event: "progressCard.changed",
@@ -1037,6 +1039,17 @@ struct ChatGatewayPayloadCodecTests {
         else {
             Issue.record("expected chatMetadataChanged")
             return
+        }
+
+        for eventName in ["chat.metadata.changed", "config.changed"] {
+            guard case .modelSelectionChanged = OpenClawChatGatewayPayloadCodec.event(from: EventFrame(
+                type: "event",
+                event: eventName,
+                payload: eventName == "chat.metadata.changed" ? AnyCodable(["modelSelectionChanged": true]) : nil))
+            else {
+                Issue.record("expected modelSelectionChanged for \(eventName)")
+                return
+            }
         }
 
         #expect(OpenClawChatGatewayPayloadCodec.event(from: EventFrame(

@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { normalizeReplyPayload } from "../../../auto-reply/reply/normalize-reply.js";
 import { SILENT_REPLY_TOKEN } from "../../../auto-reply/tokens.js";
 import { classifyAgentExecResult } from "../../../commands/agent-exec-result.js";
+import { createMediaGenerationOperation } from "../../media-generation-activity.js";
+import { resetGeneratedMediaTaskActivityForTests } from "../../media-generation-activity.test-support.js";
 import {
   buildEmbeddedRunnerAssistant,
   makeEmbeddedRunnerAttempt,
@@ -31,7 +34,10 @@ const REASONING_ONLY_RETRY_INSTRUCTION =
   "The previous assistant turn recorded reasoning but did not produce a user-visible answer. Continue from that partial turn and produce the visible answer now. Do not restate the reasoning or restart from scratch.";
 
 describe("terminal resolution", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetGeneratedMediaTaskActivityForTests();
+  });
 
   it.each([false, true])(
     "resolves an empty post-tool turn using committed media delivery (delivered: %s)",
@@ -273,47 +279,73 @@ describe("terminal resolution", () => {
     expect(text).not.toContain("Couldn't sign in");
   });
 
-  it("retries a required empty reply even when deliberate silence is enabled", async () => {
-    const activateInternalPrompt = vi.fn();
-    const input = makeTerminalInput({
-      runParams: { allowEmptyAssistantReplyAsSilent: true, terminalReplyExpectation: "required" },
-      activateInternalPrompt,
-    });
+  it.each(["", SILENT_REPLY_TOKEN])(
+    "retries required empty output %j even when legacy silence is enabled",
+    async (text) => {
+      const assistant = emptyAssistant({ content: [{ type: "text", text }] });
+      const attempt = makeEmbeddedRunnerAttempt({
+        assistantTexts: text ? [text] : [],
+        lastAssistant: assistant,
+        currentAttemptAssistant: assistant,
+        currentAttemptReplayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+      });
+      const activateInternalPrompt = vi.fn();
+      const input = makeTerminalInput({
+        attempt,
+        attemptAssistant: assistant,
+        runParams: {
+          allowEmptyAssistantReplyAsSilent: true,
+          terminalReplyExpectation: "required",
+          inputProvenance: { kind: "inter_session" },
+        },
+        activateInternalPrompt,
+      });
 
-    await expect(resolveEmbeddedRunTerminal(input)).resolves.toEqual({ action: "retry" });
-    expect(input.retryState.emptyResponseAttempts).toBe(1);
-    expect(activateInternalPrompt).toHaveBeenCalledWith(EMPTY_RESPONSE_RETRY_INSTRUCTION);
-  });
+      await expect(resolveEmbeddedRunTerminal(input)).resolves.toEqual({ action: "retry" });
+      expect(input.retryState.emptyResponseAttempts).toBe(1);
+      expect(activateInternalPrompt).toHaveBeenCalledWith(EMPTY_RESPONSE_RETRY_INSTRUCTION);
+    },
+  );
 
-  it("completes an explicit silent reply without retrying", async () => {
-    const assistant = buildEmbeddedRunnerAssistant({
-      content: [{ type: "text", text: SILENT_REPLY_TOKEN }],
-    });
-    const attempt = makeEmbeddedRunnerAttempt({
-      assistantTexts: [SILENT_REPLY_TOKEN],
-      lastAssistant: assistant,
-      currentAttemptAssistant: assistant,
-      currentAttemptReplayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
-    });
-    const activateInternalPrompt = vi.fn();
-    const input = makeTerminalInput({
-      attempt,
-      attemptAssistant: assistant,
-      runParams: { allowEmptyAssistantReplyAsSilent: true, terminalReplyExpectation: "required" },
-      activateInternalPrompt,
-    });
+  it.each(["explicit policy", "internal notification"])(
+    "completes NO_REPLY from %s without retrying",
+    async (source) => {
+      const assistant = buildEmbeddedRunnerAssistant({
+        content: [{ type: "text", text: SILENT_REPLY_TOKEN }],
+      });
+      const attempt = makeEmbeddedRunnerAttempt({
+        assistantTexts: [SILENT_REPLY_TOKEN],
+        lastAssistant: assistant,
+        currentAttemptAssistant: assistant,
+        currentAttemptReplayMetadata: { hadPotentialSideEffects: false, replaySafe: true },
+      });
+      const activateInternalPrompt = vi.fn();
+      const input = makeTerminalInput({
+        attempt,
+        attemptAssistant: assistant,
+        runParams:
+          source === "explicit policy"
+            ? { allowEmptyAssistantReplyAsSilent: false, terminalReplyExpectation: "optional" }
+            : {
+                allowEmptyAssistantReplyAsSilent: false,
+                trigger: "user",
+                inputProvenance: { kind: "inter_session", sourceTool: "subagent_announce" },
+              },
+        activateInternalPrompt,
+      });
 
-    const resolved = await resolveEmbeddedRunTerminal(input);
+      const resolved = await resolveEmbeddedRunTerminal(input);
 
-    expect(resolved.action).toBe("complete");
-    if (resolved.action !== "complete") {
-      return;
-    }
-    expect(resolved.result.payloads).toEqual([{ text: SILENT_REPLY_TOKEN }]);
-    expect(resolved.result.meta.terminalReplyKind).toBe("silent-empty");
-    expect(resolved.result.meta.livenessState).toBe("working");
-    expect(activateInternalPrompt).not.toHaveBeenCalled();
-  });
+      expect(resolved.action).toBe("complete");
+      if (resolved.action !== "complete") {
+        return;
+      }
+      expect(resolved.result.payloads).toEqual([{ text: SILENT_REPLY_TOKEN }]);
+      expect(resolved.result.meta.terminalReplyKind).toBe("silent-empty");
+      expect(resolved.result.meta.livenessState).toBe("working");
+      expect(activateInternalPrompt).not.toHaveBeenCalled();
+    },
+  );
 
   it("keeps an empty visible parent alive for accepted completion children", async () => {
     const attempt = makeEmbeddedRunnerAttempt({
@@ -335,7 +367,9 @@ describe("terminal resolution", () => {
 
     expect(resolved).toMatchObject({
       result: {
-        payloads: [{ text: "I’m continuing this work and will send the result when it is ready." }],
+        payloads: undefined,
+        meta: { continuationPending: true },
+        acceptedSessionSpawns: attempt.acceptedSessionSpawns,
       },
     });
   });
@@ -388,6 +422,102 @@ describe("terminal resolution", () => {
     expect(resolved.action).toBe("complete");
     if (resolved.action === "complete") {
       expect(resolved.result.payloads).toBeUndefined();
+      expect(resolved.result.meta.continuationPending).toBeUndefined();
+    }
+  });
+
+  // Live Telegram group: image_generate started, the model acknowledged with a
+  // progress message (or said nothing), and the image arrives in a later turn.
+  const detachedImageAttempt = (
+    status: "running" | "succeeded",
+    overrides: Parameters<typeof makeEmbeddedRunnerAttempt>[0] = {},
+  ) => {
+    createMediaGenerationOperation({
+      taskId: "task-image",
+      runId: "tool:image_generate:run-image",
+      taskKind: "image_generation",
+      requesterSessionKey: "agent:main:telegram:group:-100",
+      requesterAgentId: "main",
+      createdAt: Date.now(),
+      status,
+    });
+    return makeEmbeddedRunnerAttempt({
+      toolMetas: [
+        {
+          toolName: "image_generate",
+          asyncStarted: true,
+          asyncTaskRunId: "tool:image_generate:run-image",
+        },
+      ],
+      ...overrides,
+    });
+  };
+  const progressTarget = { tool: "message", provider: "telegram", text: "Making the image now." };
+  const progressAck = {
+    didSendViaMessagingTool: true,
+    messagingToolSentTexts: ["Making the image now."],
+    messagingToolSentTargets: [progressTarget],
+  };
+
+  it.each([
+    { name: "without an acknowledgement", overrides: {} },
+    { name: "after a plain progress send", overrides: progressAck },
+    {
+      name: "after a non-final source reply",
+      overrides: {
+        ...progressAck,
+        didDeliverSourceReplyViaMessageTool: true,
+        messagingToolSentTargets: [{ ...progressTarget, sourceReplyFinal: false }],
+        messagingToolSourceReplyPayloads: [
+          { text: "Making the image now.", sourceReplyFinal: false },
+        ],
+      },
+    },
+  ])(
+    "keeps an empty visible turn pending on a running detached media run $name",
+    async ({ overrides }) => {
+      const resolved = await resolveEmbeddedRunTerminal(
+        makeTerminalInput({
+          attempt: detachedImageAttempt("running", overrides),
+          runParams: { replyOperation: { turnKind: "visible" } as never },
+        }),
+      );
+
+      expect(resolved).toMatchObject({
+        action: "complete",
+        result: { payloads: undefined, meta: { continuationPending: true } },
+      });
+    },
+  );
+
+  it.each([
+    { name: "the media run already succeeded", status: "succeeded" as const, overrides: {} },
+    {
+      name: "a real tool failed",
+      status: "running" as const,
+      overrides: { lastToolError: { toolName: "read", error: "ENOENT" } },
+    },
+    {
+      name: "the model delivered its final reply",
+      status: "running" as const,
+      overrides: {
+        ...progressAck,
+        didDeliverSourceReplyViaMessageTool: true,
+        messagingToolSourceReplyPayloads: [
+          { text: "Making the image now.", sourceReplyFinal: true },
+        ],
+      },
+    },
+  ])("leaves normal terminal handling when $name", async ({ status, overrides }) => {
+    const resolved = await resolveEmbeddedRunTerminal(
+      makeTerminalInput({
+        attempt: detachedImageAttempt(status, overrides),
+        runParams: { replyOperation: { turnKind: "visible" } as never },
+      }),
+    );
+
+    expect(resolved.action).toBe("complete");
+    if (resolved.action === "complete") {
       expect(resolved.result.meta.continuationPending).toBeUndefined();
     }
   });
@@ -606,7 +736,7 @@ describe("terminal resolution", () => {
   ])(
     "keeps reply-optional subagent $label distinct at the terminal producer",
     async ({ rawText, expectedKind }) => {
-      const assistant = emptyAssistant();
+      const assistant = emptyAssistant({ content: [{ type: "text", text: rawText ?? "" }] });
       const attempt = makeEmbeddedRunnerAttempt({
         assistantTexts: rawText ? [rawText] : [],
         toolMetas: [{ toolName: "write", replaySafe: false }],
@@ -867,11 +997,14 @@ describe("terminal resolution", () => {
       if (expectedError) {
         expect(resolved.result.payloads?.[0]).toMatchObject({ isError: true });
         expect(resolved.result.meta.error?.kind).toBe("incomplete_turn");
-        expect(resolved.result.meta.terminalReplyKind).toBeUndefined();
+        expect(resolved.result.meta.terminalReplyKind).not.toBe("silent-empty");
       } else {
-        expect(resolved.result.payloads).toBeUndefined();
+        expect(
+          (resolved.result.payloads ?? []).flatMap(
+            (payload) => normalizeReplyPayload(payload, { applyChannelTransforms: false }) ?? [],
+          ),
+        ).toEqual([]);
         expect(resolved.result.meta.error).toBeUndefined();
-        expect(resolved.result.meta.terminalReplyKind).toBeUndefined();
       }
     },
   );

@@ -1,8 +1,11 @@
-// Defines Zod schema fragments for agent default configuration.
 import { z } from "zod";
 import { isValidNonNegativeByteSizeString } from "./byte-size.js";
 import { AgentModelMapSchema, AgentModelPolicySchema } from "./zod-schema.agent-entry-base.js";
-import { AgentModelSchema, AgentToolModelSchema } from "./zod-schema.agent-model.js";
+import {
+  AgentModelSchema,
+  AgentToolModelSchema,
+  DecisionModelSchema,
+} from "./zod-schema.agent-model.js";
 
 const SilentReplyPolicySchema = z.union([z.literal("allow"), z.literal("disallow")]);
 
@@ -54,6 +57,13 @@ export const SilentReplyPolicyConfigSchema = z
   })
   .strict();
 
+const AgentOwnerTargetSchema = z
+  .object({
+    agentId: z.string().trim().min(1).optional(),
+  })
+  .strict()
+  .optional();
+
 export const AgentDefaultsBaseSchema = z
   .object({
     /** Global default provider params applied to all models before per-model and per-agent overrides. */
@@ -61,6 +71,7 @@ export const AgentDefaultsBaseSchema = z
     model: AgentModelSchema.optional(),
     modelSelectionScope: z.enum(["session", "agent", "global"]).optional(),
     utilityModel: z.string().optional(),
+    decisionModel: DecisionModelSchema.optional(),
     imageModel: AgentToolModelSchema.optional(),
     mediaModels: z
       .object({
@@ -90,6 +101,8 @@ export const AgentDefaultsBaseSchema = z
     bootstrapTotalMaxChars: z.number().int().positive().optional(),
     experimental: z
       .object({
+        /** Global opt-in for automatic Decision experiments; model selection is separate. */
+        decisionAssistance: z.boolean().optional(),
         localModelLean: z.boolean().optional(),
       })
       .strict()
@@ -230,7 +243,7 @@ export const AgentDefaultsBaseSchema = z
       .optional(),
     embeddedAgent: EmbeddedAgentConfigSchema.optional(),
     thinkingDefault: AgentThinkingLevelSchema.optional(),
-    fastModeDefault: z.union([z.boolean(), z.literal("auto")]).optional(),
+    fastModeDefault: z.union([z.boolean(), z.literal("auto"), z.literal("ultrafast")]).optional(),
     verboseDefault: z.union([z.literal("off"), z.literal("on"), z.literal("full")]).optional(),
     toolProgressDetail: z.union([z.literal("explain"), z.literal("raw")]).optional(),
     reasoningDefault: z.union([z.literal("off"), z.literal("on"), z.literal("stream")]).optional(),
@@ -245,30 +258,22 @@ export const AgentDefaultsBaseSchema = z
     imageMaxDimensionPx: z.number().int().positive().optional(),
     imageQuality: z.enum(["auto", "efficient", "balanced", "high"]).optional(),
     typingIntervalSeconds: z.number().int().positive().optional(),
-    systemAgent: z
-      .object({
-        agentId: z.string().trim().min(1).optional(),
-      })
-      .strict()
-      .optional(),
-    authInheritance: z
-      .object({
-        agentId: z.string().trim().min(1).optional(),
-      })
-      .strict()
-      .optional(),
-    sessionStore: z
-      .object({
-        agentId: z.string().trim().min(1).optional(),
-      })
-      .strict()
-      .optional(),
+    systemAgent: AgentOwnerTargetSchema,
+    authInheritance: AgentOwnerTargetSchema,
+    sessionStore: AgentOwnerTargetSchema,
     maxConcurrent: z.number().int().positive().optional(),
     subagents: z
       .object({
         delegationMode: z.enum(["suggest", "prefer"]).optional(),
         allowAgents: z.array(z.string()).optional(),
-        maxConcurrent: z.number().int().positive().optional(),
+        maxConcurrent: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Maximum concurrent child-agent runs per immediate spawning/controller session (default: 8). Independent sessions have independent budgets.",
+          ),
         maxSpawnDepth: z
           .number()
           .int()

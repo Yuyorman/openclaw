@@ -1,29 +1,20 @@
-import type { ApplicationContext } from "../../app/context.ts";
 import type { SessionDeleteTarget } from "../../lib/sessions/session-capability.ts";
 import { publishSnapshotInvalidation } from "./session-snapshot-invalidation-events.ts";
 import { resolveChatSnapshotKey } from "./session-snapshot-key.ts";
 
-type SnapshotKeyHost = {
-  assistantAgentId: ApplicationContext["gateway"]["snapshot"]["assistantAgentId"];
-  agentsList: ApplicationContext["agents"]["state"]["agentsList"];
-  hello: ApplicationContext["gateway"]["snapshot"]["hello"];
-};
-
-const loadSnapshotInvalidation = () => import("./session-snapshot-invalidation.ts");
-
 export function clearStoredChatSnapshots(): Promise<void> {
   const invalidated = publishSnapshotInvalidation({});
-  return loadSnapshotInvalidation().then(async ({ clearStoredChatSnapshotStorage }) => {
+  return import("./session-snapshot-database.ts").then(async ({ resetSessionSnapshotDatabase }) => {
     await invalidated;
-    await clearStoredChatSnapshotStorage();
+    await resetSessionSnapshotDatabase();
   });
 }
 
 export function deleteStoredChatSessionSnapshots(
-  host: SnapshotKeyHost,
+  host: Parameters<typeof resolveChatSnapshotKey>[0],
   sessions: readonly Pick<SessionDeleteTarget, "agentId" | "key">[],
 ): Promise<void> {
-  return loadSnapshotInvalidation().then(({ deleteStoredChatSnapshot }) =>
+  return import("./session-snapshot-invalidation.ts").then(({ deleteStoredChatSnapshot }) =>
     Promise.all(
       sessions.map(({ key, agentId }) =>
         deleteStoredChatSnapshot(

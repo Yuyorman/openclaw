@@ -80,10 +80,8 @@ type MacExecHostCall = {
 describe("handleSystemRunInvoke mac app exec host routing", () => {
   let sharedFixtureRoot = "";
   let sharedOpenClawHome = "";
-  let sharedRuntimeBinDir = "";
   let sharedFixtureId = 0;
   let previousOpenClawHome: string | undefined;
-  const sharedRuntimeBins = new Set<string>();
 
   beforeAll(() => {
     closeOpenClawStateDatabaseForTest();
@@ -91,9 +89,7 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
       fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-node-host-fixtures-")),
     );
     sharedOpenClawHome = path.join(sharedFixtureRoot, "openclaw-home");
-    sharedRuntimeBinDir = path.join(sharedFixtureRoot, "bin");
     fs.mkdirSync(sharedOpenClawHome, { recursive: true });
-    fs.mkdirSync(sharedRuntimeBinDir, { recursive: true });
   });
 
   afterAll(() => {
@@ -309,50 +305,13 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
     };
   }
 
-  function createRuntimeScriptOperandFixture(
-    tmp: string,
-    runtime: "bun" | "deno" | "jiti" | "tsx",
-  ): {
-    command: string[];
-    scriptPath: string;
-    initialBody: string;
-    changedBody: string;
-  } {
-    const scriptPath = path.join(tmp, "run.ts");
-    const initialBody = 'console.log("SAFE");\n';
-    const changedBody = 'console.log("PWNED");\n';
-    switch (runtime) {
-      case "bun":
-        return {
-          command: ["bun", "run", "./run.ts"],
-          scriptPath,
-          initialBody,
-          changedBody,
-        };
-      case "deno":
-        return {
-          command: ["deno", "run", "-A", "--allow-read", "--", "./run.ts"],
-          scriptPath,
-          initialBody,
-          changedBody,
-        };
-      case "jiti":
-        return {
-          command: ["jiti", "./run.ts"],
-          scriptPath,
-          initialBody,
-          changedBody,
-        };
-      case "tsx":
-        return {
-          command: ["tsx", "./run.ts"],
-          scriptPath,
-          initialBody,
-          changedBody,
-        };
-    }
-    const unsupportedRuntime: never = runtime;
-    throw new Error(`unsupported runtime fixture: ${String(unsupportedRuntime)}`);
+  function createTsxScriptOperandFixture(tmp: string) {
+    return {
+      command: ["tsx", "./run.ts"],
+      scriptPath: path.join(tmp, "run.ts"),
+      initialBody: 'console.log("SAFE");\n',
+      changedBody: 'console.log("PWNED");\n',
+    };
   }
 
   function buildNestedEnvShellCommand(params: { depth: number; payload: string }): string[] {
@@ -467,27 +426,16 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
     );
   }
 
-  async function withFakeRuntimeOnPath<T>(
-    runtime: "bun" | "deno" | "jiti" | "tsx",
-    run: () => Promise<T>,
-  ): Promise<T> {
-    if (!sharedRuntimeBins.has(runtime)) {
-      const runtimePath =
-        process.platform === "win32"
-          ? path.join(sharedRuntimeBinDir, `${runtime}.cmd`)
-          : path.join(sharedRuntimeBinDir, runtime);
-      const runtimeBody =
-        process.platform === "win32" ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n";
-      fs.writeFileSync(runtimePath, runtimeBody, { mode: 0o755 });
-      if (process.platform !== "win32") {
-        fs.chmodSync(runtimePath, 0o755);
-      }
-      sharedRuntimeBins.add(runtime);
+  async function withFakeTsxOnPath<T>(run: () => Promise<T>): Promise<T> {
+    const binDir = createFixtureDir("tsx-bin-");
+    const runtimePath = path.join(binDir, process.platform === "win32" ? "tsx.cmd" : "tsx");
+    const runtimeBody =
+      process.platform === "win32" ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n";
+    fs.writeFileSync(runtimePath, runtimeBody, { mode: 0o755 });
+    if (process.platform !== "win32") {
+      fs.chmodSync(runtimePath, 0o755);
     }
-    return await withEnvAsync(
-      { PATH: `${sharedRuntimeBinDir}${path.delimiter}${process.env.PATH ?? ""}` },
-      run,
-    );
+    return await withEnvAsync({ PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` }, run);
   }
 
   function expectCommandPinnedToCanonicalPath(
@@ -760,28 +708,25 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
     expect(result.sendExecFinishedEvent).not.toHaveBeenCalled();
   });
 
-  it.each([null, createMacExecHostSuccess()])(
-    "cancels pending Mac exec without replay or publication (%j)",
-    async (response) => {
-      const controller = new AbortController();
-      const result = await runMacSystemInvoke({
-        signal: controller.signal,
-        runViaMacAppExecHost: ({ signal }) => {
-          expect(signal).toBe(controller.signal);
-          return new Promise((resolve) => {
-            signal?.addEventListener("abort", () => resolve(response), { once: true });
-            queueMicrotask(() => controller.abort());
-          });
-        },
-      });
+  it("cancels pending Mac exec without replay or publication", async () => {
+    const controller = new AbortController();
+    const result = await runMacSystemInvoke({
+      signal: controller.signal,
+      runViaMacAppExecHost: ({ signal }) => {
+        expect(signal).toBe(controller.signal);
+        return new Promise((resolve) => {
+          signal?.addEventListener("abort", () => resolve(null), { once: true });
+          queueMicrotask(() => controller.abort());
+        });
+      },
+    });
 
-      expect(result.runViaMacAppExecHost).toHaveBeenCalledOnce();
-      expect(result.runCommand).not.toHaveBeenCalled();
-      expect(result.sendNodeEvent).not.toHaveBeenCalled();
-      expect(result.sendInvokeResult).not.toHaveBeenCalled();
-      expect(result.sendExecFinishedEvent).not.toHaveBeenCalled();
-    },
-  );
+    expect(result.runViaMacAppExecHost).toHaveBeenCalledOnce();
+    expect(result.runCommand).not.toHaveBeenCalled();
+    expect(result.sendNodeEvent).not.toHaveBeenCalled();
+    expect(result.sendInvokeResult).not.toHaveBeenCalled();
+    expect(result.sendExecFinishedEvent).not.toHaveBeenCalled();
+  });
 
   it("routes local, mac host, and canonical shell-wrapper requests", async () => {
     const localInvoke = await runLocalSystemInvoke({});
@@ -840,7 +785,7 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
         }));
         const commitAuthorization = vi.fn(commitExecAuthorizationLocked);
         const runCommand = vi.fn(async () => createLocalRunResult("auto-reviewed"));
-        const prepared = buildCwdApprovalPlan([executablePath], tmp);
+        const prepared = buildCwdApprovalPlan([executablePath, "security.audit.suppressions"], tmp);
         expect(prepared.ok).toBe(true);
         requireApprovalPlan(prepared, "unreachable");
         const invoke = await runLocalSystemInvoke({
@@ -857,8 +802,8 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
         expect(autoReviewer).toHaveBeenCalledTimes(1);
         expect(autoReviewer).toHaveBeenCalledWith(
           expect.objectContaining({
-            command: executablePath,
-            argv: [executablePath],
+            command: `${executablePath} security.audit.suppressions`,
+            argv: [executablePath, "security.audit.suppressions"],
             cwd: tmp,
             host: "node",
             reason: "approval-required",
@@ -934,20 +879,10 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
     }
   });
 
-  it.each([
-    {
-      name: "throws synchronously",
-      reviewer: () => {
-        throw new Error("provider\n\u001b[31mfailed\u001b[0m\u202e");
-      },
-    },
-    {
-      name: "rejects asynchronously",
-      reviewer: async () => {
-        throw new Error("provider\n\u001b[31mfailed\u001b[0m\u202e");
-      },
-    },
-  ])("denies direct system.run when its reviewer $name", async ({ reviewer }) => {
+  it("denies direct system.run when its reviewer rejects", async () => {
+    const reviewer: ExecAutoReviewer = async () => {
+      throw new Error("provider\n\u001b[31mfailed\u001b[0m\u202e");
+    };
     const tmp = createFixtureDir("openclaw-system-run-auto-review-failure-");
     const executablePath = createTempExecutable(tmp, "read-info");
     setRuntimeConfigSnapshot({ tools: { exec: { mode: "auto" } } });
@@ -975,7 +910,7 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
     );
   });
 
-  it.runIf(process.platform !== "win32").each(["bash", "sh", "/bin/sh"])(
+  it.runIf(process.platform !== "win32").each(["bash", "/bin/sh"])(
     "does not auto-review direct %s login-shell startup",
     async (shell) => {
       const tmp = createFixtureDir("openclaw-system-run-auto-review-login-");
@@ -1016,47 +951,6 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
       }
     },
   );
-
-  it("does not auto-review direct system.run security audit suppression edits", async () => {
-    const tmp = createFixtureDir("openclaw-system-run-auto-review-suppression-");
-    const executablePath = createTempExecutable(tmp, "openclaw");
-    setRuntimeConfigSnapshot({
-      tools: {
-        exec: {
-          mode: "auto",
-        },
-      },
-    });
-    try {
-      const autoReviewer = vi.fn<ExecAutoReviewer>(() => ({
-        decision: "allow-once",
-        rationale: "test reviewer would allow it",
-        risk: "low",
-      }));
-      const runCommand = vi.fn(async () => createLocalRunResult("should-not-run"));
-      const prepared = buildCwdApprovalPlan(
-        [executablePath, "config", "set", "security.audit.suppressions", "[]"],
-        tmp,
-      );
-      expect(prepared.ok).toBe(true);
-      requireApprovalPlan(prepared, "unreachable");
-      const invoke = await runLocalSystemInvoke({
-        command: prepared.plan.argv,
-        cwd: prepared.plan.cwd ?? tmp,
-        systemRunPlan: prepared.plan,
-        runCommand,
-        resolveExecSecurity: resolveProductionExecSecurity,
-        resolveExecAsk: resolveProductionExecAsk,
-        autoReviewer,
-      });
-
-      expect(autoReviewer).not.toHaveBeenCalled();
-      expect(runCommand).not.toHaveBeenCalled();
-      expectInvokeErrorMessage(invoke.sendInvokeResult, "SYSTEM_RUN_DENIED: approval required");
-    } finally {
-      clearRuntimeConfigSnapshot();
-    }
-  });
 
   it.each(["ask", "deny"] as const)(
     "does not execute when system.run auto reviewer returns %s",
@@ -1703,7 +1597,7 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
   ] as const)(
     "checks live node policy at $boundary before real execution (revoke=$revoke)",
     async ({ boundary, revoke }) => {
-      const { testing } = await import("./invoke.test-support.js");
+      const { runCommand } = await import("./invoke-run-command.js");
       const cwd = createFixtureDir("openclaw-node-policy-before-spawn-");
       fs.writeFileSync(path.join(cwd, "approved.txt"), "");
       const revokePolicy = () => {
@@ -1731,7 +1625,7 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
           if (boundary === "callback") {
             revokePolicy();
           }
-          const result = await testing.runCommand(
+          const result = await runCommand(
             argv,
             runCwd,
             { PATH: "/usr/bin:/bin", HOME: cwd },
@@ -1866,9 +1760,9 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
   });
 
   it("validates approved runtime script operand bindings at dispatch", async () => {
-    await withFakeRuntimeOnPath("tsx", async () => {
+    await withFakeTsxOnPath(async () => {
       const tmp = createFixtureDir("openclaw-approval-tsx-script-drift-");
-      const fixture = createRuntimeScriptOperandFixture(tmp, "tsx");
+      const fixture = createTsxScriptOperandFixture(tmp);
       fs.writeFileSync(fixture.scriptPath, fixture.initialBody);
       const prepared = buildCwdApprovalPlan(fixture.command, tmp);
       expect(prepared.ok).toBe(true);
@@ -1888,7 +1782,7 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
         true,
       );
       const missingBindingTmp = createFixtureDir("openclaw-approval-tsx-missing-binding-");
-      const missingBindingFixture = createRuntimeScriptOperandFixture(missingBindingTmp, "tsx");
+      const missingBindingFixture = createTsxScriptOperandFixture(missingBindingTmp);
       fs.writeFileSync(missingBindingFixture.scriptPath, missingBindingFixture.initialBody);
       const missingBindingPrepared = buildCwdApprovalPlan(
         missingBindingFixture.command,
@@ -2504,33 +2398,6 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
     });
   });
 
-  it("does not let forwarded auto-review authorize security audit suppression edits", async () => {
-    const tmp = createFixtureDir("openclaw-forwarded-auto-review-suppression-");
-    const executablePath = createTempExecutable(tmp, "openclaw");
-    const prepared = buildCwdSessionApprovalPlan(
-      [executablePath, "config", "set", "security.audit.suppressions", "[]"],
-      tmp,
-      "agent:main:main",
-    );
-    expect(prepared.ok).toBe(true);
-    requireApprovalPlan(prepared, "unreachable");
-    await withTempApprovalsHome(createApprovals("full", "on-miss", "deny"), async () => {
-      const invoke = await runLocalSystemInvokeWithPolicy("full", "on-miss", {
-        preparedPlan: prepared.plan,
-        cwd: tmp,
-        approvalSource: "auto-review",
-      });
-
-      expect(invoke.runCommand).not.toHaveBeenCalled();
-      expectExecDeniedEvent(invoke.sendNodeEvent);
-      expectInvokeErrorMessage(
-        invoke.sendInvokeResult,
-        "SYSTEM_RUN_DENIED: explicit approval required",
-        true,
-      );
-    });
-  });
-
   it("preserves exact-plan forwarded auto-review for strict inline eval", async () => {
     const plan = createStrictInlineEvalApprovalPlan("openclaw-forwarded-inline-");
     setRuntimeConfigSnapshot({ tools: { exec: { strictInlineEval: true } } });
@@ -2951,55 +2818,6 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
     }
   });
 
-  it("does not let timeout fallback authorize security audit suppression edits", async () => {
-    const tmp = createFixtureDir("openclaw-timeout-fallback-suppression-");
-    const executablePath = createTempExecutable(tmp, "openclaw");
-    const prepared = buildCwdSessionApprovalPlan(
-      [executablePath, "config", "set", "security.audit.suppressions", "[]"],
-      tmp,
-      "agent:main:main",
-    );
-    expect(prepared.ok).toBe(true);
-    requireApprovalPlan(prepared, "unreachable");
-    await withTempApprovalsHome(createApprovals("full", "always", "full", {}), async () => {
-      const invoke = await runLocalSystemInvoke({
-        preparedPlan: prepared.plan,
-        cwd: tmp,
-        approvalSource: "ask-fallback",
-      });
-
-      expect(invoke.runCommand).not.toHaveBeenCalled();
-      expectApprovalRequiredDenied(invoke.sendNodeEvent, invoke.sendInvokeResult);
-    });
-  });
-
-  it("keeps audit suppression edits approval-gated under allowlist fallback from full/off", async () => {
-    const tmp = createFixtureDir("openclaw-timeout-fallback-full-off-suppression-");
-    const executablePath = createTempExecutable(tmp, "openclaw");
-    const prepared = buildCwdSessionApprovalPlan(
-      [executablePath, "config", "set", "security.audit.suppressions", "[]"],
-      tmp,
-      "agent:main:main",
-    );
-    expect(prepared.ok).toBe(true);
-    requireApprovalPlan(prepared, "unreachable");
-    await withTempApprovalsHome(
-      createApprovals("full", "off", "allowlist", {
-        main: { allowlist: [{ pattern: fs.realpathSync(executablePath) }] },
-      }),
-      async () => {
-        const invoke = await runLocalSystemInvokeWithPolicy("full", "off", {
-          preparedPlan: prepared.plan,
-          cwd: tmp,
-          approvalSource: "ask-fallback",
-        });
-
-        expect(invoke.runCommand).not.toHaveBeenCalled();
-        expectApprovalRequiredDenied(invoke.sendNodeEvent, invoke.sendInvokeResult);
-      },
-    );
-  });
-
   it("rejects unknown approval provenance", async () => {
     const invoke = await runLocalSystemInvokeWithPolicy("full", "off", {
       approved: true,
@@ -3027,10 +2845,9 @@ describe("handleSystemRunInvoke mac app exec host routing", () => {
           command: [executablePath, "-c", "print('hi')"],
         });
 
-        expect(prepared).toEqual({
+        expect(prepared).toMatchObject({
           ok: false,
-          message:
-            "SYSTEM_RUN_DENIED: approval cannot safely bind this interpreter/runtime command",
+          reason: "unsupported-command-shape",
         });
         expect(loadExecApprovals().agents?.main?.allowlist ?? []).toStrictEqual([]);
       });

@@ -1,4 +1,3 @@
-// Applies OpenClaw's conversational setup: config, workspace files, gateway.
 import { isDeepStrictEqual } from "node:util";
 import { listAgentEntries, toAgentEntriesRecord } from "../agents/agent-scope-config.js";
 import { resolveGatewayStartupTiming } from "../commands/gateway-startup-timing.js";
@@ -343,16 +342,12 @@ export async function applySystemAgentSetup(
     }
     const preserveWorkspace = currentHasRoster && !params.allowWorkspaceChange;
     if (preserveWorkspace) {
-      const defaults = { ...setupBaseConfig.agents?.defaults };
-      const currentDefaults = currentBaseConfig.agents?.defaults;
-      if (currentDefaults && Object.hasOwn(currentDefaults, "workspace")) {
-        defaults.workspace = currentDefaults.workspace;
-      } else {
-        delete defaults.workspace;
-      }
       setupBaseConfig = {
         ...setupBaseConfig,
-        agents: { ...setupBaseConfig.agents, defaults },
+        agents: {
+          ...setupBaseConfig.agents,
+          defaults: { ...setupBaseConfig.agents?.defaults },
+        },
       };
     }
 

@@ -18,7 +18,7 @@ import {
   type ProtocolSchemaDocument,
   REQUIRED_PROTOCOL_DEFINITIONS,
 } from "../../../../scripts/lib/protocol-schema-document.mts";
-import { listCoreGatewayMethodMetadata } from "../../../../src/gateway/methods/core-descriptors.js";
+import { listCoreGatewayMethodMetadata } from "../../../../src/gateway/methods/core-method-policy.js";
 import { createQaScriptEvidenceWriter } from "./script-evidence.js";
 
 const SOURCE_PATH = "test/e2e/qa-lab/runtime/gateway-protocol-artifacts.ts";
@@ -104,7 +104,7 @@ await fs.writeFile(
 `;
 }
 
-export function buildSwiftProtocolCompatibilityHarness() {
+function buildSwiftProtocolCompatibilityHarness() {
   return `import Foundation
 
 enum GatewayProtocolArtifactError: Error {

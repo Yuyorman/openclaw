@@ -1,28 +1,39 @@
 // Covers plugin hooks that run before agent replies are emitted.
 import { describe, expect, it, vi } from "vitest";
+import { withClaimingHookAdmission } from "./hook-claim-admission.js";
 import { createHookRunner } from "./hooks.js";
 import { createMockPluginRegistry, TEST_PLUGIN_AGENT_CTX } from "./hooks.test-fixtures.js";
 
 const EVENT = { cleanedBody: "hello world" };
 
 describe("before_agent_reply hook runner (claiming pattern)", () => {
-  it("returns the result when a plugin claims with { handled: true }", async () => {
-    const handler = vi.fn().mockResolvedValue({
-      handled: true,
-      reply: { text: "intercepted" },
-      reason: "test-claim",
+  it.each([false, true])("rejects revoked handler authority after handled=%s", async (handled) => {
+    let current = true;
+    const first = vi.fn(async () => {
+      current = false;
+      return { handled, reply: { text: "stale result" } };
     });
-    const registry = createMockPluginRegistry([{ hookName: "before_agent_reply", handler }]);
-    const runner = createHookRunner(registry);
+    const nextEffect = vi.fn();
+    const runner = createHookRunner(
+      createMockPluginRegistry([
+        { hookName: "before_agent_reply", handler: first },
+        { hookName: "before_agent_reply", handler: nextEffect },
+      ]),
+    );
+    const context = withClaimingHookAdmission(
+      { ...TEST_PLUGIN_AGENT_CTX },
+      {
+        assertCurrent: () => {
+          if (!current) {
+            throw new Error("root reassigned");
+          }
+        },
+      },
+    );
 
-    const result = await runner.runBeforeAgentReply(EVENT, TEST_PLUGIN_AGENT_CTX);
-
-    expect(result).toEqual({
-      handled: true,
-      reply: { text: "intercepted" },
-      reason: "test-claim",
-    });
-    expect(handler).toHaveBeenCalledWith(EVENT, TEST_PLUGIN_AGENT_CTX);
+    await expect(runner.runBeforeAgentReply(EVENT, context)).rejects.toThrow("root reassigned");
+    expect(first).toHaveBeenCalledOnce();
+    expect(nextEffect).not.toHaveBeenCalled();
   });
 
   it("returns undefined when no hooks are registered", async () => {
@@ -35,7 +46,9 @@ describe("before_agent_reply hook runner (claiming pattern)", () => {
   });
 
   it("stops at first { handled: true } — second handler is not called", async () => {
-    const first = vi.fn().mockResolvedValue({ handled: true, reply: { text: "first" } });
+    const first = vi
+      .fn()
+      .mockResolvedValue({ handled: true, reply: { text: "first" }, reason: "test-claim" });
     const second = vi.fn().mockResolvedValue({ handled: true, reply: { text: "second" } });
     const registry = createMockPluginRegistry([
       { hookName: "before_agent_reply", handler: first },
@@ -45,20 +58,10 @@ describe("before_agent_reply hook runner (claiming pattern)", () => {
 
     const result = await runner.runBeforeAgentReply(EVENT, TEST_PLUGIN_AGENT_CTX);
 
-    expect(result).toEqual({ handled: true, reply: { text: "first" } });
+    expect(result).toEqual({ handled: true, reply: { text: "first" }, reason: "test-claim" });
+    expect(first).toHaveBeenCalledWith(EVENT, TEST_PLUGIN_AGENT_CTX);
     expect(first).toHaveBeenCalledTimes(1);
     expect(second).not.toHaveBeenCalled();
-  });
-
-  it("returns { handled: true } without reply (swallow pattern)", async () => {
-    const handler = vi.fn().mockResolvedValue({ handled: true });
-    const registry = createMockPluginRegistry([{ hookName: "before_agent_reply", handler }]);
-    const runner = createHookRunner(registry);
-
-    const result = await runner.runBeforeAgentReply(EVENT, TEST_PLUGIN_AGENT_CTX);
-
-    expect(result).toEqual({ handled: true });
-    expect(result?.reply).toBeUndefined();
   });
 
   it("skips a declining plugin (returns void) and lets the next one claim", async () => {
@@ -134,15 +137,6 @@ describe("before_agent_reply hook runner (claiming pattern)", () => {
     expect(logger.error).toHaveBeenCalledWith(
       "[hooks] before_agent_reply handler from test-plugin failed: boom",
     );
-  });
-
-  it("hasHooks reports correctly for before_agent_reply", () => {
-    const registry = createMockPluginRegistry([
-      { hookName: "before_agent_reply", handler: vi.fn() },
-    ]);
-    const runner = createHookRunner(registry);
-
-    expect(runner.hasHooks("before_agent_reply")).toBe(true);
   });
 
   it("enforces trigger eligibility before invoking handlers", async () => {

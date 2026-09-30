@@ -11,7 +11,6 @@ import {
   zoomMeetingStatusScript,
   zoomMeetingTranscriptScript,
 } from "./zoom-meetings-page-scripts.js";
-import { ZOOM_MEETINGS_NODE_COMMAND } from "./zoom-meetings-platform-constants.js";
 import {
   isRecoverableZoomMeetingTab,
   isSameZoomMeetingUrl,
@@ -23,26 +22,16 @@ function zoomMeetingOrigin(meetingUrl: string): string | undefined {
   return normalizeZoomMeetingUrlForReuse(meetingUrl) ? "https://app.zoom.us" : undefined;
 }
 
-function classifyManualActionReason(reason: string): MeetingManualActionCategory {
-  switch (reason) {
-    case "zoom-login-required":
-      return "login-required";
-    case "zoom-admission-required":
-    case "zoom-passcode-required":
-    case "zoom-captcha-required":
-      return "admission-required";
-    case "zoom-permission-required":
-      return "permission-required";
-    case "zoom-audio-choice-required":
-      return "audio-choice-required";
-    case "zoom-session-conflict":
-      return "session-conflict";
-    case "browser-control-unavailable":
-      return "browser-control-unavailable";
-    default:
-      return "custom";
-  }
-}
+const manualActionCategories = new Map<string, MeetingManualActionCategory>([
+  ["zoom-login-required", "login-required"],
+  ["zoom-admission-required", "admission-required"],
+  ["zoom-passcode-required", "admission-required"],
+  ["zoom-captcha-required", "admission-required"],
+  ["zoom-permission-required", "permission-required"],
+  ["zoom-audio-choice-required", "audio-choice-required"],
+  ["zoom-session-conflict", "session-conflict"],
+  ["browser-control-unavailable", "browser-control-unavailable"],
+]);
 
 export const ZOOM_MEETINGS_PLATFORM_ADAPTER = MeetingPlatformAdapter.create<
   MeetingBrowserJoinSession<ZoomMeetingsMode>,
@@ -75,7 +64,7 @@ export const ZOOM_MEETINGS_PLATFORM_ADAPTER = MeetingPlatformAdapter.create<
         ? "Zoom guest in Chrome on a paired node"
         : "Zoom guest in the OpenClaw Chrome profile",
   },
-  nodeCommandName: ZOOM_MEETINGS_NODE_COMMAND,
+  nodeCommandName: "zoommeetings.chrome",
   nodeConfigPath: "plugins.entries.zoom-meetings.config.chromeNode.node",
   urls: {
     validateAndNormalize: normalizeZoomMeetingUrl,
@@ -142,7 +131,7 @@ export const ZOOM_MEETINGS_PLATFORM_ADAPTER = MeetingPlatformAdapter.create<
     },
   },
   parsing: {
-    classifyManualActionReason,
+    classifyManualActionReason: (reason) => manualActionCategories.get(reason) ?? "custom",
     displayName: "Zoom",
     invalidTranscriptMessage: "Zoom transcript payload is invalid.",
     malformedStatusMessage: "Zoom browser status JSON is malformed.",

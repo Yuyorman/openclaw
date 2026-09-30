@@ -38,6 +38,36 @@ function repoRelativePath(repoRoot: string, filePath: string) {
   return path.relative(repoRoot, filePath).split(path.sep).join("/");
 }
 
+function uxMatrixEntry(params: {
+  id: string;
+  title: string;
+  artifact: { kind: string; path: string; source: string };
+  result: QaEvidenceSummaryJson["entries"][number]["result"];
+}): QaEvidenceSummaryJson["entries"][number] {
+  return {
+    test: {
+      kind: "ux-matrix-cell",
+      id: params.id,
+      title: params.title,
+      source: { path: "external/qa/ux-matrix-producer.mjs" },
+    },
+    coverage: [],
+    execution: {
+      runner: "ux-matrix-dashboard",
+      environment: { ref: "gallery-test", os: "darwin", nodeVersion: "v24.0.0" },
+      provider: {
+        id: "ux-matrix",
+        live: false,
+        model: { name: null, ref: null },
+        fixture: "mocked-control-ui-and-isolated-cli",
+      },
+      packageSource: { kind: "source-checkout", sha: "abc123" },
+      artifacts: [params.artifact],
+    },
+    result: params.result,
+  };
+}
+
 describe("evidence gallery", () => {
   it("builds a generic gallery model for non-UX QA Lab evidence", async () => {
     const repoRoot = await createTempRepo();
@@ -134,104 +164,41 @@ describe("evidence gallery", () => {
   });
 
   it.each([
-    {
-      kind: "gif-runner-log",
-      file: "artifact.LOG",
-      content: "runner passed\n",
-      mediaKind: "text",
-      preview: "runner passed\n",
-    },
-    {
-      kind: "video-report",
-      file: "artifact.json",
-      content: '{"ok":true}',
-      mediaKind: "json",
-      preview: '{\n  "ok": true\n}',
-    },
-    {
-      kind: "screenshot-validation",
-      file: "artifact.webm",
-      content: "video",
-      mediaKind: "video",
-      preview: null,
-    },
-    {
-      kind: "video-report",
-      file: "artifact.png",
-      content: "image",
-      mediaKind: "image",
-      preview: null,
-    },
-    {
-      kind: "motion-preview-gif",
-      file: "artifact",
-      content: "image",
-      mediaKind: "image",
-      preview: null,
-    },
-    {
-      kind: "video-capture",
-      file: "artifact.capture",
-      content: "video",
-      mediaKind: "video",
-      preview: null,
-    },
-    {
-      kind: "validation-result",
-      file: "artifact.data",
-      content: '{"ok":true}',
-      mediaKind: "json",
-      preview: '{\n  "ok": true\n}',
-    },
-    {
-      kind: "report",
-      file: "artifact.html",
-      content: "<p>report</p>",
-      mediaKind: "text",
-      preview: "<p>report</p>",
-    },
-    {
-      kind: "video-screenshot",
-      file: "artifact.data",
-      content: "image",
-      mediaKind: "image",
-      preview: null,
-    },
-    {
-      kind: "attachment",
-      file: "artifact.data",
-      content: "opaque",
-      mediaKind: "file",
-      preview: null,
-    },
-  ])(
-    "classifies $file with $kind metadata",
-    async ({ kind, file, content, mediaKind, preview }) => {
-      const repoRoot = await createTempRepo();
-      try {
-        const outputDir = path.join(repoRoot, ".artifacts", "qa-e2e", "vitest");
-        await fs.mkdir(outputDir, { recursive: true });
-        await fs.writeFile(path.join(outputDir, file), content, "utf8");
-        await writeJson(
-          path.join(outputDir, QA_EVIDENCE_FILENAME),
-          vitestArtifactEvidence({
-            id: "qa-lab.artifact-classification",
-            title: "Artifact classification",
-            artifact: { kind, path: file },
-          }),
-        );
-        const model = await buildQaEvidenceGalleryModel({ evidencePath: outputDir, repoRoot });
-        expect(model.entries[0]?.artifacts[0]).toMatchObject({
-          exists: true,
-          kind,
-          mediaKind,
-          preview,
-        });
-      } finally {
-        await fs.rm(repoRoot, { recursive: true, force: true });
-      }
-    },
-  );
+    ["artifact.LOG", "gif-runner-log", "runner passed\n", "text", "runner passed\n"],
+    ["artifact.json", "video-report", '{"ok":true}', "json", '{\n  "ok": true\n}'],
+    ["artifact.webm", "screenshot-validation", "video", "video", null],
+    ["artifact.png", "video-report", "image", "image", null],
+    ["artifact", "motion-preview-gif", "image", "image", null],
+    ["artifact.capture", "video-capture", "video", "video", null],
+    ["artifact.data", "validation-result", '{"ok":true}', "json", '{\n  "ok": true\n}'],
+    ["artifact.html", "report", "<p>report</p>", "text", "<p>report</p>"],
+    ["artifact.data", "video-screenshot", "image", "image", null],
+    ["artifact.data", "attachment", "opaque", "file", null],
+  ])("classifies $0 with $1 metadata", async (file, kind, content, mediaKind, preview) => {
+    const repoRoot = await createTempRepo();
+    try {
+      const outputDir = path.join(repoRoot, ".artifacts", "qa-e2e", "vitest");
+      await fs.mkdir(outputDir, { recursive: true });
+      await fs.writeFile(path.join(outputDir, file), content, "utf8");
+      await writeJson(
+        path.join(outputDir, QA_EVIDENCE_FILENAME),
+        vitestArtifactEvidence({
+          id: "qa-lab.artifact-classification",
+          title: "Artifact classification",
+          artifact: { kind, path: file },
+        }),
+      );
+      const model = await buildQaEvidenceGalleryModel({ evidencePath: outputDir, repoRoot });
+      expect(model.entries[0]?.artifacts[0]).toMatchObject({
+        exists: true,
+        kind,
+        mediaKind,
+        preview,
+      });
+    } finally {
+      await fs.rm(repoRoot, { recursive: true, force: true });
+    }
+  });
 
   it("sanitizes local roots from gallery failure reasons", async () => {
     const repoRoot = await createTempRepo();
@@ -511,77 +478,26 @@ describe("evidence gallery", () => {
       generatedAt: "2026-06-17T12:00:00.000Z",
       evidenceMode: "full",
       entries: [
-        {
-          test: {
-            kind: "ux-matrix-cell",
-            id: "ux-matrix.web-ui.first-run",
-            title: `UX Matrix: web-ui / first-run at ${repoRoot}`,
-            source: { path: "external/qa/ux-matrix-producer.mjs" },
-          },
-          coverage: [],
-          execution: {
-            runner: "ux-matrix-dashboard",
-            environment: {
-              ref: "gallery-test",
-              os: "darwin",
-              nodeVersion: "v24.0.0",
-            },
-            provider: {
-              id: "ux-matrix",
-              live: false,
-              model: { name: null, ref: null },
-              fixture: "mocked-control-ui-and-isolated-cli",
-            },
-            packageSource: { kind: "source-checkout", sha: "abc123" },
-            artifacts: [
-              {
-                kind: "screenshot",
-                path: path.join(
-                  runDir,
-                  "surfaces",
-                  "web-ui",
-                  "stages",
-                  "first-run",
-                  "screenshot.png",
-                ),
-                source: "ux-matrix:web-ui:first-run",
-              },
-            ],
+        uxMatrixEntry({
+          id: "ux-matrix.web-ui.first-run",
+          title: `UX Matrix: web-ui / first-run at ${repoRoot}`,
+          artifact: {
+            kind: "screenshot",
+            path: path.join(runDir, "surfaces", "web-ui", "stages", "first-run", "screenshot.png"),
+            source: "ux-matrix:web-ui:first-run",
           },
           result: { status: "pass", timing: { wallMs: 1 } },
-        },
-        {
-          test: {
-            kind: "ux-matrix-cell",
-            id: "qa-lab.wrapper-cli-error",
-            title: "UX Matrix: cli / error-state",
-            source: { path: "external/qa/ux-matrix-producer.mjs" },
-          },
-          coverage: [],
-          execution: {
-            runner: "ux-matrix-dashboard",
-            environment: {
-              ref: "gallery-test",
-              os: "darwin",
-              nodeVersion: "v24.0.0",
-            },
-            provider: {
-              id: "ux-matrix",
-              live: false,
-              model: { name: null, ref: null },
-              fixture: "mocked-control-ui-and-isolated-cli",
-            },
-            packageSource: { kind: "source-checkout", sha: "abc123" },
-            artifacts: [
-              {
-                kind: "log",
-                path: repoRelativePath(
-                  repoRoot,
-                  path.join(runDir, "surfaces", "cli", "stages", "error-state", "logs.txt"),
-                ),
-                source: "ux-matrix:cli:error-state",
-              },
-            ],
+        }),
+        uxMatrixEntry({
+          id: "qa-lab.wrapper-cli-error",
+          title: "UX Matrix: cli / error-state",
+          artifact: {
+            kind: "log",
+            path: repoRelativePath(
+              repoRoot,
+              path.join(runDir, "surfaces", "cli", "stages", "error-state", "logs.txt"),
+            ),
+            source: "ux-matrix:cli:error-state",
           },
           result: {
             status: "blocked",
@@ -591,7 +507,7 @@ describe("evidence gallery", () => {
             },
             timing: { wallMs: 2 },
           },
-        },
+        }),
       ],
     });
 

@@ -1,4 +1,3 @@
-// Defines core Zod schema fragments for canonical config parsing.
 import path from "node:path";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { z } from "zod";
@@ -8,6 +7,7 @@ import { normalizeExactAllowedHost } from "../secrets/exact-hostname.js";
 import { ENV_SECRET_REF_ID_RE, SECRET_PROVIDER_ALIAS_PATTERN } from "../secrets/ref-contract.js";
 import { MODEL_APIS, MODEL_THINKING_FORMATS } from "./model-config-vocabulary.js";
 import { isBuiltInModelProviderOverlayId } from "./model-provider-overlay-ids.js";
+import { AgentRuntimePolicySchema } from "./zod-schema.agent-entry-base.js";
 import { createAllowDenyChannelRulesSchema } from "./zod-schema.allowdeny.js";
 import { DmConfigSchema } from "./zod-schema.messages.js";
 import { SecretInputSchema } from "./zod-schema.secret-input.js";
@@ -74,11 +74,8 @@ const SecretsManualExecProviderSchema = z
     command: z
       .string()
       .min(1)
-      .refine((value) => isSafeExecutableValue(value), "secrets.providers.*.command is unsafe.")
-      .refine(
-        (value) => isAbsolutePath(value),
-        "secrets.providers.*.command must be an absolute path.",
-      ),
+      .refine(isSafeExecutableValue, "secrets.providers.*.command is unsafe.")
+      .refine(isAbsolutePath, "secrets.providers.*.command must be an absolute path."),
     args: z.array(z.string().max(1024)).max(128).optional(),
     timeoutMs: z.number().int().positive().max(120000).optional(),
     noOutputTimeoutMs: z.number().int().positive().max(120000).optional(),
@@ -93,10 +90,7 @@ const SecretsManualExecProviderSchema = z
     passEnv: z.array(z.string().regex(ENV_SECRET_REF_ID_RE)).max(128).optional(),
     trustedDirs: z
       .array(
-        z
-          .string()
-          .min(1)
-          .refine((value) => isAbsolutePath(value), "trustedDirs entries must be absolute paths."),
+        z.string().min(1).refine(isAbsolutePath, "trustedDirs entries must be absolute paths."),
       )
       .max(64)
       .optional(),
@@ -159,12 +153,7 @@ export const SecretsConfigSchema = z
       })
       .strict()
       .optional(),
-    providers: z
-      .object({
-        // Keep this as a record so users can define multiple named providers per source.
-      })
-      .catchall(SecretProviderSchema)
-      .optional(),
+    providers: z.object({}).catchall(SecretProviderSchema).optional(),
     defaults: z
       .object({
         env: z.string().regex(SECRET_PROVIDER_ALIAS_PATTERN).optional(),
@@ -248,6 +237,8 @@ const ModelCompatSchema = z
     supportsStore: z.boolean().optional(),
     /** Whether provider accepts prompt-cache/session affinity keys. */
     supportsPromptCacheKey: z.boolean().optional(),
+    /** Opts this model into stored HTTP continuation on a verified compatible endpoint. */
+    supportsResponsesContinuation: z.boolean().optional(),
     /** Whether the provider supports the `developer` role (vs `system`). Default: auto-detected from URL. */
     supportsDeveloperRole: z.boolean().optional(),
     /** Whether the provider supports `reasoning_effort`. Default: auto-detected from URL. */
@@ -348,9 +339,7 @@ const ModelCompatSchema = z
     supportsEagerToolInputStreaming: z.boolean().optional(),
     /**
      * Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"`
-     * or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. Whether
-     * the provider supports `prompt_cache_retention: "24h"`. Default: true. Whether the provider
-     * supports Anthropic long cache retention (`cache_control.ttl: "1h"`). Default: true.
+     * or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true.
      */
     supportsLongCacheRetention: z.boolean().optional(),
   })
@@ -427,13 +416,6 @@ const ConfiguredModelProviderRequestSchema = z
   .object({
     ...ConfiguredProviderRequestFields,
     allowPrivateNetwork: z.boolean().optional(),
-  })
-  .strict()
-  .optional();
-
-const ModelAgentRuntimePolicySchema = z
-  .object({
-    id: z.string().optional(),
   })
   .strict()
   .optional();
@@ -521,7 +503,7 @@ const ModelDefinitionSchema = z
     /** Provider-specific request/runtime parameters passed through to provider plugins. */
     params: z.record(z.string(), z.unknown()).optional(),
     /** Optional agent execution runtime override for this provider/model pair. */
-    agentRuntime: ModelAgentRuntimePolicySchema,
+    agentRuntime: AgentRuntimePolicySchema,
     /** Static headers merged into requests for this model. */
     headers: z.record(z.string(), z.string()).optional(),
     /** Provider compatibility flags for payload shaping and feature gating. */
@@ -576,7 +558,7 @@ const ModelProviderSchema = z
     /** Provider-specific runtime parameters interpreted by provider plugins. */
     params: z.record(z.string(), z.unknown()).optional(),
     /** Optional default agent execution runtime for models under this provider. */
-    agentRuntime: ModelAgentRuntimePolicySchema,
+    agentRuntime: AgentRuntimePolicySchema,
     /** Optional local service to start before calling this provider. */
     localService: ModelProviderLocalServiceSchema,
     /** Secret-bearing headers merged into provider requests. */
@@ -624,16 +606,13 @@ const ModelCatalogRefreshConfigSchema = z
       .string()
       .refine(
         (value) => {
-          try {
-            const parsed = new URL(value);
-            return (
-              parsed.protocol === "https:" ||
+          const parsed = URL.parse(value);
+          return (
+            parsed !== null &&
+            (parsed.protocol === "https:" ||
               (parsed.protocol === "http:" &&
-                ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname))
-            );
-          } catch {
-            return false;
-          }
+                ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)))
+          );
         },
         {
           message: "models.catalogRefresh.url must use https, or http on localhost",
@@ -803,9 +782,6 @@ export const HumanDelaySchema = z
   })
   .strict();
 
-const normalizeAllowFrom = (values?: Array<string | number>): string[] =>
-  normalizeStringEntries(values);
-
 /**
  * Closed set of sender-policy/allowFrom dependency violations. Both cases drop
  * every inbound DM at runtime, so callers surface them as config problems.
@@ -821,7 +797,7 @@ export const evaluateDmPolicyAllowFromDependency = (params: {
   policy?: string;
   allowFrom?: Array<string | number>;
 }): DmPolicyAllowFromViolation | null => {
-  const allow = normalizeAllowFrom(params.allowFrom);
+  const allow = normalizeStringEntries(params.allowFrom);
   if (params.policy === "open" && !allow.includes("*")) {
     return "open_requires_wildcard";
   }
@@ -831,50 +807,34 @@ export const evaluateDmPolicyAllowFromDependency = (params: {
   return null;
 };
 
-export const requireOpenAllowFrom = (params: {
-  policy?: string;
-  allowFrom?: Array<string | number>;
-  ctx: z.RefinementCtx;
-  path: Array<string | number>;
-  message: string;
-}) => {
-  if (
-    evaluateDmPolicyAllowFromDependency({ policy: params.policy, allowFrom: params.allowFrom }) !==
-    "open_requires_wildcard"
-  ) {
-    return;
-  }
-  params.ctx.addIssue({
-    code: z.ZodIssueCode.custom,
-    path: params.path,
-    message: params.message,
-  });
-};
+function createDmPolicyAllowFromValidator(violation: DmPolicyAllowFromViolation) {
+  return (params: {
+    policy?: string;
+    allowFrom?: Array<string | number>;
+    ctx: z.RefinementCtx;
+    path: Array<string | number>;
+    message: string;
+  }) => {
+    if (evaluateDmPolicyAllowFromDependency(params) === violation) {
+      params.ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: params.path,
+        message: params.message,
+      });
+    }
+  };
+}
+
+export const requireOpenAllowFrom = createDmPolicyAllowFromValidator("open_requires_wildcard");
 
 /**
  * Validate that dmPolicy="allowlist" has a non-empty allowFrom array.
  * Without this, all DMs are silently dropped because the allowlist is empty
  * and no senders can match.
  */
-export const requireAllowlistAllowFrom = (params: {
-  policy?: string;
-  allowFrom?: Array<string | number>;
-  ctx: z.RefinementCtx;
-  path: Array<string | number>;
-  message: string;
-}) => {
-  if (
-    evaluateDmPolicyAllowFromDependency({ policy: params.policy, allowFrom: params.allowFrom }) !==
-    "allowlist_requires_entries"
-  ) {
-    return;
-  }
-  params.ctx.addIssue({
-    code: z.ZodIssueCode.custom,
-    path: params.path,
-    message: params.message,
-  });
-};
+export const requireAllowlistAllowFrom = createDmPolicyAllowFromValidator(
+  "allowlist_requires_entries",
+);
 
 export const MSTeamsReplyStyleSchema = z.enum(["thread", "top-level"]);
 
@@ -910,14 +870,11 @@ const ProviderOptionsSchema = z
   .optional();
 
 const MediaUnderstandingRuntimeFields = {
-  /** Optional prompt override for this model entry. */
-  /** Default prompt. */
+  /** Default prompt; model entries can override it. */
   prompt: z.string().optional(),
-  /** Optional timeout override (seconds) for this model entry. */
-  /** Default timeout (seconds). */
+  /** Default timeout (seconds); model entries can override it. */
   timeoutSeconds: z.number().int().positive().optional(),
-  /** Optional language hint for audio transcription. */
-  /** Default language hint (audio). */
+  /** Default language hint for audio transcription; model entries can override it. */
   language: z.string().optional(),
   /** Optional provider-specific query params (merged into requests). */
   providerOptions: ProviderOptionsSchema,
@@ -958,19 +915,6 @@ const MediaUnderstandingModelSchema = z
 
 const ToolsMediaCapabilitySchema = z
   .object({
-    enabled: z.boolean().optional(),
-    preferredModel: z.string().trim().min(1).optional(),
-    scope: MediaUnderstandingScopeSchema,
-    maxBytes: z.number().int().positive().optional(),
-    maxChars: z.number().int().positive().optional(),
-    ...MediaUnderstandingRuntimeFields,
-    attachments: MediaUnderstandingAttachmentsSchema,
-  })
-  .strict()
-  .optional();
-
-const ToolsMediaAudioSchema = z
-  .object({
     /** Enable media understanding when models are configured. */
     enabled: z.boolean().optional(),
     /** Prefer a matching shared model entry. */
@@ -984,6 +928,12 @@ const ToolsMediaAudioSchema = z
     ...MediaUnderstandingRuntimeFields,
     /** Attachment selection policy. */
     attachments: MediaUnderstandingAttachmentsSchema,
+  })
+  .strict()
+  .optional();
+
+const ToolsMediaAudioSchema = ToolsMediaCapabilitySchema.unwrap()
+  .extend({
     /**
      * Echo the audio transcript back to the originating chat before agent processing.
      * Lets users verify what was heard. Default: false.
@@ -995,7 +945,6 @@ const ToolsMediaAudioSchema = z
      */
     echoFormat: z.string().optional(),
   })
-  .strict()
   .optional();
 
 export const ToolsMediaSchema = z

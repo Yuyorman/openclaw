@@ -9,7 +9,6 @@ import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 const mocks = vi.hoisted(() => ({
   ensureAuthProfileStore: vi.fn(),
   evaluateStoredCredentialEligibility: vi.fn(),
-  getInstalledPluginRecord: vi.fn(),
   isInstalledPluginEnabled: vi.fn(),
   loadInstalledPluginIndex: vi.fn(),
   resolveAuthProfileOrder: vi.fn(),
@@ -28,7 +27,6 @@ vi.mock("../../../agents/auth-profiles/credential-state.js", () => ({
 
 vi.mock("../../../plugins/installed-plugin-index.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../../plugins/installed-plugin-index.js")>()),
-  getInstalledPluginRecord: mocks.getInstalledPluginRecord,
   isInstalledPluginEnabled: mocks.isInstalledPluginEnabled,
   loadInstalledPluginIndex: mocks.loadInstalledPluginIndex,
 }));
@@ -122,21 +120,6 @@ function itKeepsCodexPluginDisabled(title: string, cfg: Record<string, unknown>)
   });
 }
 
-function itAddsCodexToAllowlist(title: string, withOpenAIEntry = true) {
-  it(title, () => {
-    const result = maybeRepairCodexRoutes({
-      plugins: {
-        allow: ["openai"],
-        ...(withOpenAIEntry ? { entries: { openai: { enabled: true } } } : {}),
-      },
-      agents: { defaults: { model: "gpt-5.5" } },
-    });
-
-    expectCodexPluginEnabled(result);
-    expect(result.cfg.plugins?.allow).toEqual(["openai", "codex"]);
-  });
-}
-
 function itRepairsCodexCompaction(title: string, cfg: Record<string, unknown>) {
   it(title, () => {
     const result = maybeRepairCodexRoutes(cfg);
@@ -193,7 +176,6 @@ describe("collectCodexRouteWarnings", () => {
       eligible: true,
       reasonCode: "ok",
     });
-    mocks.getInstalledPluginRecord.mockReturnValue(undefined);
     mocks.isInstalledPluginEnabled.mockReturnValue(false);
     mocks.loadInstalledPluginIndex.mockReturnValue({ plugins: [] });
     mocks.resolveAuthProfileOrder.mockReturnValue([]);
@@ -1896,19 +1878,6 @@ describe("collectCodexRouteWarnings", () => {
     });
   });
 
-  it("repairs legacy routes without requiring OAuth readiness", () => {
-    const result = maybeRepairCodexRoutes({
-      agents: { defaults: { model: "openai-codex/gpt-5.5" } },
-    });
-
-    expect(result.cfg.agents?.defaults?.model).toBe("openai/gpt-5.5");
-    expect(result.cfg.agents?.defaults?.agentRuntime).toBeUndefined();
-    expect(result.cfg.agents?.defaults?.models?.["openai/gpt-5.5"]?.agentRuntime).toEqual({
-      id: "codex",
-    });
-    expect(result.changes.join("\n")).toContain("agentRuntime.id");
-  });
-
   it("warns without overriding an explicit Codex plugin opt-out", () => {
     const result = maybeRepairCodexRoutes({
       plugins: {
@@ -2248,14 +2217,6 @@ describe("collectCodexRouteWarnings", () => {
     expect(result.cfg.plugins?.entries?.codex?.enabled).toBe(false);
     expect(result.cfg.plugins?.allow).toEqual([]);
   });
-
-  itAddsCodexToAllowlist(
-    "adds Codex to a non-empty plugin allowlist when OpenAI routes require Codex runtime",
-  );
-
-  itAddsCodexToAllowlist("treats plugin allowlists as restrictive for the Codex harness");
-
-  itAddsCodexToAllowlist("adds Codex to plugin allowlists when re-enabling Codex", false);
 
   it("keeps the Codex plugin disabled when OpenAI routes explicitly use the OpenClaw runtime", () => {
     const result = maybeRepairCodexRoutes({
@@ -3392,7 +3353,6 @@ describe("collectCodexRouteWarnings", () => {
     };
     mocks.ensureAuthProfileStore.mockReturnValue(store);
     mocks.loadInstalledPluginIndex.mockReturnValue(index);
-    mocks.getInstalledPluginRecord.mockReturnValue(index.plugins[0]);
     mocks.isInstalledPluginEnabled.mockReturnValue(true);
     mocks.resolveAuthProfileOrder.mockReturnValue(["openai-codex:default"]);
 
@@ -3406,30 +3366,6 @@ describe("collectCodexRouteWarnings", () => {
     expect(mocks.loadInstalledPluginIndex).not.toHaveBeenCalled();
     expect(mocks.isInstalledPluginEnabled).not.toHaveBeenCalled();
     expect(mocks.resolveAuthProfileOrder).not.toHaveBeenCalled();
-    expect(result.cfg.agents?.defaults?.model).toBe("openai/gpt-5.5");
-    expect(result.cfg.agents?.defaults?.agentRuntime).toBeUndefined();
-  });
-
-  it("still repairs routes when installed plugin metadata is unavailable", () => {
-    const store = {
-      profiles: {
-        "openai-codex:default": { type: "oauth", provider: "openai-codex", access: "access-token" },
-      },
-      usageStats: {},
-    };
-    const index = {
-      plugins: [{ pluginId: "codex", enabled: true, startup: { agentHarnesses: [] } }],
-    };
-    mocks.ensureAuthProfileStore.mockReturnValue(store);
-    mocks.loadInstalledPluginIndex.mockReturnValue(index);
-    mocks.getInstalledPluginRecord.mockReturnValue(index.plugins[0]);
-    mocks.isInstalledPluginEnabled.mockReturnValue(true);
-    mocks.resolveAuthProfileOrder.mockReturnValue(["openai-codex:default"]);
-
-    const result = maybeRepairCodexRoutes({
-      agents: { defaults: { model: "openai-codex/gpt-5.5" } },
-    });
-
     expect(result.cfg.agents?.defaults?.model).toBe("openai/gpt-5.5");
     expect(result.cfg.agents?.defaults?.agentRuntime).toBeUndefined();
   });

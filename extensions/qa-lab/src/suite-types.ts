@@ -1,4 +1,3 @@
-import type { OpenClawCrablineChannelDriverSelection } from "@openclaw/crabline";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type {
   QaEvidenceOccurrence,
@@ -17,7 +16,9 @@ import type {
   QaTransportId,
 } from "./qa-transport-registry.js";
 import type { QaReportCheck } from "./report.js";
-import type { RuntimeId, RuntimeParityCell, RuntimeParityResult } from "./runtime-parity.js";
+import type { RuntimeId } from "./runtime-id.js";
+import type { RuntimeParityCell, RuntimeParityResult } from "./runtime-parity.js";
+import type { QaSeedScenarioWithSource } from "./scenario-catalog.js";
 import type { QaScorecardChannelDriver, QaScorecardEvidenceMode } from "./scorecard-taxonomy.js";
 import type { QaSuiteRoundTripProbe } from "./suite-round-trip.js";
 import type { QaSuiteRuntimeEnv } from "./suite-runtime-types.js";
@@ -54,6 +55,18 @@ export type QaSuiteEnvironment = {
 
 export type QaSuiteStartLabFn = (params?: QaLabServerStartParams) => Promise<QaLabServerHandle>;
 
+export function rejectRemovedQaChannelDriverSelection(value: unknown): void {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    Object.hasOwn(value, "channelDriverSelection")
+  ) {
+    throw new TypeError(
+      "channelDriverSelection was removed; pass channelDriver with channelId for suite runs or channel for summaries",
+    );
+  }
+}
+
 export type QaSuiteRunParams = {
   adapterOptions?: QaTransportFactoryContext["adapterOptions"];
   adapterFactories?: readonly QaTransportAdapterFactory[];
@@ -71,7 +84,6 @@ export type QaSuiteRunParams = {
   providerMode?: QaProviderMode;
   transportId?: QaTransportId;
   channelDriver?: QaScorecardChannelDriver;
-  channelDriverSelection?: OpenClawCrablineChannelDriverSelection | null;
   primaryModel?: string;
   alternateModel?: string;
   fastMode?: boolean;
@@ -79,6 +91,7 @@ export type QaSuiteRunParams = {
   thinkingDefault?: QaThinkingLevel;
   claudeCliAuthMode?: QaCliBackendAuthMode;
   scenarioIds?: string[];
+  scenarioDefinitions?: QaSeedScenarioWithSource[];
   lab?: QaLabServerHandle;
   startLab?: QaSuiteStartLabFn;
   concurrency?: number;
@@ -111,9 +124,7 @@ export type QaSuiteResult = {
 export type QaSuiteRunner = (params?: QaSuiteRunParams) => Promise<QaSuiteResult>;
 export type QaSuiteScenarioRunner = (
   env: QaSuiteEnvironment,
-  scenario: ReturnType<
-    typeof import("./scenario-catalog.js").readQaBootstrapScenarioCatalog
-  >["scenarios"][number],
+  scenario: QaSeedScenarioWithSource,
 ) => Promise<QaSuiteScenarioResult>;
 
 export type QaSuiteResolvedRunContext = {
@@ -121,9 +132,7 @@ export type QaSuiteResolvedRunContext = {
   repoRoot: string;
   outputDir: string;
   transportId: QaTransportId;
-  selectedScenarios: ReturnType<
-    typeof import("./scenario-catalog.js").readQaBootstrapScenarioCatalog
-  >["scenarios"];
+  selectedScenarios: QaSeedScenarioWithSource[];
   providerMode: QaProviderMode;
   primaryModel: string;
   alternateModel: string;

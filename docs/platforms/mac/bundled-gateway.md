@@ -7,16 +7,25 @@ read_when:
 title: "Gateway on macOS"
 ---
 
-OpenClaw.app bundles a private Node runtime and matching OpenClaw package for
-its app-owned `node worker` helper. Rebuilding or replacing the app replaces
-that helper too, including rebuilds with the same public version. The helper
-runs from the signed bundle, so moving the app or removing its build checkout
-does not change which worker it uses.
+OpenClaw.app bundles a private runtime built from the OpenClaw Bun fork, a signed
+SQLite library with extension loading, and the full matching OpenClaw package
+(CLI, Gateway, and Control UI). Its app-owned `node worker` helper and fixed local
+Chrome-extension setup entry point run on this Bun runtime. The app bundle
+contains no Node executable.
+
+The payload lives in one `Contents/Resources/runtime` directory. Universal apps
+share the JavaScript package between architectures and include universal Bun and
+SQLite binaries plus each architecture's native dependencies. Rebuilding or
+replacing the app replaces this runtime too, including rebuilds with the same
+public version. The app validates the package's version, commit, build time, and
+build ID before launch. Moving the app or removing its build checkout does not
+change which runtime it uses.
 
 The **Gateway remains external**. The app uses an external `openclaw` CLI to
 manage a per-user launchd service, or attaches to an already-running Gateway.
-It does not start the Gateway inside its private worker runtime. Packaging the
-worker never installs, updates, or restarts a Gateway service.
+It does not yet start the Gateway inside its private runtime; bundled Gateway
+hosting is a separate, subsequent change. Packaging the runtime never installs,
+updates, or restarts a Gateway service.
 
 The private worker validates core and node configuration through a read-only
 bootstrap, without Gateway-wide Doctor preflight or channel-schema validation.
@@ -48,7 +57,7 @@ the CLI as root.
 
 Gateway setup still needs an internet connection to download its separate
 runtime and matching OpenClaw package. The bundled installer owns that setup;
-the private worker is not a replacement for a CLI or Gateway installation.
+the bundled runtime does not replace this external CLI or Gateway installation.
 
 Remote connections and attachment to an independently managed local Gateway
 skip this installation. Attach-only mode never prompts for a CLI to run the
@@ -57,6 +66,14 @@ app-managed service removes its LaunchAgent record. If an independent endpoint
 is no longer available on reattachment, local setup becomes available again.
 An unreadable service ownership record blocks automatic installation instead
 of being treated as a missing service; check the LaunchAgent and retry.
+
+Chrome-extension preparation also runs automatically for the default app
+profile, including remote-only and attach-only Macs. It uses the validated
+private runtime, registers the native helper before requesting the Store
+extension, and leaves Chrome’s permission approval to you. Browser setup does not
+run Gateway-wide Doctor or migrate Gateway state. The Dashboard’s **Set up Chrome
+on this device** action retries the same serialized operation. See
+[Chrome extension](/tools/chrome-extension).
 
 ## Manual recovery
 
@@ -89,6 +106,10 @@ Plist location (per-user): `~/Library/LaunchAgents/ai.openclaw.gateway.plist`
 The macOS app owns LaunchAgent install/update for the default profile in
 Local mode. The CLI can also install it directly: `openclaw gateway install`
 (named profiles are selected via the `OPENCLAW_PROFILE` env var).
+Enabling the Gateway from the app preserves a saved runtime pin.
+If the pin is invalid, enabling fails with the CLI error; reinstall explicitly with
+`--runtime` or `--runtime-path` to replace the saved pin.
+Disabling it uninstalls the LaunchAgent, which removes the pin.
 
 Behavior:
 
@@ -96,6 +117,8 @@ Behavior:
 - Quitting the app does **not** stop the Gateway (launchd keeps it alive).
 - If a Gateway is already running on the configured port, the app attaches to
   it instead of starting a new one.
+- Other listeners are left running. Resolve port conflicts through the process
+  or service that owns them; automatic cleanup only reaps recorded orphaned SSH tunnels.
 - If service inspection is inconclusive, the app defers installation and uses
   its existing readiness checks. A service confirmed absent can still be installed.
 
@@ -200,6 +223,11 @@ version number. A missing or incompatible worker payload produces a visible
 worker error; rebuild or reinstall the app. Changing CLI channels or updating
 a global CLI does not repair this private payload. Unbundled Swift development
 builds can use the checkout's freshness-aware source runner instead.
+
+If a Gateway update advances the shared state database schema beyond the private
+worker's supported version, update and relaunch OpenClaw.app too. Restarting the
+external Gateway does not replace the app-owned worker. A schema-version error
+from that older reader does not mean the upgraded Gateway's database is corrupt.
 
 For an app-owned local Gateway, the macOS app checks the external CLI against
 its install policy. Onboarding runs managed setup when that CLI is missing or

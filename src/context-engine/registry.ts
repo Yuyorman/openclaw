@@ -29,6 +29,7 @@ import {
   describeResolvedContextEngineContractError,
   projectContextEngineHostParams,
 } from "./registry-contract.js";
+import { resolveEffectiveContextEngineId } from "./registry-selection.js";
 import {
   recordContextEngineRegistrationSource,
   createContextEngineWithResources,
@@ -48,11 +49,6 @@ import type {
 
 export type { ContextEngineFactory } from "../plugins/registry-contribution-types.js";
 
-/**
- * Runtime context passed to context engine factories during resolution.
- * Provides config and path information so plugins can initialize engines
- * without fragile workarounds.
- */
 type ContextEngineRegistrationResult = { ok: true } | { ok: false; existingOwner: string };
 
 type RegisterContextEngineForOwnerOptions = {
@@ -270,20 +266,12 @@ function wrapResolvedContextEngine(
   });
   return wrapped;
 }
-// ---------------------------------------------------------------------------
-// Registry (module-level singleton)
-// ---------------------------------------------------------------------------
-
 const CONTEXT_ENGINE_REGISTRY_STATE = Symbol.for("openclaw.contextEngineRegistryState");
 const CORE_CONTEXT_ENGINE_OWNER = "core";
 
-type ContextEngineRuntimeQuarantine = {
-  engineId: string;
-  owner?: string;
-  operation: string;
-  reason: string;
-  failedAt: Date;
-};
+type ContextEngineRuntimeQuarantine = Awaited<
+  ReturnType<typeof listPersistedContextEngineQuarantines>
+>[number];
 
 type ContextEngineRegistryState = {
   quarantinedEngines: Map<string, ContextEngineRuntimeQuarantine>;
@@ -348,15 +336,14 @@ function getContextEngineQuarantine(engineId: string): ContextEngineRuntimeQuara
   return contextEngineRegistryState.quarantinedEngines.get(engineId);
 }
 
-export function listContextEngineQuarantines(): ContextEngineRuntimeQuarantine[] {
+export async function listContextEngineQuarantines(): Promise<ContextEngineRuntimeQuarantine[]> {
+  const persisted = await listPersistedContextEngineQuarantines();
   const quarantines = Array.from(
     contextEngineRegistryState.quarantinedEngines.values(),
     ({ failedAt, ...quarantine }) => ({ ...quarantine, failedAt: new Date(failedAt) }),
   );
   const seenEngineIds = new Set(quarantines.map((entry) => entry.engineId));
-  return quarantines.concat(
-    listPersistedContextEngineQuarantines().filter(({ engineId }) => !seenEngineIds.has(engineId)),
-  );
+  return quarantines.concat(persisted.filter(({ engineId }) => !seenEngineIds.has(engineId)));
 }
 
 function clearContextEngineRuntimeQuarantine(engineId: string): void {
@@ -498,13 +485,6 @@ async function invokeFallbackContextEngineMethod(params: {
   return fallbackResult ? { ...fallbackResult } : undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Resolution
-// ---------------------------------------------------------------------------
-
-/**
- * Options for {@link resolveContextEngine}.
- */
 export type ResolveContextEngineOptions = {
   agentDir?: string;
   workspaceDir?: string;
@@ -524,19 +504,6 @@ export type LogicalTurnContextEngineResolution = {
   fallback: ResolvedContextEngineRef;
   sourceResources?: ReadonlyMap<ContextEngine, readonly ContextEngineFactoryResources[]>;
 };
-
-function resolvedContextEngineRef(params: {
-  engine: ContextEngine;
-  registeredId: string;
-  owner: string;
-}): ResolvedContextEngineRef {
-  const pluginId = pluginIdFromContextEngineOwner(params.owner);
-  return Object.freeze({
-    engine: params.engine,
-    registeredId: params.registeredId,
-    ...(pluginId ? { ownerPluginId: pluginId } : {}),
-  });
-}
 
 async function createOwnedContextEngine(
   engineId: string,
@@ -593,10 +560,12 @@ async function resolveRawContextEngineRef(
         `Available engines: ${listContextEngineIds().join(", ") || "(none)"}`,
     );
   }
-  return resolvedContextEngineRef({
-    engine: await createOwnedContextEngine(engineId, entry, factoryCtx, { source }),
+  const engine = await createOwnedContextEngine(engineId, entry, factoryCtx, { source });
+  const pluginId = pluginIdFromContextEngineOwner(entry.owner);
+  return Object.freeze({
+    engine,
     registeredId: engineId,
-    owner: entry.owner,
+    ...(pluginId ? { ownerPluginId: pluginId } : {}),
   });
 }
 
@@ -610,9 +579,7 @@ export async function resolveLogicalTurnContextEngines(
 ): Promise<LogicalTurnContextEngineResolution> {
   return await runContextEngineFactoryResolution(async (abandon) => {
     const defaultEngineId = defaultSlotIdForKey("contextEngine");
-    const slotValue = config?.plugins?.slots?.contextEngine;
-    const configuredEngineId =
-      typeof slotValue === "string" && slotValue.trim() ? slotValue.trim() : defaultEngineId;
+    const configuredEngineId = resolveEffectiveContextEngineId(config, getContextEngines());
     const factoryCtx: ContextEngineFactoryContext = {
       config,
       agentDir: options?.agentDir,
@@ -686,7 +653,7 @@ export async function resolveLogicalTurnContextEngines(
  * Resolve which ContextEngine to use based on plugin slot configuration.
  *
  * Resolution order:
- *   1. `config.plugins.slots.contextEngine` (explicit slot override)
+ *   1. `config.plugins.slots.contextEngine` when its plugin policy permits it
  *   2. Default slot value ("legacy")
  *
  * When `config` is provided it is forwarded to the factory as part of a
@@ -704,9 +671,7 @@ export async function resolveContextEngine(
   options?: ResolveContextEngineOptions,
 ): Promise<ContextEngine> {
   const defaultEngineId = defaultSlotIdForKey("contextEngine");
-  const slotValue = config?.plugins?.slots?.contextEngine;
-  const engineId =
-    typeof slotValue === "string" && slotValue.trim() ? slotValue.trim() : defaultEngineId;
+  const engineId = resolveEffectiveContextEngineId(config, getContextEngines());
   const isDefaultEngine = engineId === defaultEngineId;
 
   const factoryCtx: ContextEngineFactoryContext = {

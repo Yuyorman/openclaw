@@ -59,7 +59,7 @@ const mocks = vi.hoisted(() => ({
     async (_params: {
       channel?: string | null;
       channelDriver?: string | null;
-      channelDriverSelection?: unknown;
+      transportArtifacts?: unknown;
       recordedEvidence?: QaEvidenceSummaryJson;
     }) => ({
       evidence: _params.recordedEvidence,
@@ -77,8 +77,8 @@ vi.mock("openclaw/plugin-sdk/agent-harness", () => ({
 vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
   fetchWithSsrFGuard: mocks.fetchWithSsrFGuard,
 }));
-vi.mock("./crabline-transport.js", () => ({
-  createQaCrablineTransportAdapter: vi.fn(async () => ({
+vi.mock("./crabline-transport.js", () => {
+  const createTransport = vi.fn(async () => ({
     id: "telegram",
     label: "Crabline Telegram",
     accountId: "sut",
@@ -95,9 +95,17 @@ vi.mock("./crabline-transport.js", () => ({
     }),
     handleAction: vi.fn(async () => {}),
     createReportNotes: () => [],
-    cleanup: vi.fn(async () => {}),
-  })),
-}));
+    captureArtifacts: vi.fn(async () => ({
+      artifacts: [{ kind: "channel-driver-smoke", path: "/qa-output/driver-smoke.json" }],
+      reportNotes: [],
+    })),
+    cleanupAfterGatewayStop: vi.fn(async () => {}),
+  }));
+  return {
+    createQaCrablineTransportAdapter: createTransport,
+    createQaCrablineTransportDefinition: createTransport,
+  };
+});
 vi.mock("./gateway-child.js", () => ({
   createQaGatewayChild: () => ({
     start: (params: unknown) => mocks.startQaGatewayChild(params),
@@ -211,6 +219,31 @@ async function runCleanupTestSuite(params: {
   });
 }
 
+function createCleanupTestChild(
+  lab: QaLabServerHandle,
+  startedScenarioIds: string[] = ["runtime-cleanup"],
+) {
+  return vi.fn<QaSuiteRunner>().mockImplementation(async (params) => ({
+    outputDir: "/qa-child",
+    evidencePath: "/qa-child/qa-evidence.json",
+    reportPath: "/qa-child/qa-suite-report.md",
+    summaryPath: "/qa-child/qa-suite-summary.json",
+    report: "",
+    scenarios: [{ name: "runtime-cleanup", status: "pass", steps: [] }],
+    startedScenarioIds,
+    watchUrl: lab.baseUrl,
+    runtimeParityCell: {
+      runtime: params?.forcedRuntime ?? "openclaw",
+      transcriptBytes: "",
+      toolCalls: [],
+      finalText: "ok",
+      usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      wallClockMs: 1,
+      bootStateLines: [],
+    },
+  }));
+}
+
 describe("runtime parity suite transport cleanup", () => {
   it("executes repeated flow instances in request order through the standard producer", async () => {
     const repoRoot = await tempDirs.makeTempDir("qa-repeated-flow-");
@@ -274,25 +307,7 @@ describe("runtime parity suite transport cleanup", () => {
     const cleanup = vi.fn(async () => {});
     const factory = createCleanupTestFactory(lab, () => ({ cleanup }));
     const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-    const runChild = vi.fn<QaSuiteRunner>().mockImplementation(async (params) => ({
-      outputDir: "/qa-child",
-      evidencePath: "/qa-child/qa-evidence.json",
-      reportPath: "/qa-child/qa-suite-report.md",
-      summaryPath: "/qa-child/qa-suite-summary.json",
-      report: "",
-      scenarios: [{ name: "runtime-cleanup", status: "pass", steps: [] }],
-      startedScenarioIds: ["runtime-cleanup"],
-      watchUrl: lab.baseUrl,
-      runtimeParityCell: {
-        runtime: params?.forcedRuntime ?? "openclaw",
-        transcriptBytes: "",
-        toolCalls: [],
-        finalText: "ok",
-        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        wallClockMs: 1,
-        bootStateLines: [],
-      },
-    }));
+    const runChild = createCleanupTestChild(lab);
 
     try {
       const thrown = await runCleanupTestSuite({
@@ -325,25 +340,7 @@ describe("runtime parity suite transport cleanup", () => {
     const lab = createCleanupTestLab();
     const cleanup = vi.fn(async () => {});
     const factory = createCleanupTestFactory(lab, () => ({ cleanup }));
-    const runChild = vi.fn<QaSuiteRunner>().mockImplementation(async (params) => ({
-      outputDir: "/qa-child",
-      evidencePath: "/qa-child/qa-evidence.json",
-      reportPath: "/qa-child/qa-suite-report.md",
-      summaryPath: "/qa-child/qa-suite-summary.json",
-      report: "",
-      scenarios: [{ name: "runtime-cleanup", status: "pass", steps: [] }],
-      startedScenarioIds: [],
-      watchUrl: lab.baseUrl,
-      runtimeParityCell: {
-        runtime: params?.forcedRuntime ?? "openclaw",
-        transcriptBytes: "",
-        toolCalls: [],
-        finalText: "ok",
-        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
-        wallClockMs: 1,
-        bootStateLines: [],
-      },
-    }));
+    const runChild = createCleanupTestChild(lab, []);
 
     const result = await runCleanupTestSuite({ factory, lab, runChild });
 
@@ -358,12 +355,6 @@ describe("runtime parity suite transport cleanup", () => {
       mocks.writeQaSuiteArtifacts.mockClear();
       const repoRoot = await tempDirs.makeTempDir("qa-runtime-publication-");
       const scenario = makeQaSuiteTestScenario("runtime-cleanup");
-      const selection = {
-        capabilityMatrixPath: "crabline-channel-driver-capabilities.json",
-        channel: "telegram",
-        channelDriver: "crabline",
-        providerReadinessArtifactPath: "crabline-provider-readiness.json",
-      } as const;
       const labs = Array.from({ length: parity ? 3 : 1 }, createCleanupTestLab);
       const startLab = vi.fn<() => Promise<QaLabServerHandle>>();
       for (const lab of labs) {
@@ -387,7 +378,7 @@ describe("runtime parity suite transport cleanup", () => {
           providerMode: "mock-openai",
           transportId: "qa-channel",
           channelId: "telegram",
-          channelDriverSelection: selection,
+          channelDriver: "crabline",
           primaryModel: "mock-openai/test-model",
           alternateModel: "mock-openai/test-model-alt",
           fastMode: true,
@@ -410,13 +401,15 @@ describe("runtime parity suite transport cleanup", () => {
         ]);
         expect(runScenario).toHaveBeenCalledTimes(parity ? 2 : 1);
         expect(mocks.writeQaSuiteArtifacts).toHaveBeenCalledTimes(labs.length);
-        for (const [cellArtifacts] of mocks.writeQaSuiteArtifacts.mock.calls.slice(0, -1)) {
-          expect(cellArtifacts.channelDriverSelection).toBeUndefined();
+        for (const [childArtifacts] of mocks.writeQaSuiteArtifacts.mock.calls.slice(0, -1)) {
+          expect(childArtifacts.transportArtifacts).toBeUndefined();
         }
         expect(mocks.writeQaSuiteArtifacts.mock.calls.at(-1)?.[0]).toMatchObject({
           channel: "telegram",
           channelDriver: "crabline",
-          channelDriverSelection: selection,
+          transportArtifacts: {
+            artifacts: [{ kind: "channel-driver-smoke", path: "/qa-output/driver-smoke.json" }],
+          },
         });
         for (const lab of labs) {
           expect(lab.stop).toHaveBeenCalledOnce();

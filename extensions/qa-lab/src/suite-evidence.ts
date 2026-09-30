@@ -10,6 +10,7 @@ import { captureQaEvidenceLaunchIdentity } from "./evidence-environment.js";
 import { createQaEvidenceInvocation } from "./evidence-invocation.js";
 import {
   buildQaSuiteEvidenceSummary,
+  collectQaEvidenceArtifacts,
   validateQaEvidenceSummaryJson,
   type QaEvidenceIdentity,
   type QaEvidenceSummaryJson,
@@ -25,15 +26,7 @@ import type {
 /** Rebase both raw entries and bound receipts through the same artifact owner. */
 export function rebaseQaSuiteEvidence(summary: QaEvidenceSummaryJson, from: string, to: string) {
   const rebased = structuredClone(summary);
-  const artifacts = [
-    ...rebased.entries.flatMap((entry) => entry.execution?.artifacts ?? []),
-    ...(rebased.schemaVersion === 3
-      ? rebased.occurrences.flatMap((occurrence) =>
-          occurrence.receipts.map((receipt) => receipt.artifact),
-        )
-      : []),
-  ];
-  for (const artifact of artifacts) {
+  for (const artifact of collectQaEvidenceArtifacts(rebased)) {
     if (
       artifact.source === "qa-suite" &&
       repoRootTokenArtifactPath(artifact.path) === null &&
@@ -59,8 +52,7 @@ export async function createQaSuiteEvidenceInvocation(
     params?.evidenceAnchors?.[0]?.launch ??
       (await captureQaEvidenceLaunchIdentity(context.repoRoot)),
   );
-  const channel =
-    params?.channelId ?? params?.channelDriverSelection?.channel ?? context.transportId;
+  const channel = params?.channelId ?? context.transportId;
   const invocation = createQaEvidenceInvocation({
     scenarios: context.selectedScenarios,
     channel,

@@ -10,7 +10,8 @@ import {
   type MemorySource,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { runSqliteImmediateTransaction } from "openclaw/plugin-sdk/sqlite-runtime";
-import { MemoryIndexRevisionConflictError } from "./manager-db.js";
+import { withMemoryWorkspaceLock } from "../memory-workspace-lock.js";
+import { MemoryIndexRevisionConflictError } from "./manager-db-kernel.js";
 import type { MemoryIndexEntry } from "./manager-index-preparation.js";
 import { MemoryManagerSessionSyncOps } from "./manager-session-sync-ops.js";
 import {
@@ -66,23 +67,27 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
     source: MemorySource,
     expectedHash?: string,
   ): Promise<void> {
-    const capturedHash =
-      expectedHash ??
-      (await this.withDatabaseRead(() =>
-        resolveMemorySourceExistingHash({ db: this.db, path: pathname, source }),
-      ));
-    await runSqliteImmediateTransaction(
-      this.db,
-      async () => () => {
-        this.database.sourceIndex.deleteIfCurrent({
-          path: pathname,
-          source,
-          expectedHash: capturedHash,
-        });
-      },
-      undefined,
-      (write) => this.withDatabaseWrite(write),
-    );
+    // Recall and forget also write this database under the workspace lock.
+    // Keep their synchronous writes outside the Worker's native transaction.
+    await withMemoryWorkspaceLock(this.workspaceDir, async () => {
+      const database = this.database;
+      const capturedHash =
+        expectedHash ??
+        (await this.withDatabaseRead(() =>
+          resolveMemorySourceExistingHash({ db: this.db, path: pathname, source }),
+        ));
+      await database.deleteSource({ path: pathname, source, expectedHash: capturedHash }, () => {
+        if (
+          this.closed ||
+          database.closed ||
+          database.readOnly ||
+          !database.db.isOpen ||
+          this.database !== database
+        ) {
+          throw new Error("Memory source owner changed before deletion");
+        }
+      });
+    });
   }
 
   private async deleteStaleSourceFiles(
@@ -109,11 +114,12 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
     needsFullReindex: boolean;
     progress?: MemorySyncProgressState;
     deferIndex?: boolean;
-  }): Promise<MemorySourceSyncPlan> {
+  }): Promise<MemorySourceSyncPlan | undefined> {
     // Consume this pass's dirtiness before awaits so later edits remain queued.
     this.clearMemoryRetryState();
 
     const fileEntries = await resolveMemorySourceFileEntries({
+      files: this.memoryFiles,
       workspaceDir: this.workspaceDir,
       settings: this.settings,
       concurrency: this.getIndexConcurrency(),
@@ -171,7 +177,7 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
     }
 
     await deleteStaleRows();
-    return this.emptySourceSyncPlan();
+    return undefined;
   }
 
   protected override async syncArchiveFiles(params: {
@@ -181,10 +187,10 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
     progress?: MemorySyncProgressState;
     deferIndex?: boolean;
     prefixIndexItems?: MemoryIndexWorkItem[];
-  }): Promise<MemorySourceSyncPlan> {
+  }): Promise<void> {
     const updateUnchangedSessionSourceMetadata = this.db.prepare(
       `UPDATE memory_index_sources
-       SET mtime = ?, size = ?
+       SET mtime = ?, size = ?, hash = ?
        WHERE path = ? AND source = 'sessions' AND hash = ?`,
     );
     const corpusEntries = params.corpusEntries ?? (await this.listSessionCorpusEntries());
@@ -300,18 +306,28 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
         path: entry.path,
         existingHashes,
       });
-      if (!params.needsFullReindex && existingHash === entry.hash) {
+      const hash =
+        entry.revisionMs === undefined ? entry.hash : `sqlite:${entry.revisionMs}:${entry.hash}`;
+      const existingContentHash = existingHash?.startsWith("sqlite:")
+        ? existingHash.slice(existingHash.lastIndexOf(":") + 1)
+        : existingHash;
+      if (
+        !params.needsFullReindex &&
+        existingHash !== undefined &&
+        existingContentHash === entry.hash
+      ) {
         // Converge restored source fingerprints without replacing unchanged chunks.
         if (
-          this.sessionsDirtyFiles.has(absPath) &&
+          (this.sessionsDirtyFiles.has(absPath) || existingHash !== hash) &&
           !(await runSqliteImmediateTransaction(
             this.db,
             async () => () =>
               updateUnchangedSessionSourceMetadata.run(
                 entry.mtimeMs,
                 entry.size,
+                hash,
                 entry.path,
-                entry.hash,
+                existingHash,
               ).changes === 1,
             undefined,
             (write) => this.withDatabaseWrite(write),
@@ -325,7 +341,7 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
         return null;
       }
       // Keep the prepared entry's non-enumerable reset boundary.
-      return Object.assign(entry, { sessionId: corpusEntryForPath(absPath).sessionId });
+      return Object.assign(entry, { hash, sessionId: corpusEntryForPath(absPath).sessionId });
     };
 
     if (params.deferIndex) {
@@ -373,7 +389,7 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
       await flushPendingIndexItems();
       await deleteTargetArchiveStaleLiveRows();
       await deleteStaleRows();
-      return this.emptySourceSyncPlan();
+      return;
     }
     if ((params.prefixIndexItems?.length ?? 0) > 0) {
       throw new Error("Memory session sync prefix requires deferred source-wide indexing.");
@@ -395,6 +411,5 @@ export abstract class MemoryManagerSourceSyncOps extends MemoryManagerSessionSyn
 
     await deleteTargetArchiveStaleLiveRows();
     await deleteStaleRows();
-    return this.emptySourceSyncPlan();
   }
 }

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mockBunVersion } from "./runtime-version.test-support.js";
 
 const execFileSyncMock = vi.hoisted(() => vi.fn());
 const execFileMock = vi.hoisted(() => vi.fn());
@@ -32,13 +33,49 @@ import {
 } from "./evidence-environment.js";
 
 afterEach(() => {
-  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   execFileSyncMock.mockReset();
   execFileMock.mockReset();
 });
 
 describe("captured evidence source identity", () => {
+  it("lets a strict caller budget for a cold Git scan without changing the default deadline", async () => {
+    const deadlineError = Object.assign(new Error("Git scan exceeded its deadline"), {
+      code: "ETIMEDOUT",
+      signal: "SIGTERM",
+      killed: true,
+    });
+    execFileMock.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        options: { timeout: number },
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        const requiredMs = args[0] === "diff" ? 6_000 : 1;
+        if (options.timeout < requiredMs) {
+          callback(deadlineError, "", "");
+        } else {
+          callback(null, args[0] === "rev-parse" ? "cold-head\n" : "", "");
+        }
+      },
+    );
+    const defaultFailure = {
+      message: "Source identity git diff failed in cold-checkout (deadline 5000ms).",
+      cause: deadlineError,
+    };
+    await expect(
+      captureQaEvidenceSourceIdentity("cold-checkout", { gitTimeoutMs: 60_000 }),
+    ).resolves.toEqual({
+      gitSha: "cold-head",
+      sourceDirty: false,
+      sourcePatchSha256: null,
+    });
+    await expect(captureQaEvidenceSourceIdentity("cold-checkout")).rejects.toMatchObject(
+      defaultFailure,
+    );
+  });
+
   it("frames binary file contents separately from following untracked files", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "qa-source-framing-"));
     let untracked = "a\0b\0";
@@ -108,7 +145,7 @@ describe("captured evidence source identity", () => {
     { label: "Node", bun: undefined, runtime: { id: "node", version: process.version } },
     { label: "simulated Bun", bun: "1.3.14", runtime: { id: "bun", version: "1.3.14" } },
   ])("captures $label independently of available source identity", async ({ bun, runtime }) => {
-    vi.stubGlobal("process", { ...process, versions: { ...process.versions, bun } });
+    using _ = mockBunVersion(bun);
     execFileMock.mockImplementation((_command, args, _options, callback) =>
       callback(null, args[0] === "rev-parse" ? "actual-head\n" : "", ""),
     );
