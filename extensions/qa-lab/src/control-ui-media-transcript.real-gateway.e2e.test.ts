@@ -34,6 +34,10 @@ const replayModel: Model<"openai-responses"> = {
   maxTokens: 4_096,
 };
 
+const OMITTED_IMAGE_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAmElEQVR4nO3QMREAIBDAsHeERQyjAWRkoEP2Xmftc382OkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAK0BOkBrgA7QGqADtAboAO0B06OyaOxP7RwAAAAASUVORK5CYII=";
+const OMITTED_IMAGE_ALT = "Recovered persisted image";
+
 type PersistedAssistantMessage = AssistantMessage & {
   openclawDisplayContent?: Array<Record<string, unknown>>;
 };
@@ -95,7 +99,7 @@ function readModelReplayError(messages: AssistantMessage[]): string | null {
 }
 
 suite.define(() => {
-  it("renders sanitized omitted and retained image history", { timeout: 180_000 }, async () => {
+  it("renders recovered omitted and retained image history", { timeout: 180_000 }, async () => {
     const gatewayOwner = createQaLiveLaneGateway();
     const gateway = await gatewayOwner.start({
       repoRoot: process.cwd(),
@@ -140,7 +144,8 @@ suite.define(() => {
       {
         type: "image",
         mimeType: "image/png",
-        data: Buffer.from("omitted inline image").toString("base64"),
+        data: OMITTED_IMAGE_BASE64,
+        alt: OMITTED_IMAGE_ALT,
       },
     ]);
     await seed(retainedSessionKey, "retained-image-history", [
@@ -156,7 +161,7 @@ suite.define(() => {
         limit: 10,
       });
       expect(JSON.stringify(omittedHistory)).toContain('"omitted":true');
-      expect(JSON.stringify(omittedHistory)).not.toContain("omitted inline image");
+      expect(JSON.stringify(omittedHistory)).not.toContain(OMITTED_IMAGE_BASE64);
       expect(JSON.stringify(retainedHistory)).toContain(retainedImageUrl);
 
       await suite.withPage(
@@ -184,14 +189,23 @@ suite.define(() => {
           const omittedCard = visiblePane.locator(".chat-assistant-attachment-card", {
             hasText: "Omitted from history",
           });
-          await omittedCard.waitFor({ state: "visible" });
-          const omittedCardText = await omittedCard.textContent();
-          const omittedInteractiveDescendantCount = await omittedCard
-            .locator("a, button, img, audio, video")
-            .count();
-          expect(omittedInteractiveDescendantCount).toBe(0);
+          const recoveredImage = visiblePane.getByAltText(OMITTED_IMAGE_ALT);
+          await recoveredImage.waitFor({ state: "visible" });
+          await expect
+            .poll(() =>
+              recoveredImage.evaluate((element) =>
+                element instanceof HTMLImageElement && element.complete
+                  ? element.naturalWidth
+                  : 0,
+              ),
+            )
+            .toBe(64);
+          const omittedCardCount = await omittedCard.count();
+          expect(omittedCardCount).toBe(0);
           if (captureUiProof) {
-            await page.screenshot({ path: path.join(suite.artifactDir, "01-omitted-image.png") });
+            await page.screenshot({
+              path: path.join(suite.artifactDir, "01-recovered-omitted-image.png"),
+            });
           }
 
           await navigateToControlUiSession(page, retainedSessionKey);
@@ -210,13 +224,17 @@ suite.define(() => {
               {
                 gateway: {
                   omittedHasMarker: JSON.stringify(omittedHistory).includes('"omitted":true'),
-                  omittedExcludesInlinePayload:
-                    !JSON.stringify(omittedHistory).includes("omitted inline image"),
+                  omittedExcludesInlinePayload: !JSON.stringify(omittedHistory).includes(
+                    OMITTED_IMAGE_BASE64,
+                  ),
                   retainedIncludesUrl: JSON.stringify(retainedHistory).includes(retainedImageUrl),
                 },
                 ui: {
-                  omittedCardText,
-                  omittedInteractiveDescendantCount,
+                  recoveredImageAlt: await recoveredImage.getAttribute("alt"),
+                  recoveredImageNaturalWidth: await recoveredImage.evaluate((element) =>
+                    element instanceof HTMLImageElement ? element.naturalWidth : 0,
+                  ),
+                  omittedCardCount,
                   retainedImageSrc: await retainedPane
                     .locator(`img.chat-message-image[src="${retainedImageUrl}"]`)
                     .getAttribute("src"),

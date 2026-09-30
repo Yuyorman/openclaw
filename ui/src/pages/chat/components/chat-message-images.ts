@@ -613,6 +613,9 @@ function buildManagedOutgoingImageVariantUrl(
   variant: ManagedImageVariant,
   resourceBasePath?: string,
 ): string {
+  if (/^data:/iu.test(source)) {
+    return source;
+  }
   try {
     const parsed = new URL(source, window.location.origin);
     parsed.pathname = parsed.pathname.replace(/\/(?:full|thumbnail)$/u, `/${variant}`);

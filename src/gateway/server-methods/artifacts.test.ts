@@ -904,6 +904,39 @@ describe("artifacts RPC handlers", () => {
     expectFields(artifact?.download, { mode: "bytes" });
   });
 
+  it.each([
+    {
+      name: "top-level blob",
+      block: {
+        type: "image",
+        blob: "aGVsbG8=",
+        mimeType: "image/png",
+        alt: "top-level-blob.png",
+      },
+    },
+    {
+      name: "nested source blob",
+      block: {
+        type: "image",
+        source: { blob: "aGVsbG8=", mimeType: "image/png" },
+        alt: "nested-source-blob.png",
+      },
+    },
+  ])("downloads transcript image bytes from a $name field", async ({ block }) => {
+    mockedMessages([{ role: "user", content: [block], __openclaw: { seq: 4 } }]);
+    const listed = await listArtifacts({ sessionKey: "agent:main:main" });
+    const artifact = expectFirstArtifact(listed.calls);
+    const artifactId = requireNonEmptyString(artifact?.id, "expected blob image artifact");
+    expectFields(artifact, { type: "image", download: { mode: "bytes" } });
+
+    const downloaded = await downloadArtifact({ sessionKey: "agent:main:main", artifactId });
+    const payload = expectOkPayload(downloaded.calls) as {
+      encoding?: string;
+      data?: string;
+    };
+    expectFields(payload, { encoding: "base64", data: "aGVsbG8=" });
+  });
+
   it("treats transcript non-base64 data URLs as unsupported downloads", async () => {
     mockedMessages([
       {

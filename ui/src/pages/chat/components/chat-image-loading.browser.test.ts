@@ -58,6 +58,40 @@ describe.runIf(browserMode)("chat image loading geometry", () => {
     await page.viewport(originalViewport.width, originalViewport.height);
   });
 
+  it("fetches recovered historical images from their complete data URL", async () => {
+    const container = mount(500);
+    const recoveredUrl = "data:image/svg+xml;base64,PHN2Zy8+";
+    const fetchMock = vi.fn((...args: Parameters<typeof fetch>) => {
+      const [input] = args;
+      const requestUrl =
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      return Promise.resolve(
+        requestUrl === recoveredUrl ? svgResponse(120, 80) : new Response(null, { status: 404 }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const resolveArtifactDownload = vi.fn().mockResolvedValue({ url: recoveredUrl });
+    const artifactId = "artifact_history_image_browser_test";
+    const placeholderUrl = `/api/chat/media/outgoing/__history__/${artifactId}/full`;
+
+    render(
+      html`${renderMessageImages(
+        [{ url: placeholderUrl, artifactId, alt: "Recovered image" }],
+        { sessionKey: "agent:main:main", resolveArtifactDownload },
+      )}`,
+      container,
+    );
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(recoveredUrl);
+    await vi.waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    await container.querySelector("img")!.decode();
+    expect(resolveArtifactDownload).toHaveBeenCalledWith({
+      sessionKey: "agent:main:main",
+      artifactId,
+    });
+  });
+
   it.each(
     [
       {
